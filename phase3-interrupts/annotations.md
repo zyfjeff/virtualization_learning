@@ -161,10 +161,10 @@ static int modify_irte(struct irq_2_iommu *irq_iommu,
 
 ## 3. KVM层：PIR→IRR同步
 
-**文件**: `arch/x86/kvm/vmx/vmx.c`
+**文件**: `arch/x86/kvm/vmx/vmx.c:6912` (vmx_sync_pir_to_irr), `arch/x86/kvm/vmx/vmx.c:6881` (vmx_set_rvi)
 
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c */
+/* 来源: arch/x86/kvm/vmx/vmx.c:6912 */
 
 /*
  * vmx_sync_pir_to_irr - 将Posted Interrupt的PIR同步到vLAPIC IRR
@@ -244,10 +244,10 @@ static void vmx_set_rvi(int vector)
 
 ## 4. KVM-VT-d桥梁：vmx_pi_update_irte()
 
-**文件**: `arch/x86/kvm/vmx/vmx.c`
+**文件**: `arch/x86/kvm/vmx/posted_intr.c:272` (vmx_pi_update_irte), 通过 `vmx/main.c:135` 注册到 kvm_x86_ops
 
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c (通过 kvm_x86_ops.pi_update_irte 调用) */
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:272 */
 
 /*
  * vmx_pi_update_irte - 更新PI模式的IRTE
@@ -302,10 +302,10 @@ void vmx_pi_update_irte(struct kvm_vcpu *vcpu,
 
 ## 5. vCPU调度时的PI操作
 
-**文件**: `arch/x86/kvm/vmx/posted_intr.c`
+**文件**: `arch/x86/kvm/vmx/posted_intr.c:53` (vmx_vcpu_pi_load), `arch/x86/kvm/vmx/posted_intr.c:196` (vmx_vcpu_pi_put)
 
 ```c
-/* 来源: arch/x86/kvm/vmx/posted_intr.c */
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:53 */
 
 /*
  * vmx_vcpu_pi_load - vCPU调度到pCPU时调用
@@ -358,27 +358,37 @@ after_clear_sn:
 /*
  * vmx_vcpu_pi_put - vCPU从pCPU卸载时调用
  *
+ * 来源: posted_intr.c:196
+ *
  * 作用:
- *   1. 设置SN位 → 抑制通知中断 (vCPU不在运行，通知无意义)
- *   2. 如果vCPU因halt退出且有PI等待，唤醒它
+ *   1. 如果vCPU将要阻塞且中断未屏蔽 → 启用wakeup handler
+ *   2. 如果vCPU被抢占 → 设置SN位抑制通知
  */
 void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
 {
-    struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
 
-    /* 设置SN → 抑制通知 */
-    pi_set_sn(pi_desc);
+	/* 如果不需要PI唤醒(无直通设备等)，直接返回 */
+	if (!vmx_needs_pi_wakeup(vcpu))
+		return;
 
-    /*
-     * 如果vCPU因HLT退出:
-     *   - 检查PIR是否有待处理中断
-     *   - 如果有: 不真正halt，标记为需要唤醒
-     *   - 如果没有: 注册到wakeup_handler列表
-     *     当PI到达时，wakeup_handler唤醒vCPU
-     */
-    if (static_branch_unlikely(&pi_inject_timer) ||
-        kvm_vcpu_is_blocking(vcpu))
-        pi_set_sn(pi_desc);
+	/*
+	 * 如果vCPU将要阻塞且中断未被屏蔽:
+	 *   启用wakeup handler
+	 *   → 当PI到达时，pi_wakeup_handler()唤醒vCPU
+	 *   → 将vCPU加入wakeup_vcpus_on_cpu列表
+	 */
+	if (kvm_vcpu_is_blocking(vcpu) && !vmx_interrupt_blocked(vcpu))
+		pi_enable_wakeup_handler(vcpu);
+
+	/*
+	 * 如果vCPU被抢占:
+	 *   设置SN位 → 抑制通知中断
+	 *   (vCPU不在运行，通知无意义)
+	 *   注意: vCPU可能同时被看作blocking和preempted
+	 */
+	if (vcpu->preempted)
+		pi_set_sn(pi_desc);
 }
 ```
 
@@ -386,10 +396,10 @@ void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
 
 ## 6. 完整中断注入到vLAPIC
 
-**文件**: `arch/x86/kvm/lapic.c`, `arch/x86/kvm/irq.c`
+**文件**: `arch/x86/kvm/lapic.c`, `virt/kvm/irqchip.c:70` (kvm_set_irq)
 
 ```c
-/* 来源: arch/x86/kvm/irq.c */
+/* 来源: virt/kvm/irqchip.c:70 */
 
 /*
  * kvm_set_irq - 设置中断 (从irqfd或KVM_IRQ_LINE调用)

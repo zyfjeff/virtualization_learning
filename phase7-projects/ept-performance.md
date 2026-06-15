@@ -51,17 +51,17 @@ TRACEFS=/sys/kernel/debug/tracing
 echo > $TRACEFS/trace
 echo 0 > $TRACEFS/tracing_on
 
-# 跟踪缺页处理函数
+# ★ trace event: kvm_page_fault (已验证存在于 6.12.93)
 echo kvm:kvm_page_fault > $TRACEFS/set_event
-echo kvm:kvm_mmu_paging_element >> $TRACEFS/set_event
 
 # 开启函数级跟踪以测量延迟
+# ★ 这些函数均存在于 6.12.93
 echo function > $TRACEFS/current_tracer
 echo kvm_handle_page_fault > $TRACEFS/set_ftrace_filter
 echo kvm_tdp_page_fault >> $TRACEFS/set_ftrace_filter
 echo kvm_tdp_mmu_map >> $TRACEFS/set_ftrace_filter
 echo make_spte >> $TRACEFS/set_ftrace_filter
-echo tdp_mmu_set_spte_atomic >> $TRACEFS/set_ftrace_filter
+echo __tdp_mmu_set_spte_atomic >> $TRACEFS/set_ftrace_filter
 
 # 启用延迟测量
 echo 1 > $TRACEFS/tracing_on
@@ -176,27 +176,34 @@ echo "性能影响: $(echo "scale=1; ($DIRTY_LOG/$BASELINE - 1)*100" | bc)%"
 ```bash
 #!/bin/bash
 # 分析 SPTE 的权限变化
+# ★ 注意: kvm_mmu_set_spte/kvm_mmu_get_page 不是 trace events
+# 使用 function trace 跟踪相关函数
 
 TRACEFS=/sys/kernel/debug/tracing
 
-# 跟踪 SPTE 操作
 echo > $TRACEFS/trace
-echo kvm_mmu_set_spte > $TRACEFS/set_event
-echo kvm_mmu_get_page >> $TRACEFS/set_event
+
+# 跟踪 SPTE 相关函数
+echo function > $TRACEFS/current_tracer
+echo make_spte > $TRACEFS/set_ftrace_filter
+echo __tdp_mmu_set_spte_atomic >> $TRACEFS/set_ftrace_filter
+echo kvm_tdp_mmu_map >> $TRACEFS/set_ftrace_filter
+
+# 也可以配合 kvm_page_fault trace event 使用
+echo kvm:kvm_page_fault >> $TRACEFS/set_event
 
 echo 1 > $TRACEFS/tracing_on
 sleep 5
 echo 0 > $TRACEFS/tracing_on
 
-# 分析 SPTE 值
-echo "SPTE 分析:"
-cat $TRACEFS/trace | grep "kvm_mmu_set_spte" | head -20
+# 分析函数调用
+echo "SPTE 相关函数调用:"
+cat $TRACEFS/trace | grep -E "make_spte|tdp_mmu" | head -20
 
-# 检查大页映射
+# 检查大页映射 (通过 kvm_page_fault trace event 的 level 字段)
 echo ""
-echo "大页映射统计:"
-cat $TRACEFS/trace | grep "level=2" | wc -l
-echo "个 2MB 大页映射"
+echo "大页映射统计 (从 kvm_page_fault 提取):"
+cat $TRACEFS/trace | grep "kvm_page_fault" | head -20
 ```
 
 ### 步骤 5：内存压力下的性能
@@ -211,7 +218,8 @@ echo "=== 内存压力测试 ==="
 echo 1 > /proc/sys/vm/drop_caches
 
 # perf 记录
-perf record -e kvm:kvm_page_fault -e kvm:kvm_mmu_set_spte \
+# ★ kvm:kvm_mmu_set_spte 不是真实 trace event，已移除
+perf record -e kvm:kvm_page_fault \
     -p $QEMU_PID -g -- sleep 30 &
 
 # 在虚拟机内运行压力测试

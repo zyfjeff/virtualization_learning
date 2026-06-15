@@ -128,16 +128,16 @@ KVM SPTE 64-bit 位布局（EPT 模式）:
 ### 2.1 函数签名与参数
 
 ```c
-/* 来源: arch/x86/kvm/mmu/mmu.c */
+/* 来源: arch/x86/kvm/mmu/mmu.c:4628 */
 
 /*
  * kvm_handle_page_fault - 处理 VM-Exit 中的缺页异常
  *
- * @vcpu:        触发缺页的虚拟 CPU
- * @error_code:  硬件错误码（来自 VMCS EXIT_QUALIFICATION）
- * @fault_address: 触发缺页的线性/物理地址
- * @exec:        导致缺页的指令数据（用于 MMIO 模拟）
- * @no_reexecute: 是否禁止重新执行（内部重试标志）
+ * @vcpu:         触发缺页的虚拟 CPU
+ * @error_code:   硬件错误码（来自 VMCS EXIT_QUALIFICATION）
+ * @fault_address: 触发缺页的线性/物理地址 (u64)
+ * @insn:         导致缺页的指令数据（用于 MMIO 模拟）
+ * @insn_len:     指令长度
  *
  * 错误码位定义（与 x86 PF error code 一致）:
  *   bit 0: P    - 0=页面不存在, 1=权限违规
@@ -146,11 +146,16 @@ KVM SPTE 64-bit 位布局（EPT 模式）:
  *   bit 3: RSVD - 保留位违规
  *   bit 4: I/D  - 0=数据访问, 1=指令取指
  *   bit 15: SGX - SGX 相关违规
+ *
+ * 实际实现:
+ *   - 如果无 async PF 标志 → kvm_mmu_page_fault() → direct_page_fault()
+ *   - 如果有 async PF (PAGE_NOT_PRESENT) → kvm_async_pf_task_wait_schedule()
  */
 int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
-                          gpa_t fault_address, char *insn, int *insn_len)
+				u64 fault_address, char *insn, int insn_len)
 {
-    int r;
+    int r = 1;
+    u32 flags = vcpu->arch.apf.host_apf_flags;
     /* ... 见下方详细分析 ... */
 }
 ```
@@ -158,53 +163,52 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
 ### 2.2 处理流程详解
 
 ```c
-/* 来源: arch/x86/kvm/mmu/mmu.c - kvm_handle_page_fault() 简化流程 */
+### 2.2 处理流程详解
+
+```c
+/* 来源: arch/x86/kvm/mmu/mmu.c:4628 */
 
 int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
-                          gpa_t fault_address, char *insn, int *insn_len)
+				u64 fault_address, char *insn, int insn_len)
 {
-    int r;
+    int r = 1;
+    u32 flags = vcpu->arch.apf.host_apf_flags;
 
-    /*
-     * Step 1: 检查是否为嵌套虚拟化引起的缺页
-     * 如果 L1 hypervisor 拦截了 EPT violation，需要注入给 L1
-     */
-    if (WARN_ON_ONCE(fault_address >> 32))  /* 地址有效性检查 */
+#ifndef CONFIG_X86_64
+    if (WARN_ON_ONCE(fault_address >> 32))
         return -EFAULT;
+#endif
+    if (WARN_ON_ONCE(error_code >> 32))
+        error_code = lower_32_bits(error_code);
 
-    /*
-     * Step 2: 处理需要用户态介入的情况
-     * 某些缺页需要 QEMU 用户态处理（如 MMIO）
-     */
-    vcpu->arch.l1_tf_flush_l1d = true;
+    vcpu->arch.l1tf_flush_l1d = true;
 
-    /*
-     * Step 3: 检查是否为 MMIO 访问
-     * 如果 fault_address 映射到 MMIO 区域，需要设备模拟
-     */
-    if (error_code & PFERR_PRESENT_MASK) {
-        /* 页面存在但权限违规 —— 不是缺页，是权限问题 */
-        /* EPT misconfiguration 也走这里 */
+    if (!flags) {
+        /* ★ 正常路径: 调用 MMU 页错误处理 */
+        trace_kvm_page_fault(vcpu, fault_address, error_code);
+        r = kvm_mmu_page_fault(vcpu, fault_address, error_code,
+                               insn, insn_len);
+    } else if (flags & KVM_PV_REASON_PAGE_NOT_PRESENT) {
+        /* ★ 异步缺页 (PV): Guest页不在宿主内存中 */
+        vcpu->arch.apf.host_apf_flags = 0;
+        local_irq_disable();
+        kvm_async_pf_task_wait_schedule(fault_address);
+        local_irq_enable();
+    } else {
+        WARN_ONCE(1, "Unexpected host async PF flags: %x\n", flags);
     }
-
-    /*
-     * Step 4: 调用具体的缺页处理函数
-     * 根据当前 MMU 模式选择处理路径：
-     * - TDP 模式 (EPT/NPT): kvm_tdp_page_fault()
-     * - 影子页表模式: kvm_shadow_page_fault()
-     */
-
-    /* 调用架构相关的 page fault 处理 */
-    r = vcpu->arch.mmu->page_fault(vcpu, fault_address,
-                                    error_code, false);
-    /*
-     * 这里 vcpu->arch.mmu->page_fault 指向:
-     *   - kvm_tdp_page_fault() (TDP 模式)
-     *   - kvm_shadow_page_fault() (影子页表模式)
-     */
 
     return r;
 }
+
+/*
+ * kvm_mmu_page_fault() 内部:
+ *   → vcpu->arch.mmu->page_fault()
+ *     - TDP模式: kvm_tdp_page_fault() (mmu.c:4726)
+ *       → direct_page_fault() (mmu.c:4576)
+ *         → kvm_tdp_mmu_map() (tdp_mmu.c:1104)
+ *     - 影子页表模式: FNAME(page_fault)()
+ */
 ```
 
 ### 2.3 调用流程图
@@ -216,21 +220,21 @@ VM-Exit (EPT Violation)
 vmx_handle_exit()                    [vmx/vmx.c]
     │
     ▼
-kvm_handle_page_fault()              [mmu/mmu.c]
+kvm_handle_page_fault()              [mmu/mmu.c:4628]
     │
-    ├── 检查 error_code
-    │   ├── PFERR_PRESENT_MASK → 权限违规 / misconfiguration
-    │   └── 无 PRESENT → 真正缺页（需要映射）
+    ├── 检查 async PF 标志 (host_apf_flags)
+    │   ├── 无标志 → kvm_mmu_page_fault()
+    │   └── PAGE_NOT_PRESENT → kvm_async_pf_task_wait_schedule()
     │
-    ├── 检查 MMIO 情况
-    │   └── 如果是 MMIO → 返回给 QEMU 处理
-    │
-    └── 调用 mmu->page_fault()
+    └── kvm_mmu_page_fault()
         │
-        ├── TDP 模式:
-        │   └── kvm_tdp_page_fault()     [mmu/mmu.c]
-        │       │
-        │       └── kvm_tdp_mmu_map()    [mmu/tdp_mmu.c]
+        └── vcpu->arch.mmu->page_fault()
+            │
+            ├── TDP 模式:
+            │   └── kvm_tdp_page_fault()   [mmu/mmu.c:4726]
+            │       └── direct_page_fault() [mmu/mmu.c:4576]
+            │           │
+            │           └── kvm_tdp_mmu_map() [mmu/tdp_mmu.c:1104]
         │           │
         │           ├── 分配物理页 (kvm_mmu_alloc_sp())
         │           ├── 构造 SPTE (make_spte())
@@ -319,7 +323,7 @@ struct kvm_page_fault {
 ### 4.1 函数实现
 
 ```c
-/* 来源: arch/x86/kvm/mmu/tdp_mmu.c */
+/* 来源: arch/x86/kvm/mmu/tdp_mmu.c:1104 */
 
 /*
  * kvm_tdp_mmu_map - 为 Guest GPA 建立 EPT 映射
@@ -483,21 +487,33 @@ kvm_tdp_mmu_map() 内部流程:
 ### 5.1 构造过程
 
 ```c
-/* 来源: arch/x86/kvm/mmu/spte.c (概念性代码) */
+/* 来源: arch/x86/kvm/mmu/spte.c:157 */
 
 /*
  * make_spte - 构造一个新的 SPTE
  *
+ * 实际签名:
+ *   bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ *                  const struct kvm_memory_slot *slot,
+ *                  unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
+ *                  u64 old_spte, bool prefetch, bool can_unsync,
+ *                  bool host_writable, u64 *new_spte)
+ *
  * 输入:
- *   pfn       - 目标物理页帧号
- *   level     - 页表层级 (PT_PG_LEVEL_4K / 2M / 1G)
- *   protection - 访问权限 (ACC_EXEC_MASK | ACC_WRITE_MASK | ...)
- *   dirty     - 是否初始标记为脏
- *   gfn       - Guest 页帧号
- *   speculative - 是否为推测性分配
+ *   vcpu         - 虚拟CPU
+ *   sp           - 目标影子页 (包含level信息)
+ *   slot         - 内存槽
+ *   pte_access   - 访问权限 (ACC_EXEC_MASK | ACC_WRITE_MASK | ...)
+ *   gfn          - Guest 页帧号
+ *   pfn          - 目标物理页帧号
+ *   old_spte     - 旧SPTE值 (用于A/D位继承)
+ *   prefetch     - 是否为预取
+ *   can_unsync   - 是否允许unsync
+ *   host_writable - 宿主是否可写
  *
  * 输出:
- *   64位 SPTE 值
+ *   *new_spte = 64位 SPTE 值
+ *   返回: true 如果SPTE需要同步 (unsync)
  */
 
 /*

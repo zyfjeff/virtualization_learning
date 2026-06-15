@@ -64,8 +64,9 @@ echo kvm:kvm_exit >> $TRACEFS/set_event
 echo kvm:kvm_inj_virq >> $TRACEFS/set_event
 echo kvm:kvm_ack_irq >> $TRACEFS/set_event
 
-# 跟踪 VMX 相关事件
-echo kvm:kvm_nested_vmrun >> $TRACEFS/set_event 2>/dev/null
+# 跟踪 VMX 相关事件 (仅在启用嵌套虚拟化时有意义)
+echo kvm:kvm_nested_vmenter >> $TRACEFS/set_event 2>/dev/null
+echo kvm:kvm_nested_vmexit >> $TRACEFS/set_event 2>/dev/null
 
 echo 1 > $TRACEFS/tracing_on
 

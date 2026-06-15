@@ -1,6 +1,6 @@
-# 第四阶段源码注释：VFIO 设备直通
+# 第五阶段源码注释：VFIO 设备直通
 
-> 基于 Linux 6.12.93 源码 | 对应源码树 `drivers/vfio/` 和 `virt/kvm/`
+> 基于 Linux 6.12.93 源码（行号已验证） | 对应源码树 `drivers/vfio/` 和 `virt/kvm/`
 
 ---
 
@@ -360,27 +360,32 @@ DMA 映射详细流程:
 
 /*
  * VFIO PCI 设备操作回调:
+ * 来源: drivers/vfio/pci/vfio_pci.c:130
  */
 static const struct vfio_device_ops vfio_pci_ops = {
     .name           = "vfio-pci",
-    .open_device    = vfio_pci_core_enable,
-    .close_device   = vfio_pci_core_disable,
-    .ioctl          = vfio_pci_ioctl,
-    .read           = vfio_pci_read,
-    .write          = vfio_pci_write,
+    .init           = vfio_pci_core_init_dev,
+    .release        = vfio_pci_core_release_dev,
+    .open_device    = vfio_pci_open_device,
+    .close_device   = vfio_pci_core_close_device,
+    .ioctl          = vfio_pci_core_ioctl,
+    .device_feature = vfio_pci_core_ioctl_feature,
+    .read           = vfio_pci_core_read,
+    .write          = vfio_pci_core_write,
     .mmap           = vfio_pci_core_mmap,
-    .request        = vfio_pci_req_trigger,
-    .bind_iommufd   = vfio_pci_core_bind_iommufd,
-    .unbind_iommufd = vfio_pci_core_unbind_iommufd,
-    .attach_ioas    = vfio_pci_core_attach_ioas,
-    .detach_ioas    = vfio_pci_core_detach_ioas,
+    .request        = vfio_pci_core_request,
+    .match          = vfio_pci_core_match,
+    .bind_iommufd   = vfio_iommufd_physical_bind,
+    .unbind_iommufd = vfio_iommufd_physical_unbind,
+    .attach_ioas    = vfio_iommufd_physical_attach_ioas,
+    .detach_ioas    = vfio_iommufd_physical_detach_ioas,
 };
 ```
 
 ### 3.2 设备启用流程
 
 ```c
-/* 来源: drivers/vfio/pci/vfio_pci_core.c (简化) */
+/* 来源: drivers/vfio/pci/vfio_pci_core.c:500 (简化) */
 
 /*
  * vfio_pci_core_enable - 启用 PCI 设备直通
@@ -442,7 +447,7 @@ int vfio_pci_core_enable(struct vfio_device *core_vdev)
 ### 3.3 MMIO 映射
 
 ```c
-/* 来源: drivers/vfio/pci/vfio_pci_core.c (简化) */
+/* 来源: drivers/vfio/pci/vfio_pci_core.c:500 (简化) */
 
 /*
  * vfio_pci_core_mmap - 映射设备 MMIO 到用户空间

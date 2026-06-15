@@ -78,7 +78,7 @@ BCD: 0=二进制, 1=BCD
 ### PIT 模拟关键路径
 
 ```c
-/* 来源: arch/x86/kvm/i8254.c */
+/* 来源: arch/x86/kvm/i8254.c:365 */
 
 /*
  * Guest 写 PIT 计数值
@@ -86,20 +86,44 @@ BCD: 0=二进制, 1=BCD
  */
 static void pit_load_count(struct kvm_pit *pit, int channel, u32 val)
 {
-    struct kvm_kpit_channel_state *c = &pit->pit_state.channels[channel];
-    
-    c->count = val;
-    c->count_load_time = ktime_get_ns();  /* ★ 记录装载时间 */
-    
-    /* 启动 Host hrtimer 模拟硬件计数 */
-    if (channel == 0) {
-        /* Channel 0: 周期性定时器 */
-        u64 timeout_ns = div_u64(val * 1000000000ULL, 1193182);
-        hrtimer_start(&pit->pit_timer, 
-                      ns_to_ktime(timeout_ns),
-                      HRTIMER_MODE_REL);
-    }
+	struct kvm_kpit_state *ps = &pit->pit_state;
+
+	/* 0 表示最大值 0x10000 (2^16) */
+	if (val == 0)
+		val = 0x10000;
+
+	ps->channels[channel].count = val;
+
+	if (channel != 0) {
+		ps->channels[channel].count_load_time = ktime_get();
+		return;
+	}
+
+	/* ★ Channel 0: 根据模式创建定时器 */
+	switch (ps->channels[0].mode) {
+	case 0:
+	case 1:
+	case 4:
+		create_pit_timer(pit, val, 0);  /* one-shot 模式 */
+		break;
+	case 2:
+	case 3:
+		create_pit_timer(pit, val, 1);  /* periodic 模式 */
+		break;
+	default:
+		destroy_pit_timer(pit);         /* 其他模式: 停止定时器 */
+	}
 }
+
+/*
+ * create_pit_timer - 创建PIT定时器
+ *
+ * 实际实现中KVM使用 hrtimer 模拟，但通过 create_pit_timer 封装:
+ *   - 计算超时时间: timeout_ns = val × 10^9 / PIT_FREQ (1193182 Hz)
+ *   - 启动 hrtimer
+ *   - periodic模式下 hrtimer 回调中自动重启
+ */
+```
 
 /*
  * Host hrtimer 到期回调
@@ -214,87 +238,89 @@ APIC Timer 相关寄存器:
 ### KVM APIC Timer 实现
 
 ```c
-/* 来源: arch/x86/kvm/lapic.c */
+/* 来源: arch/x86/kvm/lapic.c:2269 */
 
 /*
- * 启动APIC Timer
- * 当Guest写APIC_TMICT时调用
+ * start_apic_timer - 启动APIC Timer
+ *
+ * 当Guest写APIC_TMICT (或TSC_DEADLINE MSR) 时调用
+ * 调用链: start_apic_timer → __start_apic_timer → restart_apic_timer
+ *         → start_hv_timer() (优先硬件定时器) 或 start_sw_timer() (回退hrtimer)
  */
-void start_apic_timer(struct kvm_lapic *apic)
+static void start_apic_timer(struct kvm_lapic *apic)
 {
-    u32 timer_mode = kvm_lapic_get_reg(apic, APIC_LVTT) &
-                     apic->lapic_timer.timer_mode_mask;
-    
-    if (apic_lvtt_tscdeadline(apic)) {
-        /* TSC-deadline模式: 直接设置MSR给硬件 */
-        /* Guest写 IA32_TSC_DEADLINE MSR → KVM拦截 → 写入VMCS */
-        /* 硬件自动比较TSC vs deadline */
-    } else {
-        /* Periodic/One-shot: 使用Host hrtimer */
-        u32 initial_count = kvm_lapic_get_reg(apic, APIC_TMICT);
-        if (initial_count == 0) {
-            hrtimer_cancel(&apic->lapic_timer.timer);
-            return;
-        }
-        
-        /* 计算超时时间 */
-        u64 ns = (u64)initial_count * APIC_BUS_CYCLE_NS * 
-                 apic->lapic_timer.divide_count;
-        
-        if (apic_lvtt_period(apic)) {
-            apic->lapic_timer.period = ns;
-            hrtimer_start(&apic->lapic_timer.timer,
-                         ns_to_ktime(ns),
-                         HRTIMER_MODE_REL_PINNED);
-        } else {
-            hrtimer_start(&apic->lapic_timer.timer,
-                         ns_to_ktime(ns),
-                         HRTIMER_MODE_REL_PINNED);
-        }
-    }
+	__start_apic_timer(apic, APIC_TMICT);
+}
+
+/* lapic.c:2258 */
+static void __start_apic_timer(struct kvm_lapic *apic, u32 count_reg)
+{
+	atomic_set(&apic->lapic_timer.pending, 0);
+
+	/* Periodic/One-shot: 设置目标过期时间 */
+	if ((apic_lvtt_period(apic) || apic_lvtt_oneshot(apic))
+	    && !set_target_expiration(apic, count_reg))
+		return;
+
+	/* TSC-deadline 或重新计时 */
+	restart_apic_timer(apic);
+}
+
+/* lapic.c:2200 */
+static void restart_apic_timer(struct kvm_lapic *apic)
+{
+	preempt_disable();
+
+	if (!apic_lvtt_period(apic) && atomic_read(&apic->lapic_timer.pending))
+		goto out;
+
+	/* ★ 优先尝试硬件定时器 (VMX preemption timer) */
+	if (!start_hv_timer(apic))
+		start_sw_timer(apic);     /* 回退到软件 hrtimer */
+out:
+	preempt_enable();
 }
 
 /*
- * APIC Timer 到期回调
- * hrtimer 到期时调用, 注入中断到vCPU
+ * apic_timer_fn - hrtimer 到期回调
+ *
+ * 来源: lapic.c:2883
+ *
+ * 通过 apic_timer_expired() 注入中断到vCPU
+ * (不是直接调用 kvm_apic_local_deliver)
  */
 static enum hrtimer_restart apic_timer_fn(struct hrtimer *data)
 {
-    struct kvm_lapic *apic = container_of(data, ...);
-    
-    /* 注入定时器中断到vCPU */
-    kvm_apic_local_deliver(apic, APIC_LVTT);
-    
-    if (apic_lvtt_period(apic)) {
-        /* Periodic: 重新启动 */
-        hrtimer_add_expires_ns(&apic->lapic_timer.timer,
-                               apic->lapic_timer.period);
-        return HRTIMER_RESTART;
-    }
-    return HRTIMER_NORESTART;
+	struct kvm_timer *ktimer = container_of(data, struct kvm_timer, timer);
+	struct kvm_lapic *apic = container_of(ktimer, struct kvm_lapic, lapic_timer);
+
+	/* ★ 注入定时器中断到vCPU */
+	apic_timer_expired(apic, true);
+
+	if (lapic_is_periodic(apic) && !WARN_ON_ONCE(!apic->lapic_timer.period)) {
+		advance_periodic_target_expiration(apic);
+		hrtimer_set_expires(&ktimer->timer, ktimer->target_expiration);
+		return HRTIMER_RESTART;
+	} else
+		return HRTIMER_NORESTART;
 }
 
 /*
- * Timer advance (高级优化)
- * 
- * 问题: hrtimer到期 → KVM处理 → 注入中断到Guest, 有延迟
- * 解决: 提前一点触发hrtimer, 补偿延迟
- * 
- * lapic_timer_advance_ns 参数控制提前量
- * 默认: true (自动调整)
+ * 定时器优先级:
+ *   1. VMX preemption timer (start_hv_timer) → 最快, 硬件直接触发VM-Exit
+ *   2. hrtimer (start_sw_timer → start_sw_period/start_sw_tscdeadline)
+ *   3. 如果两种都失败, 使用 pending 标志延迟注入
  */
-static bool lapic_timer_advance __read_mostly = true;
-module_param(lapic_timer_advance, bool, 0444);
 ```
 
 ---
 
 ## 3. TSC 虚拟化详细实现
 
-**文件**: `arch/x86/kvm/vmx/vmx.c`, `arch/x86/kvm/x86.c`
+**文件**: `arch/x86/kvm/vmx/vmx.c:1951` (vmx_write_tsc_offset), `arch/x86/kvm/x86.c:2717` (kvm_synchronize_tsc)
 
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c */
+/* 来源: arch/x86/kvm/vmx/vmx.c:1951-1959 */
 
 /*
  * TSC_OFFSET 写入 VMCS
@@ -329,14 +355,18 @@ void vmx_write_tsc_multiplier(struct kvm_vcpu *vcpu)
 /* 来源: arch/x86/kvm/x86.c */
 
 /*
- * 同步所有vCPU的TSC
- * 
+ * 同步所有vCPU的TSC (概念性描述)
+ *
+ * 来源: arch/x86/kvm/x86.c:2717
+ * 签名: static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
+ *
  * 调用时机:
- *   - vCPU创建时
+ *   - vCPU创建时 (user_value=NULL, data=0, 强制同步)
  *   - 用户空间通过 KVM_SET_TSC_OFFSET 设置时
  *   - vCPU从不同pCPU迁移回来时
  *
  * 策略: 以"最早"的TSC为基准, 其他vCPU通过offset对齐
+ * 内部调用 __kvm_synchronize_tsc() → kvm_compute_l1_tsc_offset()
  */
 void kvm_synchronize_tsc(struct kvm *kvm, u64 data)
 {
@@ -387,10 +417,10 @@ void kvm_synchronize_tsc(struct kvm *kvm, u64 data)
 
 ## 4. kvmclock 详细实现
 
-**文件**: `arch/x86/kvm/x86.c`
+**文件**: `arch/x86/kvm/x86.c:2354` (kvm_write_system_time), `arch/x86/kvm/x86.c:3215` (kvm_guest_time_update)
 
 ```c
-/* 来源: arch/x86/kvm/x86.c */
+/* 来源: arch/x86/kvm/x86.c:2354 */
 
 /*
  * 更新 pvclock_vcpu_time_info (kvmclock 的核心结构)

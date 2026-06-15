@@ -56,19 +56,20 @@ echo > $TRACEFS/trace
 echo 0 > $TRACEFS/tracing_on
 
 # 设置要跟踪的事件
-echo kvm:kvm_vm_open > $TRACEFS/set_event
-echo kvm:kvm_create_vcpu >> $TRACEFS/set_event
-echo kvm:kvm_vcpu_wakeup >> $TRACEFS/set_event
+# ★ 注意: 以下 trace events 均已验证在 6.12.93 中存在
+echo kvm:kvm_vcpu_wakeup > $TRACEFS/set_event
 echo kvm:kvm_entry >> $TRACEFS/set_event
 echo kvm:kvm_exit >> $TRACEFS/set_event
 echo kvm:kvm_userspace_exit >> $TRACEFS/set_event
 
-# 也跟踪函数调用
+# 也跟踪函数调用 (用于替代不存在的 kvm_vm_open/kvm_create_vcpu 等)
 echo function > $TRACEFS/current_tracer
 echo kvm_dev_ioctl > $TRACEFS/set_ftrace_filter
+echo kvm_create_vm >> $TRACEFS/set_ftrace_filter
 echo kvm_vm_ioctl >> $TRACEFS/set_ftrace_filter
 echo kvm_vcpu_ioctl >> $TRACEFS/set_ftrace_filter
 echo kvm_arch_vcpu_ioctl_run >> $TRACEFS/set_ftrace_filter
+echo kvm_vm_release >> $TRACEFS/set_ftrace_filter
 
 echo "跟踪已设置，请启动虚拟机"
 EOF
@@ -154,23 +155,24 @@ cat /sys/kernel/debug/tracing/trace | grep -E "kvm_vm|kvm_vcpu" | tail -30
 ### 典型的 VM 创建跟踪
 
 ```
-# VM 创建
-kvm_dev_ioctl: kvm_dev_ioctl: command 0x0 (CREATE_VM)
-kvm_vm_ioctl: kvm_vm_ioctl: command 0x4 (CREATE_VCPU)
-kvm_create_vcpu: kvm_create_vcpu: id 0
-kvm_vcpu_wakeup: kvm_vcpu_wakeup: vcpu 0, runnable
+# VM 创建 (通过 function trace 捕获)
+kvm_dev_ioctl: command KVM_CREATE_VM (ioctl 0xae01)
+kvm_create_vm: allocating new VM
+kvm_vcpu_ioctl: command KVM_CREATE_VCPU (ioctl 0xae41)
 
-# VM 运行循环
+# vCPU 唤醒 (trace event)
+kvm_vcpu_wakeup: vcpu 0, runnable
+
+# VM 运行循环 (trace events)
 kvm_entry: vcpu 0, rip 0xfffffff0
 kvm_exit: vcpu 0, reason EXTERNAL_INTERRUPT (1)
 kvm_entry: vcpu 0, rip 0xfffffff0
 kvm_exit: vcpu 0, reason CPUID (10)
+kvm_userspace_exit: reason KVM_EXIT_IO
 ...
 
-# VM 销毁
-kvm_vm_ioctl: command 0x2 (KVM_IRQ_LINE)
-kvm_vcpu_release
-kvm_vm_release
+# VM 销毁 (通过 function trace 捕获)
+kvm_vm_release: freeing VM
 ```
 
 ### VM-Exit 原因分布（典型值）
