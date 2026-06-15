@@ -1,0 +1,379 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace-vfio-dma.bpf - bpftrace 脚本: 追踪 VFIO DMA 映射/解映射
+ * KVM 深度学习项目 - 设备直通篇
+ *
+ * ======================== 功能说明 ========================
+ *   1. 追踪 VFIO DMA 映射 (map) 操作
+ *   2. 追踪 VFIO DMA 解映射 (unmap) 操作
+ *   3. 统计每个容器的 DMA 映射大小和频率
+ *   4. 追踪 IOMMU 页表操作 (page table walk)
+ *   5. 监控 DMA 映射泄漏 (map 但长期不 unmap)
+ *
+ * ======================== VFIO 设备直通原理 ========================
+ *
+ *   VFIO (Virtual Function I/O) 是 KVM 设备直通的核心框架:
+ *
+ *   ┌─────────────── Guest ──────────────────┐
+ *   │                                        │
+ *   │  Guest Driver (e.g. mlx5_core)         │
+ *   │    ↓ DMA API                           │
+ *   │  Guest IOMMU (vIOMMU, 可选)            │
+ *   │    ↓ IOVA (Guest IO Virtual Address)   │
+ *   └──────────────┬─────────────────────────┘
+ *                  │ VFIO DMA MAP (Guest GPA -> Host HPA)
+ *   ┌──────────────▼─────────────────────────┐
+ *   │  QEMU (VFIO 用户态)                     │
+ *   │    ioctl(VFIO_IOMMU_MAP_DMA)           │
+ *   │    ↓                                    │
+ *   │  VFIO 内核模块                          │
+ *   │    vfio_iommu_type1_ioctl()            │
+ *   │    -> vfio_dma_do_map()                │
+ *   │    -> vfio_link_pfn_list()             │
+ *   │    ↓                                    │
+ *   │  IOMMU 驱动 (Intel VT-d / AMD-Vi)      │
+ *   │    intel_iommu_map() / amd_iommu_map() │
+ *   │    -> 设置 IOMMU 页表项                │
+ *   │    ↓                                    │
+ *   │  物理设备 DMA -> IOMMU -> Host 内存     │
+ *   └─────────────────────────────────────────┘
+ *
+ *   DMA 映射流程:
+ *     1. Guest driver 分配 DMA buffer (Guest GPA)
+ *     2. QEMU 通过 VFIO ioctl 通知内核: MAP_DMA(GPA, size)
+ *     3. VFIO 锁定用户态页面 (pin pages): get_user_pages()
+ *     4. 获取对应的 Host 物理页帧号 (PFN)
+ *     5. 调用 IOMMU 驱动建立映射: iommu_map(IOVA -> PFN)
+ *     6. IOMMU 页表写入硬件 IOTLB
+ *     7. 物理设备可使用 IOVA 发起 DMA
+ *
+ *   性能关键路径:
+ *     - DMA map/unmap 是同步操作 (阻塞!)
+ *     - 大量小映射 (4KB) 比少量大映射 (2MB/1GB) 开销大
+ *     - IOMMU 页表遍历 (page walk) 需要 IOTLB 缓存命中
+ *     - 设备热迁移时需要批量 unmap + remap (性能炸弹!)
+ *
+ * ======================== 内核源码映射 ========================
+ *
+ *   VFIO DMA 映射核心函数:
+ *     drivers/vfio/vfio_iommu_type1.c:
+ *       vfio_iommu_type1_ioctl()       // ioctl 入口
+ *       -> vfio_dma_do_map()           // DMA 映射主函数
+ *         -> vfio_pin_pages_remote()   // 锁定用户页面
+ *         -> vfio_iommu_map()          // IOMMU 映射
+ *           -> iommu_map()             // IOMMU 通用接口
+ *
+ *     drivers/iommu/iommu.c:
+ *       iommu_map()
+ *       -> domain->ops->map()          // 平台特定实现
+ *         -> intel_iommu_map()         // Intel VT-d
+ *         -> amd_iommu_map()           // AMD-Vi
+ *
+ *   VFIO DMA 解映射:
+ *     drivers/vfio/vfio_iommu_type1.c:
+ *       vfio_dma_do_unmap()
+ *       -> vfio_remove_dma_overlap()
+ *       -> iommu_unmap()               // IOMMU 解除映射
+ *       -> vfio_unpin_pages_remote()   // 解锁用户页面
+ *
+ *   追踪点:
+ *     无标准 VFIO 追踪点, 使用 kprobe 挂载函数:
+ *       kprobe:vfio_dma_do_map        // DMA 映射入口
+ *       kretprobe:vfio_dma_do_map     // DMA 映射完成 (含延迟)
+ *       kprobe:vfio_dma_do_unmap      // DMA 解映射入口
+ *       kprobe:iommu_map              // IOMMU 映射
+ *       kprobe:iommu_unmap            // IOMMU 解映射
+ *
+ *   关键数据结构:
+ *     struct vfio_dma {
+ *         dma_addr_t iova;       // IO 虚拟地址 (设备看到的地址)
+ *         unsigned long vaddr;   // 用户态虚拟地址 (QEMU 进程)
+ *         size_t size;           // 映射大小
+ *         int prot;              // 保护标志 (READ/WRITE)
+ *         struct rb_node node;   // 红黑树节点 (快速查找)
+ *     };
+ *
+ * ======================== bpftrace 等效命令 ========================
+ *
+ *   # VFIO DMA map 统计:
+ *   bpftrace -e 'kprobe:vfio_dma_do_map {
+ *       @dma_maps = count();
+ *       @dma_total_size += arg2;
+ *   }'
+ *
+ *   # DMA 映射延迟:
+ *   bpftrace -e 'kprobe:vfio_dma_do_map { @ts = nsecs; }
+ *   kretprobe:vfio_dma_do_map /@ts/ {
+ *       @map_latency = hist(nsecs - @ts); delete(@ts);
+ *   }'
+ *
+ * ======================== ftrace 等效命令 ========================
+ *
+ *   # 使用 kprobe_events 追踪 VFIO
+ *   echo 'p:vfio_map vfio_dma_do_map iova=%di size=%dx' >> \
+ *       /sys/kernel/debug/tracing/kprobe_events
+ *   echo 'r:vfio_map_ret vfio_dma_do_map ret=%ax' >> \
+ *       /sys/kernel/debug/tracing/kprobe_events
+ *   echo 1 > /sys/kernel/debug/tracing/events/kprobes/enable
+ *   cat /sys/kernel/debug/tracing/trace_pipe
+ *
+ *   # 使用 trace-cmd
+ *   trace-cmd record -e kprobes -e vfio:* sleep 10
+ *   trace-cmd report
+ *
+ * ======================== 用法 ========================
+ *   sudo bpftrace trace-vfio-dma.bpf
+ *   sudo bpftrace trace-vfio-dma.bpf -p <qemu_pid>
+ *
+ * ======================== 预期输出 ========================
+ *   [VFIO DMA 追踪] 等待 VFIO DMA 操作...
+ *
+ *   == DMA 映射统计 (每 5 秒) ==
+ *   Map 操作: 123 次 (总计 245 MB)
+ *   Unmap 操作: 98 次 (总计 189 MB)
+ *
+ *   Map 延迟分布:
+ *     0-1μs:    50 次
+ *     1-10μs:   60 次
+ *     10-100μs: 12 次
+ *     >100μs:    1 次 (可能触发性能问题!)
+ */
+
+BEGIN
+{
+    printf("[VFIO DMA 追踪] bpftrace 启动\n");
+    printf("  追踪: VFIO DMA map/unmap + IOMMU 操作\n");
+    printf("  等效 ftrace: echo p:vfio_map vfio_dma_do_map > kprobe_events\n");
+    printf("  按 Ctrl+C 退出并显示汇总\n\n");
+
+    /* 检查是否需要 root (kprobe 需要) */
+    printf("  注意: 使用 kprobe, 需要内核支持 CONFIG_KPROBE_EVENTS\n");
+    printf("  如果 kprobe 不可用, 将静默跳过\n\n");
+}
+
+/*
+ * === VFIO DMA 映射入口 ===
+ * 捕获 DMA map 请求参数
+ *
+ * 内核函数签名 (drivers/vfio/vfio_iommu_type1.c):
+ *   static int vfio_dma_do_map(
+ *       struct vfio_iommu *iommu,      // arg0: IOMMU 容器
+ *       struct vfio_bitmap *bitmap,     // arg1: dirty bitmap (可选)
+ *       struct vfio_iommu_type1_dma_map *map  // arg2: 映射描述符
+ *   )
+ *
+ *   struct vfio_iommu_type1_dma_map {
+ *       __u32 argsz;     // 结构大小
+ *       __u32 flags;     // VFIO_DMA_MAP_FLAG_READ/WRITE
+ *       __u64 vaddr;     // 用户态虚拟地址 (QEMU 进程空间)
+ *       __u64 iova;      // IO 虚拟地址 (设备 DMA 地址)
+ *       __u64 size;      // 映射大小 (字节)
+ *   };
+ */
+kprobe:vfio_dma_do_map
+{
+    @map_count = count();
+    @map_by_comm[comm] = count();
+
+    /* 记录映射开始时间, 用于计算延迟 */
+    @map_start[tid] = nsecs;
+
+    /*
+     * 读取 map 参数 (arg2 指向 dma_map 结构)
+     * 偏移量来自内核头文件: include/uapi/linux/vfio.h
+     */
+    $size = *(uint64 *)arg4;   // map->size (offset 16 in struct)
+    $iova = *(uint64 *)arg3;   // map->iova (offset 8)
+
+    @map_size_hist = hist($size);
+    @map_total_bytes += $size;
+
+    /* 按映射大小分类: 4K / 2M / 1G */
+    if ($size == 4096) {
+        @map_by_granularity["4K"] = count();
+    } else if ($size == 2097152) {
+        @map_by_granularity["2M"] = count();
+    } else if ($size >= 1073741824) {
+        @map_by_granularity["1G+"] = count();
+    } else {
+        @map_by_granularity["other"] = count();
+    }
+}
+
+/*
+ * === VFIO DMA 映射返回 ===
+ * 计算映射操作耗时
+ * 延迟高可能表示:
+ *   - 大量页面需要 pin (get_user_pages)
+ *   - IOMMU 页表操作慢
+ *   - 内存碎片导致无法使用大页
+ */
+kretprobe:vfio_dma_do_map
+/@map_start[tid]/
+{
+    $dur = nsecs - @map_start[tid];
+    @map_latency_ns = hist($dur);
+
+    /* 检查映射结果 */
+    if (retval == 0) {
+        @map_success = count();
+    } else {
+        @map_fail = count();
+        @map_fail_errno[-retval] = count();
+    }
+
+    delete(@map_start[tid]);
+}
+
+/*
+ * === VFIO DMA 解映射入口 ===
+ *
+ * 内核函数签名:
+ *   static int vfio_dma_do_unmap(
+ *       struct vfio_iommu *iommu,
+ *       struct vfio_iommu_type1_dma_unmap *unmap,
+ *       struct iommufd_access *access
+ *   )
+ */
+kprobe:vfio_dma_do_unmap
+{
+    @unmap_count = count();
+    @unmap_by_comm[comm] = count();
+    @unmap_start[tid] = nsecs;
+
+    $size = *(uint64 *)arg3;
+    @unmap_size_hist = hist($size);
+    @unmap_total_bytes += $size;
+}
+
+kretprobe:vfio_dma_do_unmap
+/@unmap_start[tid]/
+{
+    $dur = nsecs - @unmap_start[tid];
+    @unmap_latency_ns = hist($dur);
+    delete(@unmap_start[tid]);
+}
+
+/*
+ * === IOMMU 页表映射 ===
+ * 底层 IOMMU 驱动的 map 操作
+ *
+ * 内核路径:
+ *   iommu_map() -> domain->ops->map()
+ *   Intel: intel_iommu_map() -> __domain_mapping()
+ *   AMD:   amd_iommu_map() -> alloc_pte()
+ */
+kprobe:iommu_map
+{
+    @iommu_map_count = count();
+
+    /* arg3 = size, arg4 = prot */
+    @iommu_map_size = hist(arg3);
+}
+
+/*
+ * === 页面固定 (Pin Pages) ===
+ * get_user_pages() 将用户态页面锁定在物理内存
+ * 这是 DMA map 中最耗时的步骤之一
+ *
+ * 内核路径:
+ *   vfio_pin_pages_remote()
+ *   -> pin_user_pages_remote()
+ *   -> __get_user_pages_locked()
+ */
+kprobe:pin_user_pages_remote
+{
+    @pin_count = count();
+    @pin_start[tid] = nsecs;
+
+    /* arg4 = nr_pages (要固定的页面数) */
+    @pin_pages_hist = hist(arg4);
+}
+
+kretprobe:pin_user_pages_remote
+/@pin_start[tid]/
+{
+    $dur = nsecs - @pin_start[tid];
+    @pin_latency_ns = hist($dur);
+    delete(@pin_start[tid]);
+}
+
+/*
+ * 每 5 秒输出统计摘要
+ */
+interval:s:5
+{
+    time("%H:%M:%S ");
+    printf("== VFIO DMA 统计 ==\n");
+
+    printf("  DMA Map 操作: ");
+    print(@map_count);
+    printf("  DMA Map 成功: ");
+    print(@map_success);
+    printf("  DMA Map 失败: ");
+    print(@map_fail);
+
+    printf("  DMA Unmap 操作: ");
+    print(@unmap_count);
+
+    printf("\n  Map 总数据量: ");
+    print(@map_total_bytes);
+    printf("  Unmap 总数据量: ");
+    print(@unmap_total_bytes);
+
+    printf("\n  Map 大小分布 (bytes):\n");
+    print(@map_size_hist);
+
+    printf("  Map 延迟分布 (ns):\n");
+    print(@map_latency_ns);
+
+    printf("  按粒度分类:\n");
+    print(@map_by_granularity);
+
+    printf("  IOMMU map 次数: ");
+    print(@iommu_map_count);
+
+    printf("  Pin pages 次数: ");
+    print(@pin_count);
+    printf("  Pin pages 延迟 (ns):\n");
+    print(@pin_latency_ns);
+
+    printf("\n");
+
+    /* 清除本轮统计 */
+    clear(@map_count);
+    clear(@map_success);
+    clear(@map_fail);
+    clear(@unmap_count);
+    clear(@map_total_bytes);
+    clear(@unmap_total_bytes);
+    clear(@map_size_hist);
+    clear(@map_latency_ns);
+    clear(@unmap_size_hist);
+    clear(@unmap_latency_ns);
+    clear(@map_by_granularity);
+    clear(@iommu_map_count);
+    clear(@iommu_map_size);
+    clear(@pin_count);
+    clear(@pin_latency_ns);
+    clear(@pin_pages_hist);
+    clear(@map_by_comm);
+    clear(@unmap_by_comm);
+}
+
+END
+{
+    printf("\n===== VFIO DMA 追踪最终汇总 =====\n\n");
+
+    printf("关键性能指标:\n");
+    printf("  - Map 延迟 > 100μs: 检查是否大内存映射或 IOMMU 性能\n");
+    printf("  - 大量 4K 映射: 考虑启用大页 (hugepages) 减少 IOTLB miss\n");
+    printf("  - Map/Unmap 不平衡: 可能存在 DMA 映射泄漏\n");
+    printf("  - Pin pages 延迟高: 检查内存碎片 (/proc/buddyinfo)\n\n");
+
+    printf("等效 ftrace 命令:\n");
+    printf("  echo 'p:vfio_map vfio_dma_do_map' >> ");
+    printf("/sys/kernel/debug/tracing/kprobe_events\n");
+    printf("  echo 1 > /sys/kernel/debug/tracing/events/kprobes/enable\n");
+    printf("  cat /sys/kernel/debug/tracing/trace_pipe\n");
+}

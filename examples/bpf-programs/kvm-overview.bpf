@@ -1,0 +1,407 @@
+#!/usr/bin/env bpftrace
+/*
+ * kvm-overview.bpf - bpftrace 脚本: KVM 全局概览 (性能仪表盘)
+ * KVM 深度学习项目 - 综合篇
+ *
+ * ======================== 功能说明 ========================
+ *   1. 一站式追踪 KVM 所有关键事件
+ *   2. VM-Exit/Entry 频率和延迟
+ *   3. EPT 缺页统计
+ *   4. 中断注入统计
+ *   5. HLT 退出统计 (CPU 空闲率)
+ *   6. VMCALL (hypercall) 统计
+ *   7. CPU 时间分布: guest vs host 开销
+ *
+ *   本脚本相当于 KVM 性能的 "top" 命令,
+ *   一条命令捕获所有关键指标
+ *
+ * ======================== KVM 运行模型概览 ========================
+ *
+ *   KVM 的核心是一个 vcpu_run() 循环:
+ *
+ *   ┌──────────────────────────────────────────────────────┐
+ *   │  vcpu_run() [arch/x86/kvm/x86.c]                    │
+ *   │                                                      │
+ *   │  while (!signal_pending()) {                         │
+ *   │      ┌──────────────────────────────────────┐        │
+ *   │      │  vcpu_enter_guest()                  │        │
+ *   │      │    -> vmx_vcpu_run()                 │        │
+ *   │      │      -> VM-Entry (硬件指令 VMLAUNCH) │        │
+ *   │      │         ↓                            │        │
+ *   │      │    [Guest 执行]                      │        │
+ *   │      │         ↓                            │        │
+ *   │      │      -> VM-Exit (硬件事件)           │        │
+ *   │      │    -> vmx_handle_exit()              │        │
+ *   │      │      -> 根据 exit_reason 分发        │        │
+ *   │      └──────────────────────────────────────┘        │
+ *   │                                                      │
+ *   │      // 处理退出原因                                 │
+ *   │      switch (exit_reason) {                          │
+ *   │        case EPT_VIOLATION: fix_page_table();         │
+ *   │        case EXTERNAL_IRQ:  handle_irq();             │
+ *   │        case CPUID:         emulate_cpuid();          │
+ *   │        case HLT:           halt_poll();              │
+ *   │        case VMCALL:        handle_hypercall();       │
+ *   │        ...                                           │
+ *   │      }                                               │
+ *   │  }                                                   │
+ *   └──────────────────────────────────────────────────────┘
+ *
+ *   性能关键指标:
+ *     - VM-Exit 频率: 越高 -> guest/host 切换越多 -> 性能越差
+ *     - EPT Violation 占比: 通常 > 50%, 反映内存访问模式
+ *     - External IRQ 占比: 反映 I/O 负载
+ *     - HLT 占比: 反映 guest CPU 利用率 (高 = guest 空闲)
+ *     - VM-Entry/Exit 延迟: 每次切换的固定开销
+ *
+ * ======================== 内核源码映射 ========================
+ *
+ *   核心循环:
+ *     arch/x86/kvm/x86.c:
+ *       kvm_arch_vcpu_ioctl_run()  // KVM_RUN ioctl 入口
+ *       -> vcpu_run()              // 主循环
+ *         -> vcpu_enter_guest()    // VM-Entry 准备
+ *           -> static_call(kvm_x86_vcpu_run)()  // VMX/SVM 入口
+ *         -> kvm_handle_exit()     // VM-Exit 处理
+ *           -> static_call(kvm_x86_handle_exit)()
+ *
+ *   VMX 实现:
+ *     arch/x86/kvm/vmx/vmx.c:
+ *       vmx_vcpu_run()       // Intel VMX 入口 (VMLAUNCH/VMRESUME)
+ *       vmx_handle_exit()    // VM-Exit 分发
+ *       handle_ept_violation()  // EPT 缺页
+ *       handle_interrupt_window()  // 中断窗口
+ *       handle_external_interrupt()  // 外部中断
+ *
+ *   SVM 实现 (AMD):
+ *     arch/x86/kvm/svm/svm.c:
+ *       svm_vcpu_run()       // AMD SVM 入口 (VMRUN)
+ *       svm_handle_exit()    // VM-Exit (intercept) 分发
+ *
+ *   所有追踪点一览:
+ *     kvm:kvm_entry       - VM-Entry 即将发生
+ *     kvm:kvm_exit        - VM-Exit 已发生
+ *     kvm:kvm_page_fault  - 缺页处理
+ *     kvm:kvm_set_irq     - 中断设置
+ *     kvm:kvm_ack_irq     - 中断确认
+ *     kvm:kvm_hv_enter    - Hyper-V 嵌套进入 (可选)
+ *
+ * ======================== bpftrace 等效命令 ========================
+ *
+ *   # 最简单的 KVM 概览:
+ *   bpftrace -e '
+ *   tracepoint:kvm:kvm_exit { @exits[args->exit_reason] = count(); }
+ *   tracepoint:kvm:kvm_entry { @entries = count(); }
+ *   interval:s:5 { print(@exits, 10); clear(@exits); clear(@entries); }'
+ *
+ * ======================== ftrace 等效命令 ========================
+ *
+ *   # 全面追踪所有 KVM 事件
+ *   echo kvm:* > /sys/kernel/debug/tracing/set_event
+ *   cat /sys/kernel/debug/tracing/trace_pipe
+ *
+ *   # 或使用 trace-cmd 记录后分析
+ *   trace-cmd record -e kvm:* sleep 30
+ *   trace-cmd report > kvm-trace.txt
+ *   # 分析各事件频率:
+ *   grep -oP '\w+:\w+' kvm-trace.txt | sort | uniq -c | sort -rn
+ *
+ *   # 仅查看关键事件
+ *   for e in kvm_exit kvm_entry kvm_page_fault; do
+ *       echo "=== $e ==="
+ *       grep $e /sys/kernel/debug/tracing/trace | wc -l
+ *   done
+ *
+ * ======================== 用法 ========================
+ *   sudo bpftrace kvm-overview.bpf
+ *   sudo bpftrace kvm-overview.bpf -p <qemu_pid>
+ *
+ * ======================== 预期输出 ========================
+ *   ╔══════════════════════════════════════════════════╗
+ *   ║          KVM 性能仪表盘 (每 5 秒刷新)           ║
+ *   ╠══════════════════════════════════════════════════╣
+ *   ║  VM-Entry 次数:  125,000                        ║
+ *   ║  VM-Exit 次数:   124,890                        ║
+ *   ║  VM-Exit 速率:   24,978/s                       ║
+ *   ║                                                ║
+ *   ║  Top Exit Reasons:                             ║
+ *   ║    EPT_VIOLATION     18,000  (72.0%)           ║
+ *   ║    EXTERNAL_IRQ       5,000  (20.0%)           ║
+ *   ║    HLT                1,200  ( 4.8%)           ║
+ *   ║    CPUID                500  ( 2.0%)           ║
+ *   ║    VMCALL               190  ( 0.8%)           ║
+ *   ║                                                ║
+ *   ║  VM-Entry 延迟: avg 1.2μs  p99 3.5μs         ║
+ *   ║  VM-Exit 延迟:  avg 0.8μs  p99 2.1μs         ║
+ *   ╚══════════════════════════════════════════════════╝
+ */
+
+BEGIN
+{
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║          KVM 性能概览仪表盘 (bpftrace)                 ║\n");
+    printf("║          追踪所有 KVM 关键事件                         ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    printf("  等效 ftrace: echo kvm:* > /sys/kernel/debug/tracing/set_event\n");
+    printf("  等效 bpftrace 简版: bpftrace -e 't:kvm:* { @[probe] = count(); }'\n");
+    printf("  按 Ctrl+C 退出并显示最终汇总\n\n");
+}
+
+/*
+ * ============================================================
+ *  第一部分: VM-Entry 追踪
+ * ============================================================
+ *
+ * 追踪点: kvm:kvm_entry
+ * 内核位置: arch/x86/kvm/x86.c: vcpu_enter_guest()
+ *           -> trace_kvm_entry()
+ *
+ * 参数:
+ *   args->vcpu_id   : vCPU 编号
+ *   args->injection : 是否同时注入中断 (1/0)
+ *   args->vector    : 注入的中断向量号
+ *
+ * VM-Entry 是 VMLAUNCH/VMRESUME 指令执行后,
+ * CPU 从 host 模式切换到 guest 模式的硬件操作
+ */
+tracepoint:kvm:kvm_entry
+{
+    @entry_total = count();
+    @entry_by_vcpu[args->vcpu_id] = count();
+
+    /* 记录 VM-Entry 时间戳, 用于计算 VM-Entry->VM-Exit 间隔 */
+    @entry_ts[args->vcpu_id] = nsecs;
+
+    /* 统计中断注入 */
+    if (args->injection == 1) {
+        @irq_inject_total = count();
+        @irq_inject_vector[args->vector] = count();
+    }
+}
+
+/*
+ * ============================================================
+ *  第二部分: VM-Exit 追踪
+ * ============================================================
+ *
+ * 追踪点: kvm:kvm_exit
+ * 内核位置: arch/x86/kvm/x86.c: kvm_handle_exit()
+ *           -> trace_kvm_exit()
+ *
+ * 参数:
+ *   args->exit_reason : VMCS Exit Reason (Intel SDM Vol.3C)
+ *   args->guest_rip   : Guest RIP (退出时指令指针)
+ *   args->info1       : Exit Qualification
+ *   args->info2       : Exit Info 2
+ *
+ * VM-Exit 是 CPU 从 guest 模式返回 host 模式的硬件事件,
+ * 可由多种原因触发 (EPT 缺页、外部中断、I/O 等)
+ */
+tracepoint:kvm:kvm_exit
+{
+    @exit_total = count();
+    @exit_by_reason[args->exit_reason] = count();
+    @exit_by_comm[comm] = count();
+
+    /*
+     * 计算 VM-Entry 到 VM-Exit 的时间间隔
+     * 即 guest 执行时间片长度
+     * 短间隔意味着频繁的 VM-Exit, 性能差
+     */
+    $vcpu = curtask->pid;  // 简化: 用 PID 近似 vCPU
+    if (@entry_ts[$vcpu] > 0) {
+        $guest_time = nsecs - @entry_ts[$vcpu];
+        @guest_run_time_ns = hist($guest_time);
+        delete(@entry_ts[$vcpu]);
+    }
+
+    /*
+     * 计算 VM-Exit 处理延迟:
+     * 从 VM-Exit 发生到下次 VM-Entry 的时间
+     * 这段时间是纯 host 开销 (KVM 处理退出原因)
+     *
+     * 记录当前时间, 在下次 kvm_entry 时计算差值
+     */
+    @exit_ts[$vcpu] = nsecs;
+}
+
+/*
+ * ============================================================
+ *  第三部分: 按退出原因分类统计
+ * ============================================================
+ *
+ * 每种退出原因对性能的影响不同:
+ *   - EPT_VIOLATION (24): 需要修复页表, 最常见但开销可控
+ *   - EXTERNAL_IRQ (1): 需要处理 host 中断, 不可避免
+ *   - HLT (12): guest 空闲, 可用 halt-polling 优化
+ *   - CPUID (10): guest 查询 CPU 特性, 可缓存结果
+ *   - VMCALL (18): hypercall, guest 主动请求服务
+ *   - EPT_MISCONFIG (25): 通常是 bug, 应该很少见
+ */
+
+/* 单独统计关键退出原因, 方便快速判断性能瓶颈 */
+
+/* EPT Violation - 内存虚拟化开销指标 */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 24/
+{
+    @ept_violation = count();
+}
+
+/* External Interrupt - I/O 负载指标 */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 1/
+{
+    @external_irq = count();
+}
+
+/* HLT - Guest 空闲指标 */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 12/
+{
+    @halt_exit = count();
+}
+
+/* CPUID - CPU 特性查询 */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 10/
+{
+    @cpuid_exit = count();
+}
+
+/* VMCALL - Hypercall */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 18/
+{
+    @vmcall_exit = count();
+}
+
+/* Interrupt Window - 中断递送延迟指标 */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 7/
+{
+    @int_window_exit = count();
+}
+
+/* EPT Misconfiguration - 通常表示 bug */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 25/
+{
+    @ept_misconfig = count();
+}
+
+/*
+ * ============================================================
+ *  第四部分: KVM 缺页追踪
+ * ============================================================
+ *
+ * 追踪点: kvm:kvm_page_fault
+ * 内核位置: arch/x86/kvm/mmu/mmu.c: kvm_mmu_page_fault()
+ *
+ * 参数:
+ *   args->address    : 缺页地址 (GPA)
+ *   args->error_code : 错误码 (读/写/执行)
+ *   args->async      : 是否异步缺页
+ */
+tracepoint:kvm:kvm_page_fault
+{
+    @page_fault_total = count();
+    @page_fault_error[args->error_code & 0x7] = count();
+}
+
+/*
+ * ============================================================
+ *  每 5 秒输出仪表盘
+ * ============================================================
+ */
+interval:s:5
+{
+    time("%H:%M:%S ");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║              KVM 性能仪表盘 (5 秒窗口)                  ║\n");
+    printf("╠══════════════════════════════════════════════════════════╣\n");
+
+    printf("║ [VM-Exit/Entry 概览]                                    ║\n");
+    printf("║   VM-Entry: ");
+    print(@entry_total);
+    printf("║   VM-Exit:  ");
+    print(@exit_total);
+
+    printf("║                                                         ║\n");
+    printf("║ [退出原因分布]                                           ║\n");
+    printf("║   EPT_VIOLATION (24):  ");
+    print(@ept_violation);
+    printf("║   EXTERNAL_IRQ  (1):   ");
+    print(@external_irq);
+    printf("║   HLT           (12):  ");
+    print(@halt_exit);
+    printf("║   CPUID         (10):  ");
+    print(@cpuid_exit);
+    printf("║   VMCALL        (18):  ");
+    print(@vmcall_exit);
+    printf("║   INT_WINDOW    (7):   ");
+    print(@int_window_exit);
+    printf("║   EPT_MISCONFIG (25):  ");
+    print(@ept_misconfig);
+
+    printf("║                                                         ║\n");
+    printf("║ [全部退出原因 Top 10]                                    ║\n");
+    print(@exit_by_reason, 10);
+
+    printf("║                                                         ║\n");
+    printf("║ [Guest 执行时间分布 (ns)]                                ║\n");
+    print(@guest_run_time_ns);
+
+    printf("║                                                         ║\n");
+    printf("║ [缺页统计]                                               ║\n");
+    printf("║   Page Faults: ");
+    print(@page_fault_total);
+    printf("║   按错误码: \n");
+    print(@page_fault_error);
+
+    printf("║                                                         ║\n");
+    printf("║ [按 VM 进程]                                             ║\n");
+    print(@exit_by_comm, 5);
+
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    /* 清除本轮统计 */
+    clear(@entry_total);
+    clear(@exit_total);
+    clear(@exit_by_reason);
+    clear(@exit_by_comm);
+    clear(@ept_violation);
+    clear(@external_irq);
+    clear(@halt_exit);
+    clear(@cpuid_exit);
+    clear(@vmcall_exit);
+    clear(@int_window_exit);
+    clear(@ept_misconfig);
+    clear(@page_fault_total);
+    clear(@page_fault_error);
+    clear(@guest_run_time_ns);
+    clear(@irq_inject_total);
+    clear(@irq_inject_vector);
+    clear(@entry_by_vcpu);
+}
+
+END
+{
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║              KVM 性能概览 - 最终汇总                    ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    printf("性能调优建议:\n");
+    printf("  1. EPT_VIOLATION 占比高 -> 考虑使用大页 (hugepages)\n");
+    printf("  2. EXTERNAL_IRQ 占比高 -> 检查设备中断亲和性 (irqbalance)\n");
+    printf("  3. HLT 占比高 -> 启用 halt-polling (halt_poll_ns > 0)\n");
+    printf("  4. INT_WINDOW 频繁 -> guest 长时间关中断, 检查 guest 驱动\n");
+    printf("  5. EPT_MISCONFIG > 0 -> 检查 KVM 内存槽配置\n\n");
+
+    printf("等效 ftrace 全面追踪命令:\n");
+    printf("  echo kvm:* > /sys/kernel/debug/tracing/set_event\n");
+    printf("  trace-cmd record -e kvm:* -e irq:* sleep 30\n");
+    printf("  trace-cmd report | grep -oP '\\w+:\\w+' | sort | uniq -c | sort -rn\n");
+}

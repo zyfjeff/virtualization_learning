@@ -1,0 +1,297 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace-irq-latency.bpf - bpftrace 脚本: 追踪 KVM 中断注入延迟
+ * KVM 深度学习项目 - 中断虚拟化篇
+ *
+ * ======================== 功能说明 ========================
+ *   1. 测量外部中断从 host 接收到注入 guest 的延迟
+ *   2. 追踪 KVM 中断窗口 (interrupt window) 机制
+ *   3. 统计中断注入频率和延迟分布 (直方图)
+ *   4. 追踪 EOI (End of Interrupt) 处理
+ *   5. 识别中断风暴 (interrupt storm)
+ *
+ * ======================== KVM 中断虚拟化原理 ========================
+ *
+ *   KVM 中断处理涉及 3 层中断控制器:
+ *
+ *   ┌─────────────────────────────────────────────┐
+ *   │  Guest 内部: 虚拟中断控制器                  │
+ *   │    vPIC (8259) + vIOAPIC + vLAPIC            │
+ *   │    对 guest OS 透明, 完全由 KVM 模拟         │
+ *   └──────────────┬──────────────────────────────┘
+ *                  │ KVM 中断路由 (irq routing)
+ *   ┌──────────────▼──────────────────────────────┐
+ *   │  Host 内核: 中断子系统                       │
+ *   │    irq_desc -> handle_irq -> KVM irqfd       │
+ *   │    host_irq -> irqfd -> eventfd -> KVM       │
+ *   └──────────────┬──────────────────────────────┘
+ *                  │ 硬件中断
+ *   ┌──────────────▼──────────────────────────────┐
+ *   │  物理设备 → APIC → CPU                       │
+ *   │    物理中断到达 host CPU                     │
+ *   └─────────────────────────────────────────────┘
+ *
+ *   中断注入流程 (以 MSI-X 设备直通为例):
+ *     1. 物理设备触发 MSI-X 中断
+ *     2. Host CPU 收到中断, 执行 host IRQ handler
+ *     3. irqfd 通知 KVM (通过 eventfd 机制)
+ *     4. KVM 将中断标记为 pending (vIRR 位图)
+ *     5. 等待中断窗口 (RFLAGS.IF=1 且无阻塞)
+ *     6. VM-Entry 时 CPU 硬件自动递送中断到 guest
+ *        (虚拟中断递送, Virtual Interrupt Delivery)
+ *
+ *   关键延迟来源:
+ *     - host IRQ 处理延迟 (host 调度、中断关闭)
+ *     - KVM 中断路由延迟 (irqfd -> vIRR)
+ *     - 中断窗口等待 (guest 关中断时间过长)
+ *     - VM-Entry/VM-Exit 开销
+ *
+ * ======================== 内核源码映射 ========================
+ *
+ *   中断注入路径:
+ *     virt/kvm/eventfd.c:
+ *       irqfd_wakeup()           // irqfd 被触发
+ *       -> kvm_set_irq()         // 设置虚拟中断 pending
+ *
+ *     arch/x86/kvm/irq_comm.c:
+ *       kvm_set_irq()
+ *       -> kvm_set_msi() / kvm_set_ioapic()
+ *       -> kvm_irq_delivery_to_apic()
+ *
+ *     arch/x86/kvm/lapic.c:
+ *       kvm_apic_set_irq()       // 设置 vLAPIC IRR
+ *       -> apic_set_irq()        // 设置 vIRR 位
+ *
+ *     arch/x86/kvm/x86.c:
+ *       vcpu_enter_guest()
+ *       -> kvm_check_async_pf_completion()
+ *       -> inject_pending_event() // 检查并注入 pending 中断
+ *       -> static_call(kvm_x86_inject_irq)()
+ *
+ *   中断窗口退出 (Interrupt Window Exit):
+ *     arch/x86/kvm/vmx/vmx.c:
+ *       handle_interrupt_window() // exit_reason = 7
+ *       -> 清除 VMCS 的 Interrupt Window Exiting 控制位
+ *       -> 允许 VM-Entry 继续
+ *
+ *   追踪点:
+ *     kvm:kvm_entry       - VM-Entry (含注入中断信息)
+ *     kvm:kvm_exit        - VM-Exit (中断窗口退出 reason=7)
+ *     kvm:kvm_ack_irq     - 中断确认 (EOI)
+ *     kvm:kvm_set_irq     - 设置中断 pending
+ *     irq:irq_handler_entry - Host IRQ 处理入口
+ *     irq:irq_handler_exit  - Host IRQ 处理出口
+ *
+ * ======================== bpftrace 等效命令 ========================
+ *
+ *   # 中断注入延迟 (irq_handler -> VM-Entry):
+ *   bpftrace -e '
+ *   tracepoint:irq:irq_handler_entry { @irq_ts[args->irq] = nsecs; }
+ *   tracepoint:kvm:kvm_entry /@irq_ts[arg0]/ {
+ *       @latency = hist(nsecs - @irq_ts[arg0]);
+ *       delete(@irq_ts[arg0]);
+ *   }'
+ *
+ * ======================== ftrace 等效命令 ========================
+ *
+ *   # 追踪中断注入
+ *   echo kvm:kvm_entry > /sys/kernel/debug/tracing/set_event
+ *   echo kvm:kvm_set_irq >> /sys/kernel/debug/tracing/set_event
+ *   cat /sys/kernel/debug/tracing/trace_pipe
+ *
+ *   # 追踪中断窗口退出
+ *   echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event
+ *   echo 'reason==7' > /sys/kernel/debug/tracing/events/kvm/kvm_exit/filter
+ *   cat /sys/kernel/debug/tracing/trace_pipe
+ *
+ *   # 使用 trace-cmd 分析延迟
+ *   trace-cmd record -e kvm:kvm_entry -e kvm:kvm_set_irq \
+ *       -e irq:irq_handler_entry sleep 10
+ *   trace-cmd report | grep -E 'kvm_set_irq|kvm_entry'
+ *
+ * ======================== 用法 ========================
+ *   sudo bpftrace trace-irq-latency.bpf
+ *   sudo bpftrace trace-irq-latency.bpf -p <qemu_pid>
+ */
+
+BEGIN
+{
+    printf("[IRQ 延迟追踪] bpftrace 启动\n");
+    printf("  追踪: host IRQ -> KVM 中断注入 -> guest 接收\n");
+    printf("  等效 ftrace: echo kvm:kvm_entry kvm:kvm_set_irq > set_event\n");
+    printf("  按 Ctrl+C 退出并显示汇总\n\n");
+}
+
+/*
+ * === Host 中断入口 ===
+ * 记录每个 IRQ 号的处理开始时间
+ *
+ * 内核路径:
+ *   arch/x86/kernel/irq.c: __common_interrupt()
+ *   -> generic_handle_irq_desc()
+ *   -> trace_irq_handler_entry()  <-- 此处
+ */
+tracepoint:irq:irq_handler_entry
+{
+    @irq_start[args->irq] = nsecs;
+    @irq_count[args->irq] = count();
+}
+
+/*
+ * === Host 中断出口 ===
+ * 计算 host IRQ handler 处理耗时
+ * 如果 handler 中包含 kvm 通知, 这段时间是延迟的一部分
+ */
+tracepoint:irq:irq_handler_exit
+/@irq_start[args->irq]/
+{
+    $dur = nsecs - @irq_start[args->irq];
+    @irq_handler_ns = hist($dur);
+    delete(@irq_start[args->irq]);
+}
+
+/*
+ * === KVM 中断设置 (pending) ===
+ * 当 KVM 收到中断通知, 设置虚拟 IRR 位图
+ *
+ * 内核路径:
+ *   virt/kvm/eventfd.c: irqfd_wakeup()
+ *   -> kvm_set_irq()
+ *   -> trace_kvm_set_irq()  <-- 此处
+ *
+ * 从 host IRQ 到 kvm_set_irq 的延迟 = irqfd 通知延迟
+ */
+tracepoint:kvm:kvm_set_irq
+{
+    @setirq_count = count();
+    @setirq_by_source[args->irq_source] = count();
+
+    /* 记录时间戳, 用于计算注入延迟 */
+    @setirq_ts = nsecs;
+}
+
+/*
+ * === VM-Entry ===
+ * 实际的中断注入发生在 VM-Entry 时
+ * injection = 1 表示本次 VM-Entry 会递送一个中断
+ *
+ * 内核路径:
+ *   arch/x86/kvm/x86.c: vcpu_enter_guest()
+ *   -> inject_pending_event()
+ *   -> trace_kvm_entry(injection, vector)  <-- 此处
+ *
+ * 参数:
+ *   args->vcpu_id : vCPU ID
+ *   args->injection : 是否注入中断 (1/0)
+ *   args->vector    : 中断向量号 (0-255)
+ */
+tracepoint:kvm:kvm_entry
+/args->injection == 1/
+{
+    @inject_count = count();
+    @inject_by_vector[args->vector] = count();
+    @inject_by_vcpu[args->vcpu_id] = count();
+
+    /*
+     * 计算中断注入延迟:
+     *   kvm_set_irq 时间 -> VM-Entry 时间
+     *   这段时间包含: 中断路由 + 等待中断窗口 + VM-Entry 准备
+     */
+    if (@setirq_ts > 0) {
+        $delay = nsecs - @setirq_ts;
+        @inject_latency_ns = hist($delay);
+        delete(@setirq_ts);
+    }
+}
+
+/*
+ * === 中断窗口退出 ===
+ * Guest 正在执行但需要等待中断递送时, KVM 请求中断窗口退出
+ *
+ * 内核路径:
+ *   arch/x86/kvm/vmx/vmx.c: handle_interrupt_window()
+ *   VMCS: CPU-based VM-Execution Controls -> "interrupt-window exiting"
+ *
+ * 高频中断窗口退出意味着 guest 频繁被中断, 性能受影响
+ */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 7/
+{
+    @int_window_count = count();
+    @int_window_by_vcpu[args->guest_rip] = count();
+}
+
+/*
+ * === EOI (End of Interrupt) 追踪 ===
+ * Guest 完成中断处理后发送 EOI
+ *
+ * 内核路径:
+ *   arch/x86/kvm/lapic.c: kvm_apic_set_eoi_accelerated()
+ *   -> trace_kvm_ack_irq()
+ */
+tracepoint:kvm:kvm_ack_irq
+{
+    @eoi_count = count();
+    @eoi_by_vector[args->vector] = count();
+}
+
+/*
+ * 每 5 秒输出统计摘要
+ */
+interval:s:5
+{
+    time("%H:%M:%S ");
+    printf("== IRQ 延迟统计 ==\n");
+
+    printf("  Host IRQ 处理次数:\n");
+    print(@irq_count, 5);
+
+    printf("  Host IRQ handler 耗时分布 (ns):\n");
+    print(@irq_handler_ns);
+
+    printf("\n  KVM 中断设置次数: ");
+    print(@setirq_count);
+
+    printf("  中断注入次数 (vector != 0): ");
+    print(@inject_count);
+
+    printf("  注入延迟分布 (ns):\n");
+    print(@inject_latency_ns);
+
+    printf("  中断窗口退出次数: ");
+    print(@int_window_count);
+
+    printf("  EOI 次数: ");
+    print(@eoi_count);
+
+    printf("\n  按中断向量:\n");
+    print(@inject_by_vector, 10);
+
+    printf("\n");
+
+    clear(@irq_count);
+    clear(@irq_handler_ns);
+    clear(@setirq_count);
+    clear(@inject_count);
+    clear(@inject_latency_ns);
+    clear(@int_window_count);
+    clear(@eoi_count);
+    clear(@inject_by_vector);
+}
+
+END
+{
+    printf("\n===== IRQ 延迟追踪最终汇总 =====\n\n");
+
+    printf("中断向量含义参考:\n");
+    printf("  向量 32-47  : 硬件 IRQ (PIC remap)\n");
+    printf("  向量 48-223 : MSI/MSI-X 设备中断\n");
+    printf("  向量 254    : 虚拟中断递送 (APIC timer)\n");
+    printf("  向量 0x20   :  typically timer (PIT/HPET)\n");
+    printf("  向量 0x24   :  typically keyboard/mouse (8259)\n\n");
+
+    printf("等效 ftrace 命令:\n");
+    printf("  trace-cmd record -e kvm:kvm_entry -e kvm:kvm_set_irq ");
+    printf("-e irq:irq_handler_entry sleep 10\n");
+    printf("  trace-cmd report | grep -E 'kvm_entry|kvm_set_irq'\n");
+}

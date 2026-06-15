@@ -1,0 +1,232 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace-ept-faults.bpf - bpftrace 脚本: 追踪 KVM EPT 缺页异常
+ * KVM 深度学习项目 - 内存虚拟化篇
+ *
+ * ======================== 功能说明 ========================
+ *   1. 追踪 EPT Violation VM-Exit (exit_reason = 24)
+ *   2. 区分读/写/执行权限违规
+ *   3. 统计每个 VM 进程的 EPT 缺页频率
+ *   4. 追踪 EPT 页表修复 (page fault handler) 延迟
+ *   5. 识别高频缺页的 Guest 物理地址 (GPA) 区间
+ *
+ * ======================== KVM 内存虚拟化原理 ========================
+ *
+ *   EPT (Extended Page Table) 是 Intel 的二级页表机制:
+ *
+ *     Guest 虚拟地址 (GVA)
+ *         |
+ *         | Guest 页表 (CR3) -> Guest 物理地址 (GPA)
+ *         v
+ *     Guest 物理地址 (GPA)
+ *         |
+ *         | EPT 页表 (EPTP) -> 主机物理地址 (HPA)
+ *         v
+ *     主机物理地址 (HPA)
+ *
+ *   当 GPA -> HPA 映射缺失时, 触发 EPT Violation:
+ *     1. CPU 硬件自动 VM-Exit (exit_reason = 24)
+ *     2. KVM 内核模块处理: kvm_mmu_page_fault()
+ *     3. 建立 EPT 映射 (或模拟 MMIO 访问)
+ *     4. VM-Entry 继续执行 guest
+ *
+ *   高频 EPT Violation 是 VM 性能杀手! 常见原因:
+ *     - 内存分配 (demand paging)
+ *     - 写时复制 (CoW)
+ *     - 内存热迁移 (dirty page tracking)
+ *     - MMIO 设备访问
+ *     - THP (Transparent Huge Page) 拆分
+ *
+ * ======================== 内核源码映射 ========================
+ *
+ *   EPT Violation 处理链:
+ *     arch/x86/kvm/vmx/vmx.c:
+ *       handle_ept_violation()
+ *       -> kvm_mmu_page_fault()   [通用缺页处理入口]
+ *
+ *     arch/x86/kvm/mmu/mmu.c:
+ *       kvm_mmu_page_fault()
+ *       -> vcpu->arch.mmu->page_fault()
+ *         -> kvm_tdp_page_fault()        [两级页表]
+ *         -> kvm_tdp_mmu_page_fault()    [TDP MMU, 新架构]
+ *
+ *     arch/x86/kvm/mmu/tdp_mmu.c:
+ *       kvm_tdp_mmu_page_fault()
+ *       -> kvm_tdp_page_fault_handle()
+ *         -> tdp_mmu_map_spte()          [建立 SPTE 映射]
+ *
+ *   追踪点:
+ *     kvm:kvm_page_fault  - KVM 缺页处理 (推荐)
+ *     kvm:kvm_exit (reason=24) - VM-Exit 级别
+ *
+ *   关键数据结构:
+ *     struct kvm_page_fault {
+ *         gpa_t addr;          // Guest 物理地址
+ *         u32 error_code;      // 错误码 (读/写/执行/user/smap)
+ *         bool is_tdp;         // 是否使用 TDP (EPT/NPT)
+ *         bool rsvd;           // 保留位错误 (EPT misconfig)
+ *     };
+ *
+ * ======================== bpftrace 等效命令 ========================
+ *
+ *   # 简单统计:
+ *   bpftrace -e 'tracepoint:kvm:kvm_exit /args->exit_reason == 24/ {
+ *       @ept_faults = count(); }'
+ *
+ *   # 按进程统计:
+ *   bpftrace -e 'tracepoint:kvm:kvm_exit /args->exit_reason == 24/ {
+ *       @ept[comm] = count(); }'
+ *
+ * ======================== ftrace 等效命令 ========================
+ *
+ *   # 方法1: 仅追踪 EPT 缺页
+ *   echo kvm:kvm_page_fault > /sys/kernel/debug/tracing/set_event
+ *   cat /sys/kernel/debug/tracing/trace_pipe
+ *
+ *   # 方法2: 过滤 exit_reason=24
+ *   echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event
+ *   echo 'reason==24' > /sys/kernel/debug/tracing/events/kvm/kvm_exit/filter
+ *   cat /sys/kernel/debug/tracing/trace_pipe
+ *
+ *   # 方法3: 统计 EPT 缺页频率
+ *   trace-cmd record -e kvm:kvm_page_fault sleep 10
+ *   trace-cmd report | grep page_fault | awk '{print $5}' | sort | uniq -c | sort -rn
+ *
+ * ======================== 用法 ========================
+ *   sudo bpftrace trace-ept-faults.bpf
+ *   sudo bpftrace trace-ept-faults.bpf -p <qemu_pid>
+ *
+ * ======================== 预期输出 ========================
+ *   [EPT Fault 追踪] 等待事件...
+ *
+ *   == EPT Violation 统计 (每 5 秒) ==
+ *   总 EPT 缺页: 12,345
+ *
+ *   按进程:
+ *     qemu-system-x86  10,234  (83%)
+ *     qemu-system-arm   2,111  (17%)
+ *
+ *   按错误类型:
+ *     写违规 (Write)       8,500  (69%)
+ *     读违规 (Read)        3,200  (26%)
+ *     执行违规 (Execute)     645  ( 5%)
+ */
+
+BEGIN
+{
+    printf("[EPT Fault 追踪] bpftrace 启动\n");
+    printf("  追踪点: kvm:kvm_exit (exit_reason == 24)\n");
+    printf("  追踪点: kvm:kvm_page_fault\n");
+    printf("  等效 ftrace: echo kvm:kvm_page_fault > set_event\n");
+    printf("  按 Ctrl+C 退出并显示汇总\n\n");
+
+    /*
+     * 错误码位定义 (Intel SDM Vol.3C 27.2.1):
+     *   Bit 0: 页不存在 (P)     - EPT 页表项为空
+     *   Bit 1: 写操作 (W)       - guest 尝试写入
+     *   Bit 2: 用户态 (U)       - guest CPL=3
+     *   Bit 3: 保留位 (RSVD)    - EPT 页表项保留位被设置
+     *   Bit 4: 指令获取 (ID)    - guest 尝试执行
+     */
+}
+
+/*
+ * 追踪点: kvm:kvm_exit
+ * 仅捕获 EPT Violation (exit_reason = 24)
+ *
+ * 内核位置: arch/x86/kvm/vmx/vmx.c: handle_ept_violation()
+ * VMCS 字段:
+ *   EXIT_QUALIFICATION: 包含 GPA 和访问类型信息
+ *   GUEST_PHYSICAL_ADDRESS: 触发缺页的 GPA
+ */
+tracepoint:kvm:kvm_exit
+/args->exit_reason == 24/
+{
+    @ept_total = count();
+    @ept_by_comm[comm] = count();
+
+    /*
+     * args->info1 对应 VMCS Exit Qualification:
+     *   Bit 0: 读访问
+     *   Bit 1: 写访问
+     *   Bit 2: 执行访问 (指令获取)
+     */
+    @ept_by_access_type[args->info1 & 0x7] = count();
+
+    /* 追踪 Guest RIP, 可反汇编定位 guest 代码位置 */
+    @guest_rip[args->guest_rip] = count();
+}
+
+/*
+ * 追踪点: kvm:kvm_page_fault
+ * 更底层的缺页处理追踪点
+ *
+ * 内核位置: arch/x86/kvm/mmu/mmu.c: kvm_mmu_page_fault()
+ * 参数:
+ *   args->address : 缺页地址 (GPA 或 GVA)
+ *   args->error_code : 页错误码
+ *   args->async : 是否为异步页错误
+ */
+tracepoint:kvm:kvm_page_fault
+{
+    @pf_total = count();
+    @pf_by_comm[comm] = count();
+
+    /*
+     * 错误码解析 (与页表错误码相同):
+     *   Bit 0: Protection violation (vs. not-present)
+     *   Bit 1: Write (vs. Read)
+     *   Bit 2: User-mode (vs. Supervisor)
+     *   Bit 3: Reserved bit set
+     *   Bit 4: Instruction fetch
+     */
+    @pf_by_error[args->error_code & 0x1f] = count();
+}
+
+/*
+ * 每 5 秒输出一次统计摘要
+ * 对应: ftrace 中需要手动 cat trace | awk 统计
+ */
+interval:s:5
+{
+    time("%H:%M:%S ");
+    printf("== EPT Violation 统计 ==\n");
+
+    printf("  VM-Exit EPT 总数: ");
+    print(@ept_total);
+
+    printf("\n  按进程 (comm):\n");
+    print(@ept_by_comm, 5);
+
+    printf("\n  按访问类型 (Exit Qualification):\n");
+    printf("    0x1 = 读, 0x2 = 写, 0x4 = 执行\n");
+    print(@ept_by_access_type);
+
+    printf("\n  KVM Page Fault 总数: ");
+    print(@pf_total);
+
+    printf("\n  按错误码:\n");
+    print(@pf_by_error, 5);
+
+    printf("\n  Top Guest RIP (缺页触发位置):\n");
+    print(@guest_rip, 5);
+
+    printf("\n");
+
+    /* 清除本轮统计, 仅显示增量 */
+    clear(@ept_total);
+    clear(@ept_by_comm);
+    clear(@ept_by_access_type);
+    clear(@guest_rip);
+    clear(@pf_total);
+    clear(@pf_by_comm);
+    clear(@pf_by_error);
+}
+
+END
+{
+    printf("\n===== 最终 EPT 缺页汇总 =====\n");
+    printf("等效 ftrace 命令:\n");
+    printf("  echo kvm:kvm_page_fault > /sys/kernel/debug/tracing/set_event\n");
+    printf("  cat /sys/kernel/debug/tracing/trace_pipe\n\n");
+}

@@ -1,0 +1,1 @@
+savedcmd_/root/code/kvm-study/examples/minimal-vmx/vmx-demo.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T scripts/module.lds -o /root/code/kvm-study/examples/minimal-vmx/vmx-demo.ko /root/code/kvm-study/examples/minimal-vmx/vmx-demo.o /root/code/kvm-study/examples/minimal-vmx/vmx-demo.mod.o

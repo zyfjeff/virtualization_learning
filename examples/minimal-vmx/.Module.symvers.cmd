@@ -1,0 +1,1 @@
+savedcmd_/root/code/kvm-study/examples/minimal-vmx/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /root/code/kvm-study/examples/minimal-vmx/Module.symvers -T /root/code/kvm-study/examples/minimal-vmx/modules.order -i Module.symvers -e 

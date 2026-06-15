@@ -1,0 +1,1 @@
+savedcmd_/root/code/kvm-study/examples/minimal-vmx/vmx-info/vmx-info.mod := printf '%s\n'   vmx-info.o | awk '!x[$$0]++ { print("/root/code/kvm-study/examples/minimal-vmx/vmx-info/"$$0) }' > /root/code/kvm-study/examples/minimal-vmx/vmx-info/vmx-info.mod
