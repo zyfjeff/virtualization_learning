@@ -110,9 +110,10 @@ echo > "$TRACEFS/trace"
 echo 0 > "$TRACEFS/tracing_on"
 
 # 设置缺页相关事件
+# ★ kvm:kvm_page_fault 是 6.12.93 中真实存在的 trace event
 echo kvm:kvm_page_fault > "$TRACEFS/set_event"
-echo kvm:kvm_mmu_paging_element >> "$TRACEFS/set_event" 2>/dev/null || true
-echo kvm:kvm_mmu_set_spte >> "$TRACEFS/set_event" 2>/dev/null || true
+# 注: kvm:kvm_mmu_paging_element 和 kvm:kvm_mmu_set_spte 在 6.12 中不存在
+# 如需 SPTE 操作跟踪，请使用 -a 选项启用 function trace
 
 # 如果指定了页级别过滤
 if [ -n "$LEVEL" ]; then
@@ -137,8 +138,8 @@ if [ "$ALL_DETAILS" = true ]; then
     echo kvm_tdp_page_fault >> "$TRACEFS/set_ftrace_filter"
     echo kvm_tdp_mmu_map >> "$TRACEFS/set_ftrace_filter"
     echo make_spte >> "$TRACEFS/set_ftrace_filter"
-    echo tdp_mmu_set_spte_atomic >> "$TRACEFS/set_ftrace_filter"
-    echo kvm_mmu_get_page >> "$TRACEFS/set_ftrace_filter"
+    echo __tdp_mmu_set_spte_atomic >> "$TRACEFS/set_ftrace_filter"
+    # 注: kvm_mmu_get_page 在 6.12 中不存在
 fi
 
 # 开始跟踪
@@ -173,9 +174,9 @@ if [ "$SUMMARY_ONLY" = true ]; then
         echo "  执行缺页: $(echo "$TRACE_DATA" | grep "kvm_page_fault" | grep -c "exec" || echo 0)"
         echo ""
 
-        # 分析 SPTE 操作
-        SPTE_OPS=$(echo "$TRACE_DATA" | grep "kvm_mmu_set_spte" | wc -l)
-        echo "SPTE 操作次数: $SPTE_OPS"
+        # 分析 SPTE 操作 (通过 function trace 捕获 make_spte 调用)
+        SPTE_OPS=$(echo "$TRACE_DATA" | grep "make_spte" | wc -l)
+        echo "SPTE 构造次数 (make_spte): $SPTE_OPS"
     fi
 
 else
@@ -205,10 +206,12 @@ else
         echo "  1GB 大页映射: $(echo "$TRACE_DATA" | grep "level=3" | wc -l)"
         echo ""
 
-        # SPTE 分析
-        echo -e "${BLUE}--- SPTE 操作 ---${NC}"
-        SPTE_OPS=$(echo "$TRACE_DATA" | grep "kvm_mmu_set_spte" | wc -l)
-        echo "  SPTE 设置次数: $SPTE_OPS"
+        # SPTE 分析 (通过 function trace)
+        echo -e "${BLUE}--- SPTE 构造 (make_spte 函数调用) ---${NC}"
+        SPTE_OPS=$(echo "$TRACE_DATA" | grep "make_spte" | wc -l)
+        echo "  make_spte 调用次数: $SPTE_OPS"
+        TDP_MAP=$(echo "$TRACE_DATA" | grep "kvm_tdp_mmu_map" | wc -l)
+        echo "  kvm_tdp_mmu_map 调用次数: $TDP_MAP"
         echo ""
 
         # 显示前 30 个缺页事件
@@ -237,4 +240,4 @@ echo "提示:"
 echo "  - 使用 trace-cmd 可以保存完整数据:"
 echo "    trace-cmd record -e kvm:kvm_page_fault -p $PID -- sleep $DURATION"
 echo "  - 分析大页效果: 对比 level=1 和 level=2 的数量"
-echo "  - 跟踪脏页: 观察 kvm_mmu_set_spte 中 W 位的变化"
+echo "  - 跟踪脏页: 使用 -a 选项启用函数跟踪，观察 make_spte 的调用模式"

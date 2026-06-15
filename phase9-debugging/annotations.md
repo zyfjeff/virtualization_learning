@@ -293,9 +293,186 @@ done
 
 ---
 
-## 3. ftrace 高级用法
+## 3. KVM sysfs 与 debugfs 接口
 
-### 3.1 Function tracer
+### 3.1 sysfs 模块参数 (`/sys/module/kvm*/parameters/`)
+
+```
+KVM 核心模块参数 (kvm):
+──────────────────────────────────────────────────────────────────
+halt_poll_ns              [uint]   全局 halt-polling 上限 (默认 400000ns)
+halt_poll_ns_grow         [uint]   增长倍数 (默认 2)
+halt_poll_ns_grow_start   [uint]   增长起始值 (默认 10000ns)
+halt_poll_ns_shrink       [uint]   缩小除数 (默认 2)
+tdp_mmu                   [bool]   启用 TDP MMU (默认 1)
+nx_huge_pages             [bool]   NX 大页缓解 (默认 1)
+nx_huge_pages_recovery_period_ms [uint] NX 大页恢复周期
+nx_huge_pages_recovery_ratio [uint] NX 大页恢复比例
+mmio_caching              [bool]   MMIO 缓存 (默认 1)
+eager_page_split          [bool]    eager 页分裂
+lapic_timer_advance_ns    [int]    LAPIC 定时器提前量 (默认自动)
+min_timer_period_us       [uint]   最小定时器周期
+kvmclock_periodic_sync    [bool]   kvmclock 定期同步
+pi_inject_timer           [bool]   PI 注入定时器
+tsc_tolerance_ppm         [uint]   TSC 容差 (ppm)
+
+Intel VMX 模块参数 (kvm_intel):
+──────────────────────────────────────────────────────────────────
+ept                       [bool]   ★ 启用 EPT (默认 1)
+eptad                     [bool]   ★ EPT A/D 位 (默认 1)
+vpid                      [bool]   VPID 支持 (默认 1)
+enable_apicv              [bool]   ★ APIC 虚拟化 (默认 1)
+enable_ipiv               [bool]   IPI 虚拟化 (默认 1)
+flexpriority              [bool]   TPR Shadow (默认 1)
+fasteoi                   [bool]   快速 EOI (默认 1)
+nested                    [bool]   ★ 嵌套虚拟化 (默认 1)
+pml                       [bool]   ★ PML 脏页日志 (默认 1)
+ple_gap                   [uint]   PLE gap (默认 128)
+ple_window                [uint]   PLE 窗口 (默认 4096)
+ple_window_grow           [uint]   PLE 窗口增长 (默认 2)
+ple_window_shrink         [uint]   PLE 窗口缩小 (默认 2)
+ple_window_max            [uint]   PLE 窗口上限 (默认 16384)
+enable_shadow_vmcs        [bool]   shadow VMCS (嵌套用)
+enlightened_vmcs          [bool]   Hyper-V enlightened VMCS
+emulate_invalid_guest_state [bool] 模拟无效 Guest 状态
+dump_invalid_vmcs         [bool]   dump 无效 VMCS (调试)
+allow_smaller_maxphyaddr  [bool]   允许较小的 MAXPHYADDR
+
+查看与修改:
+  cat /sys/module/kvm_intel/parameters/ept
+  echo 1 > /sys/module/kvm/parameters/halt_poll_ns
+  # 注意: 部分参数需要重启 KVM 模块才能生效
+```
+
+### 3.2 debugfs 接口 (`/sys/kernel/debug/kvm/`)
+
+```
+目录结构:
+  /sys/kernel/debug/kvm/
+  ├── <pid>-<vmid>/              ← 每个 VM 一个目录
+  │   ├── pid                    ← vCPU 对应的 host PID
+  │   ├── stats                  ← ★ VM 级统计数据 (二进制格式)
+  │   ├── mmu_rmaps_stat         ← MMU rmap 统计 (x86 特定)
+  │   ├── vcpu<n>/               ← 每个 vCPU 一个子目录
+  │   │   ├── pid                ← vCPU 线程 PID
+  │   │   ├── guest_mode         ← ★ 是否在 guest 模式 (0/1)
+  │   │   ├── tsc-offset         ← ★ 当前 TSC 偏移
+  │   │   ├── lapic_timer_advance_ns  ← LAPIC 定时器提前量
+  │   │   ├── tsc-scaling-ratio       ← TSC 缩放比率
+  │   │   └── tsc-scaling-ratio-frac-bits ← TSC 缩放分数位
+  │   └── stats                ← vCPU 级统计
+  │
+  ├── vm_stat_*                ← 全局 VM 统计 (二进制)
+  └── vcpu_stat_*              ← 全局 vCPU 统计 (二进制)
+
+常用操作:
+  # 查看某个 vCPU 是否在 guest 模式
+  cat /sys/kernel/debug/kvm/<pid>-<vmid>/vcpu0/guest_mode
+
+  # 查看 TSC 偏移
+  cat /sys/kernel/debug/kvm/<pid>-<vmid>/vcpu0/tsc-offset
+
+  # 查看 MMU rmap 统计
+  cat /sys/kernel/debug/kvm/<pid>-<vmid>/mmu_rmaps_stat
+```
+
+### 3.3 KVM 统计数据 (stats) 接口
+
+```
+KVM 通过 debugfs 暴露二进制 stats 接口:
+  - VM 级统计: /sys/kernel/debug/kvm/<pid>-<vmid>/stats
+  - vCPU 级统计: /sys/kernel/debug/kvm/<pid>-<vmid>/vcpu<n>/stats
+
+VM 级关键统计 (arch/x86/kvm/x86.c:233-246):
+  mmu_shadow_zapped     ← MMU shadow 页被回收次数
+  mmu_pte_write         ← PTE 写入次数
+  mmu_pde_zapped        ← PDE 被回收次数
+  mmu_flooded           ← MMU 被洪水攻击次数
+  mmu_recycled          ← MMU 页回收次数
+  mmu_cache_miss        ← MMU 缓存未命中
+  mmu_unsync            ← 非同步 MMU 页数
+  pages_4k              ← 4K 页数
+  pages_2m              ← 2MB 大页数
+  pages_1g              ← 1GB 大页数
+  nx_lpage_splits       ← NX 大页拆分次数
+  max_mmu_rmap_size     ← 最大 rmap 大小
+  max_mmu_page_hash_collisions ← 最大 MMU 页哈希冲突
+
+vCPU 级关键统计 (arch/x86/kvm/x86.c:259-271):
+  pf_taken              ← 缺页发生次数
+  pf_fixed              ← 缺页修复次数
+  pf_emulate            ← 模拟的缺页
+  pf_spurious           ← 虚假缺页
+  pf_fast               ← 快速路径缺页
+  pf_mmio_spte_created  ← MMIO SPTE 创建数
+  pf_guest              ← Guest 侧缺页
+  tlb_flush             ← TLB 刷新次数
+  invlpg                ← INVLPG 指令次数
+  exits                 ← ★ VM-Exit 总次数
+  io_exits              ← IO VM-Exit 次数
+  mmio_exits            ← MMIO VM-Exit 次数
+
+也可以使用二进制接口 KVM_GET_STATS_FD (include/uapi/linux/kvm.h:1541)
+  ioctl(vcpu_fd, KVM_GET_STATS_FD, 0)
+  → 返回 stats fd, 可 mmap 读取二进制数据
+
+工具:
+  - virt-what: 通过 stats 识别虚拟化类型
+  - 自定义工具: 解析二进制 stats 数据
+```
+
+### 3.4 实战: 使用 debugfs 监控 VM
+
+```bash
+#!/bin/bash
+# 监控 KVM VM 状态
+
+# 找到 KVM 目录
+KVM_DIR=$(ls -d /sys/kernel/debug/kvm/*/ 2>/dev/null | head -1)
+if [ -z "$KVM_DIR" ]; then
+    echo "未找到运行中的 VM"
+    exit 1
+fi
+
+echo "=== VM 信息 ==="
+echo "目录: $KVM_DIR"
+echo ""
+
+echo "=== vCPU 状态 ==="
+for vcpu_dir in "$KVM_DIR"/vcpu*/; do
+    vcpu=$(basename "$vcpu_dir")
+    pid=$(cat "$vcpu_dir/pid" 2>/dev/null)
+    guest_mode=$(cat "$vcpu_dir/guest_mode" 2>/dev/null)
+    tsc_offset=$(cat "$vcpu_dir/tsc-offset" 2>/dev/null)
+    timer_adv=$(cat "$vcpu_dir/lapic_timer_advance_ns" 2>/dev/null)
+    echo "  $vcpu: pid=$pid guest_mode=$guest_mode tsc_offset=$tsc_offset timer_adv=$timer_adv"
+done
+echo ""
+
+echo "=== MMU rmap 统计 ==="
+if [ -f "$KVM_DIR/mmu_rmaps_stat" ]; then
+    cat "$KVM_DIR/mmu_rmaps_stat"
+fi
+echo ""
+
+# 实时监控 vCPU guest_mode 变化
+echo "=== 实时监控 (Ctrl+C 停止) ==="
+while true; do
+    for vcpu_dir in "$KVM_DIR"/vcpu*/; do
+        vcpu=$(basename "$vcpu_dir")
+        mode=$(cat "$vcpu_dir/guest_mode" 2>/dev/null)
+        printf "%s: %s  " "$vcpu" "$( [ "$mode" = "1" ] && echo "IN_GUEST" || echo "OUT_GUEST" )"
+    done
+    printf "\r"
+    sleep 0.1
+done
+```
+
+---
+
+## 4. ftrace 高级用法
+
+### 4.1 Function tracer
 
 ```bash
 TRACEFS=/sys/kernel/debug/tracing
@@ -321,7 +498,7 @@ echo 0 > $TRACEFS/tracing_on
 cat $TRACEFS/trace | head -50
 ```
 
-### 3.2 Function graph tracer
+### 4.2 Function graph tracer
 
 ```bash
 TRACEFS=/sys/kernel/debug/tracing
@@ -349,7 +526,7 @@ echo 0 > $TRACEFS/tracing_on
 # }
 ```
 
-### 3.3 事件 + 函数组合
+### 4.3 事件 + 函数组合
 
 ```bash
 TRACEFS=/sys/kernel/debug/tracing
@@ -369,7 +546,7 @@ echo 0 > $TRACEFS/tracing_on
 # 输出会同时包含 event 和 function trace
 ```
 
-### 3.4 PID 过滤
+### 4.4 PID 过滤
 
 ```bash
 TRACEFS=/sys/kernel/debug/tracing
@@ -382,7 +559,7 @@ echo $VCPU1_TID > $TRACEFS/set_event_pid
 echo $VCPU2_TID >> $TRACEFS/set_event_pid
 ```
 
-### 3.5 实时流式输出
+### 4.5 实时流式输出
 
 ```bash
 # 实时查看 trace 输出
@@ -395,57 +572,6 @@ echo options:irq-info > /sys/kernel/debug/tracing/trace_options
 cat /sys/kernel/debug/tracing/trace_pipe > /tmp/trace.log &
 # ... 运行测试 ...
 kill %1
-```
-
----
-
-## 4. debugfs KVM 接口
-
-### 4.1 VM 级统计
-
-```bash
-# 列出所有 KVM VM 目录
-ls /sys/kernel/debug/kvm/
-
-# 每个 VM 的统计数据
-cat /sys/kernel/debug/kvm/<vm-id>/stats
-
-# 常见统计字段:
-# - mmu_shadow_zapped
-# - mmu_unsync
-# - mmu_recycled
-# - remote_tlb_flush
-# - request_irq_exits
-# - signal_exits
-# - ...
-```
-
-### 4.2 vCPU 级 debugfs
-
-```bash
-# 在 arch/x86/kvm/debugfs.c 中定义
-# 路径: /sys/kernel/debug/kvm/<vm-id>/vcpu/<vcpu-id>/
-
-# 可用文件:
-# - guest_mode (当前是否在 guest 模式)
-# - tsc-offset (当前 TSC 偏移)
-# - lapic_timer_advance_ns (LAPIC 定时器提前量)
-# - tsc-scaling-ratio (TSC 缩放比率)
-# - tsc-scaling-ratio-frac-bits (TSC 缩放的分数位数)
-# - mmu_rmaps_stat (MMU rmap 统计)
-```
-
-### 4.3 全局 KVM 统计
-
-```bash
-# 系统级 KVM 统计
-cat /sys/kernel/debug/kvm/*/stats
-
-# 或使用 kvm_stat 工具
-sudo kvm_stat
-
-# 或使用 virt-what
-cat /sys/kernel/debug/kvm/0/stats
 ```
 
 ---

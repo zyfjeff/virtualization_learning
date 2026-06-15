@@ -217,6 +217,118 @@ ple_gap/ple_window ← PLE窗口参数
 ### kvm 关键参数
 ```
 halt_poll_ns=400000    ← HLT轮询时间(ns)
+halt_poll_ns_grow=2    ← 增长倍数
+halt_poll_ns_grow_start=10000 ← 增长起始值(10μs)
+halt_poll_ns_shrink=2  ← 缩小除数
 nx_huge_pages=1        ← NX大页缓解
 mmio_caching=1         ← MMIO缓存
+```
+
+---
+
+## ★ Phase 8: 性能优化相关源码
+
+### halt-polling
+```
+virt/kvm/kvm_main.c:78-97    ← halt_poll_ns 模块参数定义
+virt/kvm/kvm_main.c:3670-3706 ← grow_halt_poll_ns() / shrink_halt_poll_ns()
+virt/kvm/kvm_main.c:3811-3882 ← kvm_vcpu_halt() (含自适应算法)
+include/trace/events/kvm.h    ← kvm_halt_poll_ns trace event
+```
+
+### PLE (Pause Loop Exiting)
+```
+arch/x86/kvm/vmx/vmx.c:194-219 ← ple_* 模块参数定义
+arch/x86/kvm/vmx/vmx.c:1417   ← grow_ple_window()
+arch/x86/kvm/vmx/vmx.c:5911-5924 ← handle_pause() (PLE 处理)
+virt/kvm/kvm_main.c:4037-4099 ← kvm_vcpu_on_spin() (自旋锁检测)
+arch/x86/kvm/trace.h          ← kvm_ple_window_update trace event
+```
+
+### PML (Page Modification Logging)
+```
+arch/x86/kvm/vmx/vmx.c:127-128 ← enable_pml 参数
+arch/x86/kvm/vmx/vmx.h:336    ← PML_ENTITY_NUM (512)
+arch/x86/kvm/vmx/vmx.c:4656   ← PML 检查逻辑
+arch/x86/kvm/trace.h          ← kvm_pml_full trace event
+```
+
+### TSC 同步
+```
+arch/x86/kvm/x86.c:2670-2783  ← __kvm_synchronize_tsc() / kvm_synchronize_tsc()
+arch/x86/kvm/x86.c:1951-1959  ← vmx_write_tsc_offset() / vmx_write_tsc_multiplier()
+arch/x86/kvm/trace.h          ← kvm_track_tsc, kvm_write_tsc_offset trace events
+```
+
+---
+
+## ★ Phase 9: 调试与测试相关源码
+
+### Trace Events 定义位置
+```
+arch/x86/kvm/trace.h           ← x86 特定 KVM trace events (70+ 个)
+include/trace/events/kvm.h     ← 通用 KVM trace events (20+ 个)
+include/trace/events/irq.h     ← 中断相关 trace events
+```
+
+### debugfs 接口
+```
+virt/kvm/kvm_main.c            ← KVM 通用 debugfs 接口
+arch/x86/kvm/debugfs.c         ← x86 特定 debugfs 接口
+  - guest_mode                 ← vCPU 是否在 guest 模式
+  - tsc-offset                 ← 当前 TSC 偏移
+  - lapic_timer_advance_ns     ← LAPIC 定时器提前量
+  - mmu_rmaps_stat             ← MMU rmap 统计
+```
+
+### KVM Selftests
+```
+tools/testing/selftests/kvm/   ← 完整测试框架目录
+  dirty_log_test.c             ← 脏页日志正确性测试
+  dirty_log_perf_test.c        ← ★ 脏页日志性能测试
+  demand_paging_test.c         ← ★ 按需分页性能测试
+  guest_memfd_test.c           ← ★ guest_memfd 测试 (6.12)
+  memslot_perf_test.c          ← memslot 操作性能测试
+  access_tracking_perf_test.c  ← 访问跟踪性能测试
+  kvm_page_table_test.c        ← KVM 页表测试
+  include/kvm_util.h           ← 测试工具库头文件
+  lib/kvm_util.c               ← KVM 操作封装
+```
+
+---
+
+## ★ Phase 10: MicroVM 相关源码
+
+### VM 创建启动路径
+```
+virt/kvm/kvm_main.c:5492-5533 ← kvm_dev_ioctl_create_vm()
+virt/kvm/kvm_main.c:1146-1265 ← kvm_create_vm()
+virt/kvm/kvm_main.c:4217      ← kvm_vm_ioctl_create_vcpu()
+virt/kvm/kvm_main.c:2124      ← kvm_vm_ioctl_set_memory_region()
+arch/x86/kvm/x86.c:11579-11697 ← kvm_arch_vcpu_ioctl_run() (首次 VM-Entry)
+```
+
+### guest_memfd (6.12 新增)
+```
+virt/kvm/guest_memfd.c         ← ★ guest_memfd 完整实现
+  kvm_gmem_create()            ← KVM_CREATE_GUEST_MEMFD 实现
+  kvm_gmem_populate()          ← 内存填充回调
+virt/kvm/kvm_mm.h:40           ← kvm_gmem_create() 声明
+arch/x86/kvm/Kconfig:88        ← KVM_PRIVATE_MEM 配置选项
+```
+
+### 嵌套虚拟化 (MicroVM 参考)
+```
+arch/x86/kvm/vmx/nested.c      ← ★ L1/L2 嵌套虚拟化
+arch/x86/kvm/vmx/nested.h      ← 嵌套虚拟化数据结构
+arch/x86/kvm/trace.h           ← kvm_nested_vmenter, kvm_nested_vmexit 等 trace events
+```
+
+### VFIO 安全模型
+```
+drivers/vfio/vfio_main.c       ← VFIO 主框架
+drivers/vfio/pci/vfio_pci_core.c ← PCI 设备直通
+  vfio_pci_core_enable()       ← 设备启用 (line 500)
+virt/kvm/vfio.c:296-360        ← KVM-VFIO 桥接 (kvm_vfio_set_attr)
+virt/kvm/vfio.c:352            ← kvm_vfio_ops 注册
 ```

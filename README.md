@@ -20,7 +20,9 @@
 - EPT页表管理 (并发、大页、脏页跟踪)
 - 中断虚拟化 (Posted Interrupts零VM-Exit)
 - vhost内核态加速 (数据面卸载)
-- 性能优化技术 (halt-polling, VPID, APICv)
+- ★ KVM性能优化技术 (halt-polling, VPID, APICv, PLE)
+- ★ KVM调试与测试 (ftrace, perf kvm stat, selftests, bpftrace)
+- ★ MicroVM架构专项 (启动路径, 最小设备模型, guest_memfd, 安全模型)
 
 ## 环境信息
 
@@ -67,6 +69,15 @@ kvm-study/
 │   ├── irq-path-trace.md        ← 项目5: 中断路径
 │   ├── timer-performance.md     ← 项目6: 时钟性能
 │   └── cpu-virtualization.md    ← 项目7: CPU虚拟化
+├── phase8-performance/          ← ★ 第八阶段：KVM性能优化深入 (新增!)
+│   ├── README.md                ← 性能优化概览 + 调优参数
+│   └── annotations.md           ← halt-polling/VPID/APICv/PLE源码注释
+├── phase9-debugging/            ← ★ 第九阶段：KVM调试与测试 (新增!)
+│   ├── README.md                ← 调试场景速查 + 决策树
+│   └── annotations.md           ← trace events目录 + selftests + bpftrace
+├── phase10-microvm/             ← ★ 第十阶段：MicroVM架构专项 (新增!)
+│   ├── README.md                ← MicroVM技术栈全景
+│   └── annotations.md           ← 启动路径/设备模型/安全模型/guest_memfd
 ├── examples/                    ← 可运行示例代码 (★ 重点!)
 │   ├── kvm-api-demo/            ← KVM API用户空间演示 (C语言)
 │   │   ├── kvm-demo.c           ← ★ 完整VM生命周期 (make && ./kvm-demo)
@@ -86,6 +97,18 @@ kvm-study/
 │       ├── trace-vfio-dma.bpf   ← VFIO DMA追踪
 │       ├── kvm-overview.bpf     ← KVM综合概览
 │       └── README.md
+├── mini-kvm/                  ← ★★ 实战项目: 简化版 KVM 实现 (新增!)
+│   ├── README.md                ← 项目说明 + 学习路径
+│   ├── mini-kvm.c               ← 内核模块主代码 (725 行)
+│   ├── mini-kvm.h               ← 内部头文件 (数据结构 + VMCS 编码)
+│   ├── test-mini-kvm.c          ← 用户空间测试程序
+│   ├── Makefile                 ← 构建脚本
+│   └── stages/                  ← 分阶段学习指南
+│       ├── stage1-vmx.md        ← Stage 1: VMX 基础 (对应 Phase 1)
+│       ├── stage2-ept.md        ← Stage 2: EPT 内存虚拟化 (对应 Phase 2)
+│       ├── stage3-interrupt.md  ← Stage 3: 中断注入 (对应 Phase 3)
+│       ├── stage4-device.md     ← Stage 4: 设备模拟 (对应 Phase 4-5)
+│       └── stage5-runloop.md    ← Stage 5: 运行循环 (对应 Phase 0, 8)
 └── scripts/                     ← 实践脚本
     ├── ftrace/                  ← ftrace 脚本集 (trace-vmexit.sh等)
     └── perf/                    ← perf 脚本集 (kvm-overview.sh等)
@@ -132,12 +155,19 @@ sudo bpftrace examples/bpf-programs/trace-vmexit.bpf
 | 5 | VFIO设备直通 | 2-3周 | vfio_main.c, vfio_pci_core.c | ✓ | trace-vfio-dma.bpf |
 | 6 | 时钟虚拟化 | 1周 | i8254.c, lapic.c(timer), x86.c(kvmclock) | ✓ | cyclictest对比 |
 | 7 | 综合实践 | 持续 | 全部 | - | 7个综合项目 |
+| 8 | ★ KVM性能优化深入 | 1-2周 | kvm_main.c(halt_poll), vmx.c(PLE) | ✓ | perf kvm stat |
+| 9 | ★ KVM调试与测试 | 1周 | trace.h, selftests/ | - | bpftrace 脚本集 |
+| 10 | ★ MicroVM架构专项 | 1-2周 | guest_memfd.c, nested.c | ✓ | Firecracker/Cloud Hypervisor |
 
 **新增特性**：
 - ✓ 每章包含VMM视角对比，帮助理解KVM设计决策
 - ✓ 每章包含性能优化技术，指导实际调优
 - ✓ 每章包含常见陷阱，避免踩坑
+- ✓ ★ 性能优化专题 (phase8): halt-polling/PLE/VPID 源码级分析
+- ✓ ★ 调试与测试专题 (phase9): 完整 trace events 目录 + selftests + bpftrace
+- ✓ ★ MicroVM架构专项 (phase10): guest_memfd/jailer/启动路径优化
 - ✓ 配套KVM调试实战指南 (`notes/debugging-guide.md`)
+- ✓ 所有 trace events 和函数行号均基于 6.12.93 实际源码验证
 
 ## 快速开始
 
