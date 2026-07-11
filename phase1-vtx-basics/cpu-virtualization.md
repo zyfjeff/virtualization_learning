@@ -11,11 +11,12 @@
 ## 📋 学习目标
 
 完成本章后，你应该能：
-1. 解释 CPUID 虚拟化的两种机制（静态过滤 vs 动态拦截）
-2. 画出 MSR 访问的完整路径（MSR Bitmap → VM-Exit → KVM处理）
-3. 列举至少 10 种触发 VM-Exit 的指令及其 KVM 处理方式
-4. 解释 `kvm_x86_ops` 回调表如何连接 x86 通用层和 VMX 实现
-5. 理解 `kvm_emulate_instruction()` 在指令模拟中的角色
+1. 解释 CPUID 虚拟化的机制（CPUID 总是触发 VM-Exit，KVM 返回虚拟化值）
+2. 解释 CPUID Faulting 的作用和工作原理
+3. 画出 MSR 访问的完整路径（MSR Bitmap → VM-Exit → KVM处理）
+4. 列举至少 10 种触发 VM-Exit 的指令及其 KVM 处理方式
+5. 解释 `kvm_x86_ops` 回调表如何连接 x86 通用层和 VMX 实现
+6. 理解 `kvm_emulate_instruction()` 在指令模拟中的角色
 
 ---
 
@@ -31,11 +32,11 @@ VMX 解决了最核心的问题：**Guest 代码在 Non-root 模式运行，特�
 │                  CPU 虚拟化的三大挑战                                │
 │                                                                     │
 │  ① CPUID — "我是什么CPU？"                                         │
-│     Guest 执行 CPUID 指令 → 硬件不拦截！直接返回真实CPU信息        │
-│     问题: Guest 看到了真实CPU型号/特性, 可能依赖不存在的特性        │
-│     解决: CPU_BASED_USE_MSR_BITMAPS 不控制CPUID,                   │
-│           KVM通过: CPUID VM-Exit (Secondary Exec Control)          │
-│           或 用户空间预过滤 (QEMU KVM_SET_CPUID2)                  │
+│     Guest 执行 CPUID 指令 → ★ 总是触发 VM-Exit ★                  │
+│     (Intel SDM: CPUID 在 VMX non-root 模式下无条件导致 VM-Exit)   │
+│     解决: KVM 通过 kvm_emulate_cpuid() 返回虚拟化值               │
+│           虚拟化值由 QEMU 通过 KVM_SET_CPUID2 配置                 │
+│           Guest 看到的是 QEMU 配置的"虚拟 CPU"信息                │
 │                                                                     │
 │  ② MSR — "模型特殊寄存器"                                         │
 │     数百个MSR, 控制CPU各种特性 (TSC, EFER, APIC_BASE, PAT...)     │
@@ -45,11 +46,12 @@ VMX 解决了最核心的问题：**Guest 代码在 Non-root 模式运行，特�
 │           不拦截的 → 直接访问物理MSR (高性能)                      │
 │                                                                     │
 │  ③ 特权指令 — 敏感但不被VMX自动拦截的指令                         │
-│     例如: CPUID, INVD, WBINVD, MONITOR, MWAIT, RDTSC, RDPMC       │
+│     例如: INVD, WBINVD, MONITOR, MWAIT, RDTSC, RDPMC              │
 │           SGDT, SIDT, SLDT, STR (读取GDT/IDT/LDT/TR)              │
 │           IN, OUT (IO端口访问)                                      │
 │     解决: 通过 VM-Execution Controls 配置哪些指令触发 VM-Exit      │
 │           Exit 后 KVM 模拟指令行为                                 │
+│     注意: CPUID 不属于此类, CPUID 总是触发 VM-Exit                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -59,30 +61,242 @@ VMX 解决了最核心的问题：**Guest 代码在 Non-root 模式运行，特�
 
 ### 1.1 硬件机制
 
-CPUID 指令比较特殊。VMX 提供了两种处理方式：
+CPUID 指令在 VMX 中的行为非常明确：
 
 ```
-┌─ 方式一: CPUID VM-Exit (Secondary Exec Control) ─────────────────┐
-│  VMCS.Secondary_VM_EXEC_CONTROL bit 12 = "CPUID exiting"         │
-│  启用后: 每次 Guest 执行 CPUID → VM-Exit → KVM 处理              │
-│  优点: 精确控制每次 CPUID 的返回值                                │
-│  缺点: 每次 CPUID 都 VM-Exit, 性能差                              │
-│  KVM 使用: 仅在嵌套虚拟化等特殊场景启用                           │
-└──────────────────────────────────────────────────────────────────┘
+┌─ 核心事实: CPUID 总是触发 VM-Exit ─────────────────────────────────┐
+│                                                                      │
+│  Intel SDM Vol.3, Section 25.1.2 明确规定:                          │
+│    "CPUID instruction (always; see Section 25.2)"                   │
+│                                                                      │
+│  在 VMX non-root 模式下:                                            │
+│    Guest 执行 CPUID → 无条件触发 VM-Exit                            │
+│    Exit Reason = 10 (EXIT_REASON_CPUID)                             │
+│    没有控制位可以关闭此行为（不存在 "CPUID exiting" 控制位）        │
+│                                                                      │
+│  常见误解:                                                           │
+│    ✗ "CPUID 可以不拦截, 直接返回真实值" ← 错误!                    │
+│    ✗ "Secondary Exec Control bit 12 是 CPUID exiting" ← 错误!      │
+│      (bit 12 实际是 INVPCID)                                        │
+│    ✗ "存在两种方式: 拦截和不拦截" ← 错误!                          │
+│                                                                      │
+│  实际行为:                                                           │
+│    ✓ CPUID 总是导致 VM-Exit                                         │
+│    ✓ KVM 通过 kvm_emulate_cpuid() 处理                              │
+│    ✓ 返回 QEMU 通过 KVM_SET_CPUID2 配置的值                        │
+│    ✓ Guest 看到的是完全虚拟化的 CPUID 值                            │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
-┌─ 方式二: 静态过滤 (主流方式) ───────────────────────────────────┐
-│  QEMU 在 vCPU 创建时调用 KVM_SET_CPUID2,                        │
-│  将允许的 CPUID 条目列表传给 KVM                                 │
-│  Guest 执行 CPUID → 硬件不拦截 → 返回真实值                     │
-│  但是! KVM 在 VM-Entry 前检查 CPUID 依赖关系,                   │
-│  禁用 Guest 不应看到的功能对应的 VMCS 控制位                     │
-│                                                                  │
-│  例: 如果 CPUID 告诉 Guest "没有 VMX",                          │
-│      KVM 就不会在 VMCS 中暴露嵌套虚拟化能力                      │
-│                                                                  │
-│  优点: CPUID 不触发 VM-Exit, 性能最优                            │
-│  缺点: Guest 看到真实CPUID值 (可能被用户空间预过滤)              │
-└──────────────────────────────────────────────────────────────────┘
+### 1.1.1 CPUID Faulting 机制（补充）
+
+CPUID Faulting 是一个独立于 VMX 的 CPU 特性，用于控制 CPUID 指令在不同特权级的行为。
+
+#### 1.1.1.1 原理
+
+```
+┌─ CPUID Faulting 控制 MSR ──────────────────────────────────────────┐
+│                                                                      │
+│  第一步: 确认 CPU 支持                                              │
+│    读 MSR_PLATFORM_INFO (0xCE) bit 31                              │
+│    或 CPUID leaf 7, sub-leaf 0, EBX bit 31                        │
+│    = 1 表示支持                                                     │
+│                                                                      │
+│  第二步: 启用                                                       │
+│    写 MSR_MISC_FEATURES_ENABLES (0x161) bit 0 = 1                 │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 启用后的行为 ─────────────────────────────────────────────────────┐
+│                                                                      │
+│  Ring 3 (CPL > 0, 用户态) 执行 CPUID:                              │
+│    → ★ 触发 #GP (General Protection Fault) ★                      │
+│    → 不是 VM-Exit! 是 #GP 异常                                    │
+│    → 用户态程序收到 SIGSEGV, 无法获取 CPUID 信息                  │
+│                                                                      │
+│  Ring 0 (CPL = 0, 内核态) 执行 CPUID:                              │
+│    → 正常执行, 返回 CPUID 值                                       │
+│    → 如果同时有 VMX: 会触发 VM-Exit (因为 CPUID 总是 VM-Exit)    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.1.1.2 事件优先级: CPUID Faulting vs VM-Exit
+
+这是理解 CPUID Faulting 在虚拟化中作用的关键：
+
+```
+┌─ Intel SDM 事件优先级 ─────────────────────────────────────────────┐
+│                                                                      │
+│  在 VMX non-root 模式下, 当 Ring 3 执行 CPUID 时:                  │
+│                                                                      │
+│  1. CPU 执行 CPUID 指令                                            │
+│  2. CPUID Faulting 检查 (如果启用 + Ring 3)                       │
+│     → 触发 #GP 异常                                                │
+│     → ★ #GP 先于 VM-Exit ★                                       │
+│     → 指令没有完成, 不会触发 CPUID 的 VM-Exit                     │
+│                                                                      │
+│  3. Guest 的 #GP 异常处理程序接管                                  │
+│     → 通常转换为 SIGSEGV 信号发给用户态程序                       │
+│                                                                      │
+│  结论: CPUID Faulting #GP 优先于 CPUID VM-Exit                    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 对比: 启用 vs 未启用 ─────────────────────────────────────────────┐
+│                                                                      │
+│  未启用 CPUID Faulting:                                            │
+│    Ring 3 CPUID → VM-Exit → KVM 返回虚拟化值 → VM-Entry          │
+│    每次开销: ~1-2 μs (VM-Exit/Entry 开销)                         │
+│                                                                      │
+│  启用 CPUID Faulting:                                              │
+│    Ring 3 CPUID → #GP (无 VM-Exit!)                               │
+│    Guest #GP 处理程序捕获异常                                      │
+│    每次开销: ~0.1 μs (#GP 异常处理)                               │
+│                                                                      │
+│  ★ 性能提升: 10-20 倍 ★                                         │
+│                                                                      │
+│  注意: Ring 0 的 CPUID 不受影响, 总是 VM-Exit                     │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.1.1.3 KVM 中的实现
+
+```
+┌─ 初始化: KVM 告诉 Guest 支持 CPUID Faulting ─────────────────────┐
+│                                                                      │
+│  来源: arch/x86/kvm/x86.c:12420-12424                             │
+│                                                                      │
+│  if (kvm_check_has_quirk(vcpu->kvm,                                │
+│                          KVM_X86_QUIRK_STUFF_FEATURE_MSRS))        │
+│  {                                                                   │
+│      vcpu->arch.msr_platform_info =                               │
+│          MSR_PLATFORM_INFO_CPUID_FAULT;  ← 设置为 1              │
+│  }                                                                   │
+│                                                                      │
+│  含义: KVM 默认让 Guest 看到 MSR_PLATFORM_INFO bit 31 = 1       │
+│        即告诉 Guest "我支持 CPUID Faulting"                       │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ Guest 启用: 写 MSR_MISC_FEATURES_ENABLES ──────────────────────┐
+│                                                                      │
+│  来源: arch/x86/kvm/x86.c:4115-4118                               │
+│                                                                      │
+│  case MSR_MISC_FEATURES_ENABLES:                                   │
+│      if (data & ~MSR_MISC_FEATURES_ENABLES_CPUID_FAULT ||        │
+│          (data & MSR_MISC_FEATURES_ENABLES_CPUID_FAULT &&        │
+│           !supports_cpuid_fault(vcpu)))                           │
+│          return 1;  ← 拒绝                                        │
+│      vcpu->arch.msr_misc_features_enables = data;                 │
+│                                                                      │
+│  检查逻辑:                                                         │
+│    1. 只能写 bit 0 (其他位必须为 0)                               │
+│    2. 要启用 CPUID_FAULT, 必须先确认支持                          │
+│       (supports_cpuid_fault 检查 MSR_PLATFORM_INFO bit 31)       │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ CPUID 处理时的防御性检查 ────────────────────────────────────────┐
+│                                                                      │
+│  来源: arch/x86/kvm/cpuid.c:1685-1686                             │
+│                                                                      │
+│  kvm_emulate_cpuid():                                              │
+│    if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))   │
+│        return 1;                                                   │
+│                                                                      │
+│  含义:                                                             │
+│    - cpuid_fault_enabled() = MSR_MISC_FEATURES_ENABLES bit 0     │
+│    - kvm_require_cpl(vcpu, 0) = 检查 CPL == 0                    │
+│    - 如果已启用 + Ring 3 → 不处理 CPUID                          │
+│                                                                      │
+│  实际上:                                                           │
+│    CPUID Faulting #GP 在硬件层面发生, 优先于 VM-Exit             │
+│    Ring 3 CPUID 根本不会到达 kvm_emulate_cpuid()                 │
+│    这个检查是防御性的, 防止某些边缘情况                          │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 辅助函数 ──────────────────────────────────────────────────────────┐
+│                                                                      │
+│  来源: arch/x86/kvm/cpuid.h:168-176                               │
+│                                                                      │
+│  static inline bool supports_cpuid_fault(struct kvm_vcpu *vcpu)   │
+│  {                                                                   │
+│      return vcpu->arch.msr_platform_info                          │
+│             & MSR_PLATFORM_INFO_CPUID_FAULT;                      │
+│  }                                                                   │
+│  // 检查 CPU 是否支持 CPUID Faulting (MSR_PLATFORM_INFO bit 31) │
+│                                                                      │
+│  static inline bool cpuid_fault_enabled(struct kvm_vcpu *vcpu)    │
+│  {                                                                   │
+│      return vcpu->arch.msr_misc_features_enables                  │
+│             & MSR_MISC_FEATURES_ENABLES_CPUID_FAULT;              │
+│  }                                                                   │
+│  // 检查 CPUID Faulting 是否已启用 (MSR_MISC_FEATURES_ENABLES   │
+│  // bit 0)                                                         │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.1.1.4 对虚拟化的影响
+
+```
+┌─ 性能影响 ──────────────────────────────────────────────────────────┐
+│                                                                      │
+│  Guest Ring 3 频繁调用 CPUID 的场景:                               │
+│                                                                      │
+│  未启用 CPUID Faulting:                                            │
+│    每次 CPUID → VM-Exit → KVM 处理 → VM-Entry                    │
+│    每秒 100 万次 → ~1-2 秒 CPU 时间用于 VM-Exit                  │
+│                                                                      │
+│  启用 CPUID Faulting:                                              │
+│    每次 CPUID → #GP (无 VM-Exit)                                  │
+│    每秒 100 万次 → ~0.1 秒 CPU 时间                              │
+│    ★ 性能提升: 10-20 倍 ★                                       │
+│                                                                      │
+│  Guest Ring 0 调用 CPUID:                                          │
+│    启用前后没有区别, 总是 VM-Exit                                  │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 功能影响 ──────────────────────────────────────────────────────────┐
+│                                                                      │
+│  Guest Ring 0 (内核):                                              │
+│    - CPUID 正常工作, 返回虚拟化值                                 │
+│    - 没有影响                                                      │
+│                                                                      │
+│  Guest Ring 3 (用户态):                                            │
+│    - CPUID 触发 #GP                                                │
+│    - 用户态程序无法直接读取 CPUID                                  │
+│    - 必须通过系统调用 (如 getauxval, vDSO) 获取 CPU 信息         │
+│    - 某些旧程序可能崩溃 (如果不处理 #GP)                          │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 使用建议 ──────────────────────────────────────────────────────────┐
+│                                                                      │
+│  建议启用:                                                          │
+│    - 安全敏感场景 (防止用户态探测 CPU 信息)                       │
+│    - 用户态频繁调用 CPUID 的性能敏感场景                           │
+│    - 现代 Guest OS (Linux 4.x+, Windows 10+)                      │
+│                                                                      │
+│  不建议启用:                                                        │
+│    - 运行旧版软件 (依赖 Ring 3 CPUID)                              │
+│    - 调试/分析工具需要用户态 CPUID 访问                            │
+│    - Guest 内核没有提供替代接口                                     │
+│                                                                      │
+│  配置方法 (QEMU):                                                   │
+│    qemu-system-x86_64 -cpu host,+cpuid_fault ...                  │
+│    或                                                               │
+│    qemu-system-x86_64 -cpu qemu64,cpuid-fault=on ...              │
+│                                                                      │
+│  Guest 内验证:                                                      │
+│    cat /proc/cpuinfo | grep cpuid_fault                            │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 1.2 KVM CPUID 数据结构
@@ -93,7 +307,9 @@ CPUID 指令比较特殊。VMX 提供了两种处理方式：
 /*
  * 一个 CPUID 条目
  * QEMU 通过 KVM_SET_CPUID2 传入一组这样的条目
- * KVM 保存后, 在 VM-Entry 时用来过滤/修改 Guest 可见的 CPUID
+ * KVM 保存后, 在 Guest 执行 CPUID 触发 VM-Exit 时返回这些值
+ * 注意: CPUID 在 VMX non-root 下总是触发 VM-Exit, 所以这些值
+ *       总是会返回给 Guest (不存在"不拦截"的情况)
  */
 struct kvm_cpuid_entry2 {
     u32 function;        /* CPUID 叶号 (EAX 输入值) */
@@ -141,29 +357,60 @@ QEMU 配置 CPUID:
             │
             ├── 检查嵌套虚拟化是否允许
             ├── 更新 VMCS Secondary Exec Controls
+            │     (例: 如果 Guest 没有 INVPCID, 禁用 ENABLE_INVPCID)
             ├── 更新 VMCS PIN/CPU_BASED Controls
-            ├── 更新 EPT/VPID/APICv 相关控制
-            └── 更新 MSR Bitmap (x2APIC 相关)
+            ├── 更新 MSR Bitmap (x2APIC 相关)
+            ├── 更新 CR4 保留位 (根据 Guest 支持的特性)
+            └── 更新 Exception Bitmap (根据 MAXPHYADDR 等)
 
 
-Guest 执行 CPUID:
+Guest 执行 CPUID (完整流程):
 
-  ┌─ 如果没有 "CPUID exiting" 控制 ──────────────────────────────┐
-  │  Guest 执行 CPUID → 直接返回真实 CPUID 值                    │
-  │  (用户空间已通过 KVM_SET_CPUID2 告诉 KVM 允许哪些特性)       │
-  │  KVM 在 VM-Entry 前已根据 CPUID 调整了 VMCS 控制位           │
-  │  → Guest 即使看到真实 CPUID, 也看不到被 VMCS 禁用的功能      │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ 总是触发 VM-Exit (无条件) ─────────────────────────────────────┐
+  │                                                                  │
+  │  Guest 执行 CPUID 指令                                         │
+  │    → ★ 无条件触发 VM-Exit (EXIT_REASON_CPUID = 10) ★          │
+  │    → 这是 Intel 硬件的固定行为, 没有控制位可以关闭             │
+  │                                                                  │
+  │  VM-Exit 后 KVM 处理:                                          │
+  │    vmx_handle_exit()                                            │
+  │      → kvm_vmx_exit_handlers[EXIT_REASON_CPUID]                │
+  │      → kvm_emulate_cpuid()  [cpuid.c]                          │
+  │        │                                                         │
+  │        │  1. 读取 Guest 请求的 leaf (EAX) 和 sub-leaf (ECX)    │
+  │        │  2. kvm_cpuid() 查找 vcpu->arch.cpuid_entries[]       │
+  │        │  3. 返回 QEMU 配置的值                                │
+  │        │  4. 写入 Guest 寄存器 (EAX/EBX/ECX/EDX)               │
+  │        │  5. 推进 Guest RIP (跳过 CPUID 指令, 2字节)           │
+  │        │                                                         │
+  │    → VM-Entry 继续 Guest                                        │
+  │                                                                  │
+  │  Guest 看到的是: QEMU 配置的虚拟 CPUID 值                      │
+  │  不是物理机的真实 CPUID 值                                      │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
 
-  ┌─ 如果有 "CPUID exiting" 控制 (嵌套虚拟化) ──────────────────┐
-  │  Guest 执行 CPUID → VM-Exit (EXIT_REASON_CPUID = 10)        │
-  │  → handle_cpuid() [vmx.c]                                    │
-  │    → kvm_emulate_cpuid()  [x86.c]                            │
-  │      → 从 vcpu->arch.cpuid_entries 中查找匹配条目           │
-  │      → 设置 EAX/EBX/ECX/EDX 为条目中的值                    │
-  │      → 推进 Guest RIP (跳过 CPUID 指令, 2字节)              │
-  │  → VM-Entry 继续 Guest                                       │
-  └──────────────────────────────────────────────────────────────┘
+
+拓扑模拟的具体例子 (-smp 8,sockets=2,cores=2,threads=2):
+
+  QEMU 为每个 vCPU 配置 CPUID leaf 0x0B (Extended Topology):
+
+  Level 0 (SMT/线程级):
+    EAX = 1        ← 1 bit 用于区分同一 core 内的 thread
+    EBX = 2        ← 每个 core 有 2 个 thread
+    ECX = 1        ← level 类型 = SMT
+    EDX = vcpu的 x2APIC ID
+
+  Level 1 (Core/核心级):
+    EAX = 3        ← 2 bits 用于区分同一 package 内的 core
+    EBX = 4        ← 每个 package 有 4 个 logical processor (2 cores × 2 threads)
+    ECX = 2        ← level 类型 = Core
+    EDX = vcpu的 x2APIC ID
+
+  Level 2:
+    ECX = 0        ← 没有更多 level
+
+  Guest Linux 解析后得到: 2 sockets × 2 cores × 2 threads = 8 CPUs
 ```
 
 ### 1.4 KVM 修改的 CPUID 叶
@@ -187,6 +434,22 @@ KVM 特别处理的 CPUID 叶:
 0x0000000A       PMU (性能监控单元)            修改:
                 EAX: PMU version, counters    - 根据 KVM 的 PMU 配置返回
                 EDX: fixed counters           - 可能减少可见的计数器数量
+
+0x0000000B       ★ 扩展拓扑 (Extended Topology) ★  KVM/QEMU 虚拟化:
+                Level 0 (SMT):                - EAX: 线程ID位宽
+                  EAX: 位宽                     - EBX: 每core的逻辑处理器数
+                  EBX: 逻辑处理器数             - ECX: level类型=1(SMT)
+                  ECX: level类型=1              - EDX: x2APIC ID
+                  EDX: x2APIC ID              Level 1 (Core):
+                Level 1 (Core):                 - EAX: 核心ID位宽
+                  EAX: 位宽                     - EBX: 每package的逻辑处理器数
+                  EBX: 逻辑处理器数             - ECX: level类型=2(Core)
+                  ECX: level类型=2              - EDX: x2APIC ID
+                  EDX: x2APIC ID              QEMU 根据 -smp 参数计算这些值
+                Guest 由此得知: socket/core/thread 拓扑
+
+0x0000001F       V2扩展拓扑 (更细粒度)         类似 0x0B, 增加 Module/Die 级别
+                                                Level 类型: 3=Module, 4=Die
 
 0x40000000       Hypervisor 信息              ★ KVM 注入:
                 EBX-EDX: "KVMKVMKVM\0\0\0"    - 告诉 Guest "你在虚拟化环境中"
@@ -355,6 +618,8 @@ x2APIC (0x800-0x8FF)      various       APICv启用时部分透传
 ┌─ VMX 自动拦截 (无需配置) ──────────────────────────────────────┐
 │  指令                 Exit原因                  KVM处理         │
 │  ──────────────────  ──────────────────────     ──────────────  │
+│  CPUID               EXIT_REASON_CPUID (10)    kvm_emulate_cpuid│
+│                        ★ 无条件拦截, 无控制位 ★  返回虚拟化值   │
 │  VMCALL              EXIT_REASON_VMCALL (18)   hypercall处理   │
 │  VMX指令族           EXIT_REASON_VMX*          嵌套VMX模拟     │
 │    VMCLEAR, VMLAUNCH, VMPTRLD, VMPTRST,                        │
@@ -443,7 +708,7 @@ x2APIC (0x800-0x8FF)      various       APICv启用时部分透传
  * static int (*const kvm_vmx_exit_handlers[])(...) = {
  *     [EXIT_REASON_EXCEPTION_NMI]     = handle_exception_nmi,
  *     [EXIT_REASON_EXTERNAL_INTERRUPT] = handle_external_interrupt,
- *     [EXIT_REASON_CPUID]             = handle_cpuid,
+ *     [EXIT_REASON_CPUID]             = kvm_emulate_cpuid,
  *     [EXIT_REASON_HLT]               = handle_halt,
  *     [EXIT_REASON_IO_INSTRUCTION]    = handle_io,
  *     [EXIT_REASON_CR_ACCESS]         = handle_cr,
@@ -559,8 +824,9 @@ cpuid -1 | head -50
 ### 5.2 ftrace 追踪 CPUID/MSR
 
 ```bash
-# 追踪 CPUID 拦截 (如果启用了CPUID exiting)
+# 追踪 CPUID 拦截 (CPUID 总是触发 VM-Exit)
 echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_cpuid/enable
+# 注意: 每次 Guest CPUID 都会产生 trace, 数量可能很大!
 
 # 追踪 MSR 访问
 echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_msr/enable
@@ -594,7 +860,9 @@ cat /sys/kernel/debug/tracing/trace | \
 ## ✅ 验证清单
 
 完成后确认能回答：
-- [ ] CPUID 虚拟化的两种机制是什么？各有什么优缺点？
+- [ ] CPUID 在 VMX non-root 模式下的行为是什么？为什么没有 "CPUID exiting" 控制位？
+- [ ] CPUID Faulting 是什么？启用后 Ring 0 和 Ring 3 的 CPUID 行为分别是什么？
+- [ ] Guest 的 CPU 拓扑信息（socket/core/thread）是如何通过 CPUID leaf 0x0B 模拟的？
 - [ ] MSR Bitmap 的 4KB 布局是什么？如何控制每个 MSR 的拦截？
 - [ ] 列举 5 个直接透传的 MSR 和 5 个必须拦截的 MSR，解释原因
 - [ ] VM-Exit 指令处理的两种路径（快速 vs 完整解码）分别在什么场景使用？

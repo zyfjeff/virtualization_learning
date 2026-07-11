@@ -1,0 +1,297 @@
+#
+# KVM Study - 最小内核配置
+#
+# 用于 KVM 学习和测试的最小 Linux 内核配置
+# 编译时间: ~5-10 分钟
+# 内核大小: ~10-15 MB
+#
+# 使用方法:
+#   cd linux-6.12.93
+#   cp /path/to/kernel-config .config
+#   make olddefconfig
+#   make -j$(nproc)
+#
+
+# ===========================================================================
+# 基本架构配置
+# ===========================================================================
+
+CONFIG_X86_64=y
+CONFIG_64BIT=y
+CONFIG_SMP=y                        # 多处理器支持
+CONFIG_NR_CPUS=8                    # 最大 CPU 数量
+
+# ===========================================================================
+# 内存管理
+# ===========================================================================
+
+CONFIG_PAGE_OFFSET=0xFFFF888000000000
+CONFIG_DIRECT_MAP_SIZE_MAX=0x40000000000
+CONFIG_HZ_250=y
+CONFIG_HZ=250
+
+# 大页支持（EPT 大页测试）
+CONFIG_HUGETLBFS=y
+CONFIG_HUGETLB_PAGE=y
+
+# ===========================================================================
+# KVM 虚拟化支持
+# ===========================================================================
+
+# 核心 KVM 支持
+CONFIG_KVM=y
+CONFIG_KVM_INTEL=y
+CONFIG_KVM_AMD=y
+
+# KVM 特性
+CONFIG_KVM_MMIO=y
+CONFIG_KVM_ASYNC_PF=y
+CONFIG_KVM_VFIO=y
+CONFIG_KVM_GENERIC_DIRTYLOG_READ_PROTECT=y
+CONFIG_HAVE_KVM_IRQCHIP=y
+CONFIG_HAVE_KVM_IRQFD=y
+CONFIG_HAVE_KVM_IRQ_ROUTING=y
+CONFIG_HAVE_KVM_EVENTFD=y
+CONFIG_KVM_XFER_TO_GUEST_WORK=y
+
+# CPU 虚拟化特性（VMX）
+# 这些通常自动启用，但明确列出便于学习
+# VMX 支持通过 CPU 特性检测自动启用
+
+# ===========================================================================
+# 串口控制台（QEMU 使用）
+# ===========================================================================
+
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_NR_UARTS=4
+CONFIG_SERIAL_8250_RUNTIME_UARTS=4
+CONFIG_SERIAL_8250_EXTENDED=y
+CONFIG_SERIAL_8250_MANY_PORTS=y
+CONFIG_SERIAL_8250_SHARE_IRQ=y
+CONFIG_SERIAL_8250_DETECT_IRQ=y
+CONFIG_SERIAL_8250_RSA=y
+
+# ===========================================================================
+# Virtio 设备（QEMU 使用）
+# ===========================================================================
+
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_RING=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VIRTIO_BALLOON=y
+CONFIG_VIRTIO_INPUT=y
+
+# ===========================================================================
+# 文件系统支持
+# ===========================================================================
+
+# 基本文件系统
+CONFIG_PROC_FS=y
+CONFIG_PROC_SYSCTL=y
+CONFIG_PROC_KCORE=y
+CONFIG_SYSFS=y
+CONFIG_TMPFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+
+# Initramfs 支持
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_INITRAMFS_SOURCE=""
+CONFIG_RD_GZIP=y
+
+# 内存文件系统
+CONFIG_CONFIGFS_FS=y
+
+# ===========================================================================
+# 文件系统支持
+# ===========================================================================
+
+# ext4 文件系统（用于 rootfs）
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_USE_FOR_EXT2=y
+CONFIG_EXT4_FS_POSIX_ACL=y
+CONFIG_EXT4_FS_SECURITY=y
+
+# 其他必要文件系统
+CONFIG_JBD2=y  # ext4 依赖
+
+# ===========================================================================
+# 网络和协议（基础）
+# ===========================================================================
+
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+
+# 9p 文件系统（用于 QEMU 共享目录）
+CONFIG_NET_9P=y
+CONFIG_NET_9P_VIRTIO=y
+CONFIG_9P_FS=y
+CONFIG_9P_FS_POSIX_ACL=y
+CONFIG_9P_FS_SECURITY=y
+
+# 网络过滤（可选，用于测试）
+CONFIG_NETFILTER=y
+CONFIG_BRIDGE_NETFILTER=y
+
+# ===========================================================================
+# 设备驱动（最小）
+# ===========================================================================
+
+# PCI 支持
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+
+# USB（禁用，减少编译时间）
+# CONFIG_USB is not set
+
+# 块设备
+CONFIG_BLK_DEV=y
+CONFIG_BLK_DEV_RAM=y
+CONFIG_BLK_DEV_RAM_SIZE=65536
+
+# ===========================================================================
+# 调试和追踪
+# ===========================================================================
+
+# Ftrace（用于追踪 VM-Exit 等事件）
+CONFIG_FTRACE=y
+CONFIG_FUNCTION_TRACER=y
+CONFIG_FUNCTION_GRAPH_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
+
+# KVM 追踪点
+CONFIG_KVM_TRACE=y
+
+# Perf 支持
+CONFIG_PERF_EVENTS=y
+
+# 调试信息
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_DWARF4=y
+
+# ===========================================================================
+# 安全特性
+# ===========================================================================
+
+# Spectre/Meltdown 缓解
+CONFIG_RETPOLINE=y
+CONFIG_PAGE_TABLE_ISOLATION=y
+
+# ===========================================================================
+# 模块支持
+# ===========================================================================
+
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+CONFIG_MODVERSIONS=y
+
+# ===========================================================================
+# 禁用的特性（减少编译时间和内核大小）
+# ===========================================================================
+
+# 禁用不需要的架构
+# CONFIG_ARM is not set
+# CONFIG_ARM64 is not set
+
+# 禁用图形
+# CONFIG_DRM is not set
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
+# CONFIG_VGA_CONSOLE is not set
+
+# 禁用不必要的网络设备
+# CONFIG_WIRELESS is not set
+# CONFIG_WIFI is not set
+
+# 禁用不必要的文件系统
+# CONFIG_EXT4_FS is not set
+# CONFIG_XFS_FS is not set
+# CONFIG_BTRFS_FS is not set
+
+# ===========================================================================
+# 电源管理（最小）
+# ===========================================================================
+
+CONFIG_PM=y
+CONFIG_PM_SLEEP=y
+
+# ===========================================================================
+# 加密（禁用，减少编译时间）
+# ===========================================================================
+
+# CONFIG_CRYPTO is not set
+
+# ===========================================================================
+# 日志和打印
+# ===========================================================================
+
+CONFIG_PRINTK=y
+CONFIG_PRINTK_TIME=y
+CONFIG_BOOT_PRINTK_DELAY=y
+CONFIG_DYNAMIC_DEBUG=y
+
+# ===========================================================================
+# 命令行使内核更小
+# ===========================================================================
+
+# 禁用不必要的调试选项
+# CONFIG_DEBUG_KERNEL is not set
+# CONFIG_DEBUG_VM is not set
+
+# ===========================================================================
+# 性能优化
+# ===========================================================================
+
+CONFIG_OPTIMIZE_INLINING=y
+CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
+
+# ===========================================================================
+# 特殊功能（用于学习）
+# ===========================================================================
+
+# CPUID Faulting 支持（通过 CPU 特性自动检测）
+# MSR 访问支持
+CONFIG_X86_MSR=y
+
+# TSC 支持
+CONFIG_X86_TSC=y
+CONFIG_X86_CMPXCHG64=y
+
+# APIC 支持
+CONFIG_X86_LOCAL_APIC=y
+CONFIG_X86_IO_APIC=y
+
+# ===========================================================================
+# 内核版本信息
+# ===========================================================================
+
+CONFIG_LOCALVERSION="-kvm-study"
+CONFIG_DEFAULT_HOSTNAME="kvm-test"
+
+# ===========================================================================
+# 注意
+# ===========================================================================
+
+# 这个配置是用于学习的，不是生产环境配置。
+# 它包含了 KVM 学习和测试所需的最小功能集。
+#
+# 编译命令:
+#   make olddefconfig
+#   make -j$(nproc) bzImage
+#
+# 生成的内核镜像:
+#   arch/x86/boot/bzImage
+#
+# 使用方法:
+#   qemu-system-x86_64 \
+#     -enable-kvm \
+#     -kernel arch/x86/boot/bzImage \
+#     -initrd /path/to/initramfs.img \
+#     -append "console=ttyS0" \
+#     -nographic \
+#     -m 512

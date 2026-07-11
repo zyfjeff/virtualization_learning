@@ -18,6 +18,7 @@
 | `README.md` | 本文件：VT-x硬件基础 + 学习指南 |
 | `annotations.md` | 源码精读：vmx_x86_ops, vmx_hardware_setup, vmx_vcpu_run |
 | `cpu-virtualization.md` | ★ CPU虚拟化：CPUID / MSR / 指令虚拟化 / kvm_x86_ops |
+| `practice/` | ★ 实战练习：VMX验证 / CPUID Faulting / MSR测试 / VM-Exit开销测量 |
 
 ## 推荐阅读顺序
 
@@ -38,7 +39,13 @@
   → 指令虚拟化: 哪些指令触发 VM-Exit
   → kvm_x86_ops: 通用层 ↔ VMX 桥梁
 
-第4步: 运行示例 + ftrace 追踪
+第4步: practice/ ← 实战练习
+  → ex1-vmx-verify: 验证 VMX 支持和能力
+  → ex2-cpuid-fault: 测试 CPUID Faulting 机制
+  → ex3-msr-test: 测量 MSR 访问时间
+  → ex5-vmexit-overhead: 测量 VM-Exit 开销
+
+第5步: 运行示例 + ftrace 追踪
   → kvm-demo: 完整 VM 生命周期
   → ftrace kvm_cpuid / kvm_msr: 观察拦截效果
 ```

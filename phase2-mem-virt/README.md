@@ -170,6 +170,211 @@ KVM 巧妙地在 SPTE 中混合了硬件和软件信息：
 └──────────────────────────────────────────────────────────┘
 ```
 
+### 2.4 内存类型处理（Memory Type）
+
+EPT SPTE 中需要显式设置内存类型，因为 **EPT 覆盖 host MTRR**。
+
+#### 2.4.1 内存类型位布局
+
+```
+  63  62  61  ...  7  6  5  4  3  2  1  0
+ ┌───┬───┬───┬───┬───┬──┬──┬──┬──┬──┬──┬──┐
+ │...│...│...│...│...│IP│MT │MT │MT │W │R │
+ │   │   │   │   │   │AT│ 2 │ 1 │ 0 │  │  │
+ └───┴───┴───┴───┴───┴──┴──┴──┴──┴──┴──┴──┘
+                        │  │  │
+                        └──┴──┴── 内存类型 (bit 3-5)
+                             │
+                             └──── Ignore PAT (bit 6)
+```
+
+**内存类型编码**（bit 3-5，基于 MTRR）：
+- `000` (0) = UC (Uncacheable)
+- `001` (1) = WC (Write Combining)
+- `010` (2) = 保留
+- `011` (3) = 保留
+- `100` (4) = WT (Write Through)
+- `101` (5) = WP (Write Protect)
+- `110` (6) = WB (Write Back)
+
+#### 2.4.2 内存类型的动态决策
+
+**关键代码**：`vmx_get_mt_mask()` in `arch/x86/kvm/vmx/vmx.c:7679`
+
+```c
+u8 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
+{
+    /*
+     * 强制 UC 用于 host MMIO 区域
+     * 如果允许 guest 用可缓存方式访问 MMIO，会导致 Machine Check
+     */
+    if (is_mmio)
+        return MTRR_TYPE_UNCACHABLE << VMX_EPT_MT_EPTE_SHIFT;
+        // 0 << 3 = 0x00 (UC)
+
+    /* 如果忽略 guest PAT，强制 WB */
+    if (vmx_ignore_guest_pat(vcpu->kvm))
+        return (MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT) | VMX_EPT_IPAT_BIT;
+        // 6 << 3 = 0x30 (WB) | IPAT
+
+    return (MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT);
+    // 6 << 3 = 0x30 (WB)
+}
+```
+
+**决策逻辑**：
+1. **MMIO 区域**（设备内存）→ **UC (Uncacheable)**，防止缓存导致设备行为异常
+2. **普通 RAM** → **WB (Write-Back)**，最大化缓存性能
+3. **IPAT 位**：控制是否忽略 guest PAT（通常不需要）
+
+#### 2.4.3 MMIO 检测机制
+
+**关键代码**：`kvm_is_mmio_pfn()` in `arch/x86/kvm/mmu/spte.c:108`
+
+```c
+static bool kvm_is_mmio_pfn(kvm_pfn_t pfn)
+{
+    if (pfn_valid(pfn))
+        return !is_zero_pfn(pfn) && PageReserved(pfn_to_page(pfn)) &&
+            /*
+             * Some reserved pages, such as those from NVDIMM
+             * DAX devices, are not for MMIO, and can be mapped
+             * with cached memory type for better performance.
+             */
+            (!pat_enabled() || pat_pfn_immune_to_uc_mtrr(pfn));
+
+    return !e820__mapped_raw_any(pfn_to_hpa(pfn),
+                                 pfn_to_hpa(pfn + 1) - 1,
+                                 E820_TYPE_RAM);
+}
+```
+
+**检测逻辑**：
+1. **pfn_valid(pfn) 为真**（有 `struct page`）：
+   - 检查是否是 `PageReserved`（保留页）
+   - 检查是否是零页
+   - 检查 PAT 属性
+2. **pfn_valid(pfn) 为假**（无 `struct page`）：
+   - 查询 e820 内存映射表
+   - 如果不是 `E820_TYPE_RAM`，则判定为 MMIO
+
+#### 2.4.4 SPTE 构建时的内存类型设置
+
+**关键代码**：`make_spte()` in `arch/x86/kvm/mmu/spte.c:211`
+
+```c
+u64 make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+              unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
+              u64 lpage_mask, bool host_writable, bool speculative,
+              bool can_unsync, bool reset_host_protection, u64 *sptep)
+{
+    // ... 其他位设置 ...
+
+    // 动态获取内存类型
+    if (shadow_memtype_mask)
+        spte |= kvm_x86_call(get_mt_mask)(vcpu, gfn,
+                                          kvm_is_mmio_pfn(pfn));
+
+    // ... PFN 和其他位 ...
+}
+```
+
+**关键点**：
+- `shadow_memtype_mask` 在 EPT 模式下设置为 `VMX_EPT_MT_MASK | VMX_EPT_IPAT_BIT`
+- 每个页的内存类型通过 `get_mt_mask()` 动态计算
+- `kvm_is_mmio_pfn(pfn)` 判断是 RAM 还是 MMIO
+
+#### 2.4.5 EPT 与 Shadow Paging 的内存类型处理对比
+
+| 模式 | 内存类型设置 | 依赖 |
+|------|------------|------|
+| **EPT** | `shadow_memtype_mask = VMX_EPT_MT_MASK \| VMX_EPT_IPAT_BIT`<br>动态计算每个页的内存类型 | 必须在 SPTE 中显式设置，EPT 覆盖 host MTRR |
+| **Shadow/NPT** | `shadow_memtype_mask = 0`<br>不在 SPTE 中设置内存类型 | 依赖 host MTRR 提供正确内存类型 |
+
+**为什么 EPT 需要显式设置？**
+
+EPT 有自己的内存类型控制，完全独立于 host MTRR。如果不在 EPT 页表中设置内存类型，硬件会使用默认的 UC，导致所有内存访问都不可缓存，性能极差。
+
+#### 2.4.6 为什么 MMIO 必须用 UC？
+
+```c
+// vmx_get_mt_mask() 中的注释
+/*
+ * Force UC for host MMIO regions, as allowing the guest to access MMIO
+ * with cacheable accesses will result in Machine Checks.
+ */
+```
+
+**原因**：
+1. **MMIO 是设备内存**（GPU、网卡寄存器等）
+2. **设备期望精确的访问时序**
+3. **如果 CPU 缓存了 MMIO 访问**：
+   - 设备状态更新不会立即反映
+   - 写操作可能被合并或重排序
+   - 导致设备行为异常
+   - 某些硬件会触发 Machine Check（致命错误）
+
+#### 2.4.7 实际案例：GPU BAR 内存注册
+
+**场景**：QEMU 虚拟机中注册 GPU 设备的 BAR（Base Address Register）区域
+
+**流程**：
+
+```
+1. QEMU 通过 pci_device_register() 注册 GPU 设备
+   ↓
+2. GPU 驱动探测 BAR 区域（通常在 0xF0000000+）
+   ↓
+3. QEMU 调用 ioremap() 映射 GPU BAR 到宿主虚拟地址
+   - HVA = 0x7f1234560000（示例）
+   - HPA = 0xF0000000（GPU BAR 物理地址）
+   ↓
+4. QEMU 调用 KVM_SET_USER_MEMORY_REGION
+   struct kvm_userspace_memory_region region = {
+       .slot = 1,                              // GPU BAR slot
+       .guest_phys_addr = 0xF0000000,          // GPA（Guest 看到的地址）
+       .memory_size = 256 * 1024 * 1024,       // 256MB BAR 大小
+       .userspace_addr = 0x7f1234560000,       // HVA
+       .flags = KVM_MEM_READONLY,              // 如果只读
+   };
+   ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region);
+   ↓
+5. KVM 内部创建 kvm_memory_slot
+   ↓
+6. Guest 访问 GPU BAR 时触发 EPT Violation
+   ↓
+7. kvm_is_mmio_pfn(pfn) 检查
+   - pfn = 0xF0000000 >> 12 = 0xF0000
+   - pfn >= 0x3C000（0xF0000000 >> 12）→ 识别为 MMIO
+   ↓
+8. vmx_get_mt_mask() 返回 UC (0x00)
+   ↓
+9. EPT 页表项设置为 UC，防止缓存
+   - SPTE bit 3-5 = 000 (UC)
+   - SPTE bit 12-51 = PFN (物理页帧号)
+   ↓
+10. Guest 访问 GPU 寄存器时：
+    - 不会被缓存
+    - 直接访问设备寄存器
+    - 设备状态立即反映
+```
+
+**SPTE 值对比**：
+
+```c
+// RAM 的 SPTE (GPA = 0x10000)
+SPTE = 0x0000010000000037
+       │              │
+       │              └─ bit 0-2: R|W|U + WB(110)
+       └─ bit 12-51: PFN
+
+// GPU BAR 的 SPTE (GPA = 0xF0000000)
+SPTE = 0x0000F00000000005
+       │              │
+       │              └─ bit 0-2: R|U + UC(000)
+       └─ bit 12-51: PFN
+```
+
 ---
 
 ## 📖 源码阅读路线
@@ -214,7 +419,10 @@ KVM 巧妙地在 SPTE 中混合了硬件和软件信息：
 | `kvm_tdp_mmu_get_root()` | `mmu/tdp_mmu.c` | 获取 TDP MMU 根 |
 | `kvm_mmu_get_tdp_root()` | `mmu/tdp_mmu.c` | 获取/创建 TDP 根页面 |
 | `tdp_mmu_set_spte_atomic()` | `mmu/tdp_mmu.c` | 原子设置 SPTE |
-| `make_spte()` | `mmu/spte.c` | 构造 SPTE 值 |
+| `make_spte()` | `mmu/spte.c` | 构造 SPTE 值（包含内存类型设置） |
+| `vmx_get_mt_mask()` | `vmx/vmx.c` | **动态计算内存类型**（UC/WB） |
+| `kvm_is_mmio_pfn()` | `mmu/spte.c` | **判断 PFN 是否是 MMIO** |
+| `kvm_mmu_set_ept_masks()` | `mmu/spte.c` | 设置 EPT 位掩码（不含内存类型） |
 | `kvm_mmu_page_fault()` | `mmu/mmu.c` | vCPU 缺页入口 |
 
 ### 阅读技巧

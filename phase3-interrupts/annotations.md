@@ -99,24 +99,42 @@ struct intel_ir_data {
 };
 ```
 
-### IRTE 128位格式
+### IRTE 128位格式 (参考 VT-d Spec Section 9.10)
 
 ```
+Remapped模式 (IM=0, Section 9.9):
 低64位:
 ┌──┬───┬──┬──┬──┬───┬───┬───┬───┬────┬───┬────────┐
-│ P│FPD│DM│RH│TM│DLM│AV │RSV│URG│ NV │LG │PDA[47:26]│
-│ 1│ 1 │ 1│ 1│ 1│ 3 │ 4 │ 5 │ 1 │ 8  │ 4 │   22    │
+│ P│FPD│DM│RH│TM│DLM│AV │RSV│RSV│ VV │RSV│Dest ID │
+│ 1│ 1 │ 1│ 1│ 1│ 3 │ 4 │ 5 │ 8 │ 8  │ 8 │   32   │
 └──┴───┴──┴──┴──┴───┴───┴───┴───┴────┴───┴────────┘
 
-高64位:
-┌──────┬──┬───┬──────────────────────────────────┐
-│ SID  │SQ│SVT│ PDA[25:0] (PI描述符地址低位)      │
-│ 16bit│ 2│ 2 │          44 bits                  │
-└──────┴──┴───┴──────────────────────────────────┘
+Posted模式 (IM=1, Section 9.10):
+低64位:
+┌──┬───┬──┬───┬──┬───┬──┬───┬───┬──────────────────┐
+│ P│FPD│RSV│AV │RSV│URG│IM│ VV│RSV│ PDAL (26 bits) │
+│ 1│ 1 │ 6 │ 4 │ 2 │ 1 │ 1│ 8 │14 │                │
+└──┴───┴──┴───┴──┴───┴──┴───┴───┴──────────────────┘
 
-PDA (Posted Descriptor Address) = pi_desc的物理地址
+高64位:
+┌──────┬──┬───┬──────┬─────────────────────────────┐
+│ SID  │SQ│SVT│ RSV  │ PDAH (PI描述符地址高位)      │
+│ 16bit│ 2│ 2 │ 12bit│          32 bits             │
+└──────┴──┴───┴──────┴─────────────────────────────┘
+
+字段说明:
+  IM  = IRTE Mode (bit 15): 1=Posted模式, 0=Remapped模式
+  VV  = Virtual Vector (bits 23:16): 通知向量
+  PDAL = Posted Descriptor Address Low (bits 63:38, 地址bits 31:6)
+  PDAH = Posted Descriptor Address High (bits 127:96, 地址bits 63:32)
+  
+PDA (Posted Descriptor Address) = pi_desc的物理地址(64字节对齐)
   → IOMMU通过PDA找到vCPU的PI描述符
   → 直接写PIR[vector]和ON位
+  
+注意: 
+  · IRTE中的VV会被写入PI Descriptor的NV字段
+  · 不要与Remapped模式的DM (Delivery Mode)字段混淆
 ```
 
 ### prepare_irte() — 初始化IRTE
