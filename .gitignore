@@ -1,0 +1,21 @@
+# 构建产物
+scripts/images/
+images/
+
+# 编译产物
+*.o
+*.ko
+*.mod
+*.mod.c
+modules.order
+Module.symvers
+
+# 临时文件
+*.swp
+*.swo
+*~
+.tmp_*
+
+# 内核构建
+linux-*/
+!linux-6.12.93/
