@@ -9,6 +9,7 @@ images/
 *.mod.c
 modules.order
 Module.symvers
+.*.cmd
 
 # 临时文件
 *.swp

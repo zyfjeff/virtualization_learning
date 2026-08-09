@@ -16,12 +16,11 @@ DEVICE="0000:4b:00.0"
 VM_NAME="pi-test-vm"
 PID_FILE="/tmp/${VM_NAME}.pid"
 
-# 项目路径
+# 项目路径（脚本位于 scripts/ 目录）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-KVM_STUDY_ROOT="$(dirname "$PROJECT_ROOT")"
-TESTING_DIR="$KVM_STUDY_ROOT/scripts/testing"
-IMAGES_DIR="$KVM_STUDY_ROOT/scripts/images"
+KVM_STUDY_ROOT="$(dirname "$SCRIPT_DIR")"  # scripts/ 的父目录 = 项目根目录
+TESTING_DIR="$SCRIPT_DIR/testing"
+IMAGES_DIR="$SCRIPT_DIR/images"
 
 # 内核和 initramfs 路径
 KERNEL="$IMAGES_DIR/bzImage"
