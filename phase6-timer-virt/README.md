@@ -656,6 +656,134 @@ ptp_kvm 名字有误导性 —— 它不跑任何 IEEE 1588 报文!
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+### 冷启动：时间如何进入 Guest (事实核查补充)
+
+```
+VM 冷启动时, Guest 的墙钟 (CLOCK_REALTIME) 从何而来?
+
+┌─ 步骤 1: Guest 内核早期启动 ─────────────────────────────────┐
+│  检测 CPUID 0x40000001 (KVM 签名)                            │
+│  kvmclock_init():                                             │
+│    ├─ 写 MSR_KVM_SYSTEM_TIME_NEW 注册 pvclock 页             │
+│    ├─ 注册 kvm-clock clocksource                             │
+│    ├─ pv_ops.time.sched_clock = kvm_sched_clock_read         │
+│    ├─ x86_platform.get_wallclock = kvm_get_wallclock         │
+│    └─ x86_platform.set_wallclock = kvm_set_wallclock         │
+│                                                                │
+│  注意: set_wallclock 返回 -ENODEV!                            │
+│        → Guest 里 hwclock -w (写回 RTC) 会失败               │
+│        → 这是 pvclock 故意不给写, 防止 guest 修改 host 时间   │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ 步骤 2: timekeeping_init() ────────────────────────────────┐
+│  timekeeping_init()                                          │
+│    → read_persistent_clock64()                               │
+│    → kvm_get_wallclock():                                    │
+│                                                                │
+│      写 MSR_KVM_WALL_CLOCK_NEW, host 侧填页:                │
+│        wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);│
+│                                                                │
+│      即 "host 真实墙钟 − 当前 kvmclock" = guest 墙钟原点    │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ 步骤 3: 建立时间基准 ──────────────────────────────────────┐
+│  CLOCK_REALTIME = wall_clock + kvmclock                      │
+│                                                                │
+│  · wall_clock: boot 时刻的 host 墙钟                         │
+│  · kvmclock: 从 boot 开始的增量 (基于 pvclock)               │
+│  · 精度: 纳秒级, 一次性完成                                  │
+│                                                                │
+│  之后再无 "同步":                                            │
+│    guest realtime = 开机原点 + clocksource 增量               │
+│    而 clocksource (tsc 或 kvm-clock) 最终都由 host 物理 TSC 派生│
+│    → guest 和 host 流逝速率天然同源                          │
+│    → 不存在晶振 drift                                        │
+│    → 这就是冷启动不需要 NTP/PTP 的原因                       │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ 没有 kvmclock 时的回退 ────────────────────────────────────┐
+│  如果 kvmclock 不可用 (no-kvmclock 或 CLOCKSOURCE2 关闭):   │
+│    → 退回 mach_get_cmos_time() 读 CMOS                      │
+│    → 秒级精度, 且每次读都 VM-Exit                            │
+│    → 只在 boot 时读一次, 之后用 TSC 或其他 clocksource       │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Snapshot / 热迁移 / 热升级的时间处理 (事实核查补充)
+
+```
+VM 快照/迁移时, 必须一起处理的四件套:
+
+┌──────────────────────────────────────────────────────────────────┐
+│  #   对象            保存              恢复                      │
+├──────────────────────────────────────────────────────────────────┤
+│  1   TSC 频率        KVM_GET_TSC_KHZ   KVM_SET_TSC_KHZ          │
+│  2   TSC 值          MSR_IA32_TSC      写回 → KVM 重算 OFFSET   │
+│  3   kvmclock offset KVM_GET_CLOCK     KVM_SET_CLOCK             │
+│  4   pvclock 页注册  两个 KVM MSR      写回 MSR, 页内容随内存快照│
+│  +   watchdog 抑制   —                 KVM_KVMCLOCK_CTRL        │
+└──────────────────────────────────────────────────────────────────┘
+
+顺序有硬约束:
+  SET_TSC_KHZ  必须早于  SET_MSRS       // TSC deadline timer 状态
+  SET_SREGS    必须早于  SET_LAPIC      // apic base msr
+  SET_LAPIC    必须早于  SET_MSRS       // TSC deadline MSR 需要 LAPIC 就绪
+  MSR_IA32_TSC 必须早于  MSR_IA32_TSC_DEADLINE
+
+跳变治理的三条原则:
+
+┌─ 原则一: MONOTONIC 绝不推进 ─────────────────────────────────┐
+│  KVM_SET_CLOCK 时 flags 必须为 0                              │
+│                                                                │
+│  这就是 Firecracker PR #5809 的全部内容:                      │
+│    · 恢复时 clock.flags = 0, 不信任快照中的 flags             │
+│    · 防止 KVM_CLOCK_REALTIME 导致单调钟跳变                  │
+│                                                                │
+│  为什么后果特别严重:                                          │
+│    kvmclock 污染的是地基                                      │
+│    它不只是 clocksource                                       │
+│    kvmclock_init() 还把它注册成了 sched_clock                 │
+│    所以即便 guest 把 clocksource 选成了 tsc                   │
+│    kvmclock 跳变仍会影响:                                     │
+│      · printk 时间戳                                          │
+│      · 调度统计                                               │
+│      · softlockup 判定                                        │
+│    牵连面比 "只影响 clocksource" 大得多                       │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ 原则二: 告知暂停, 而非伪造时间 ────────────────────────────┐
+│  KVM_KVMCLOCK_CTRL → PVCLOCK_GUEST_STOPPED                  │
+│    → guest 主动宽恕这段空白                                 │
+│                                                                │
+│  不是伪造时间让 guest 以为自己一直在跑                        │
+│  而是告知事实并让它宽恕这段空白                              │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ 原则三: REALTIME 必须在 guest 侧尽早校准 ──────────────────┐
+│  不校的后果是硬伤:                                          │
+│    · TLS 证书校验失败                                       │
+│    · token/Kerberos 票据过期                                │
+│    · 和外部系统时间戳对不上                                 │
+│    · 日志乱序                                               │
+│                                                                │
+│  方案对比:                                                  │
+│    · ptp_kvm + chrony: 亚微秒, 推荐默认                     │
+│    · hwclock --hctosys: 1 秒, 精简 rootfs 兜底              │
+│    · 网络 NTP: 毫秒级, 长期兜底                             │
+│                                                                │
+│  执行时机: resume → 校时 → 再放业务流量                     │
+│            不要等业务跑起来了才跳墙钟                        │
+└────────────────────────────────────────────────────────────────┘
+
+跨主机迁移的额外问题:
+
+  · TSC 频率不同 → 必须有 TSC scaling 硬件支持
+  · host 之间 realtime 有偏差 → 残差需要 guest 侧校
+  · backwards_tsc_observed → 永久关掉 masterclock, guest 掉进慢路径
+  · flags 兼容性 → 5.16+ 主机打的快照带 flags=0xC
+                   灌到 5.10 KVM 上会直接 -EINVAL
+```
+
 ### 5. Guest 视角的时钟层次
 
 ```
