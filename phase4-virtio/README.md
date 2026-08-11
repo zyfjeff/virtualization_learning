@@ -91,6 +91,265 @@ vhost内核态数据路径:
 
 ---
 
+## 🔧 Virtio Queue 基础
+
+### 核心概念
+
+Virtio Queue 是 virtio 规范定义的设备与驱动之间的通信机制。它使用**环形缓冲区（ring buffer）**实现无锁的高效数据传输。
+
+```
+关键特性:
+├── 无锁设计: 通过内存屏障和原子操作实现
+├── 异步处理: 驱动和设备可以独立操作
+├── 批量处理: 一次可以提交多个请求
+└── 双向通信: avail ring (驱动→设备) + used ring (设备→驱动)
+```
+
+### 核心数据结构
+
+Virtio Queue 由三个核心部分组成：
+
+```
+┌─ Virtio Queue 结构 ───────────────────────────────────────┐
+│                                                            │
+│  Guest 内存空间 (GPA)                                      │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │                                                     │  │
+│  │  ┌─────────────────┐                               │  │
+│  │  │ Descriptor Table│  描述符表 (16 bytes/entry)    │  │
+│  │  │  [0][1][2]...   │  每个描述符指向一块内存       │  │
+│  │  └─────────────────┘                               │  │
+│  │         ↓                                          │  │
+│  │  ┌─────────────────┐                               │  │
+│  │  │   Avail Ring    │  可用环 (驱动→设备)           │  │
+│  │  │  [idx][ring]    │  驱动告诉设备"哪些描述符可用" │  │
+│  │  └─────────────────┘                               │  │
+│  │         ↓                                          │  │
+│  │  ┌─────────────────┐                               │  │
+│  │  │   Used Ring     │  已用环 (设备→驱动)           │  │
+│  │  │  [idx][ring]    │  设备告诉驱动"哪些描述符已处理"│  │
+│  │  └─────────────────┘                               │  │
+│  │                                                     │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                                                            │
+│  关键指针:                                                 │
+│  ├── avail.idx: 驱动递增, 设备读取                        │
+│  ├── used.idx: 设备递增, 驱动读取                         │
+│  └── desc.next: 描述符链式连接                            │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Descriptor Table (描述符表)
+
+描述符表是 virtio queue 的核心，每个描述符描述一块内存区域。
+
+```c
+/* include/uapi/linux/virtio_ring.h */
+
+struct vring_desc {
+    __u64 addr;      /* 物理地址 (Guest 物理地址 GPA) */
+    __u32 len;       /* 长度 */
+    __u16 flags;     /* 标志位 */
+    __u16 next;      /* 下一个描述符索引 (如果 flags 有 NEXT 标志) */
+};
+
+/* 标志位定义 */
+#define VRING_DESC_F_NEXT     1  /* 有下一个描述符 (链式) */
+#define VRING_DESC_F_WRITE    2  /* 设备可写 (否则只读) */
+#define VRING_DESC_F_INDIRECT 4  /* 指向间接描述符表 */
+```
+
+```
+描述符结构 (16 bytes):
+┌─────────────────────────────────────────────────────────┐
+│  addr (8 bytes)   │  len (4 bytes)  │ flags (2) │ next  │
+│  Guest 物理地址   │  缓冲区长度     │ 标志位    │ 下一个│
+└─────────────────────────────────────────────────────────┘
+
+使用场景:
+├── 简单场景: 单个描述符指向一块连续内存
+├── 链式描述符: NEXT 标志链接多个描述符 (scatter-gather)
+└── 间接描述符: INDIRECT 标志指向另一个描述符表 (减少 avail ring 占用)
+```
+
+### Avail Ring (可用环)
+
+驱动通过 avail ring 告诉设备"哪些描述符准备好了"。
+
+```c
+/* include/uapi/linux/virtio_ring.h */
+
+struct vring_avail {
+    __u16 flags;     /* 标志位 */
+    __u16 idx;       /* 索引 (递增) */
+    __u16 ring[];    /* 描述符索引数组 */
+};
+
+/* 实际布局 (对齐后) */
+struct vring {
+    unsigned int num;           /* 队列大小 */
+    struct vring_desc *desc;    /* 描述符表 */
+    struct vring_avail *avail;  /* 可用环 */
+    struct vring_used *used;    /* 已用环 */
+};
+```
+
+```
+Avail Ring 结构:
+┌─────────────────────────────────────────────────────────┐
+│  flags (2 bytes)  │  idx (2 bytes)  │ ring[0..num-1]    │
+│  标志位           │  当前索引       │ 描述符索引数组    │
+└─────────────────────────────────────────────────────────┘
+
+数据流 (驱动 → 设备):
+  1. 驱动准备描述符 (填充 desc table)
+  2. 驱动将描述符索引写入 avail.ring[idx % num]
+  3. 驱动递增 avail.idx
+  4. 驱动发送 kick 通知设备
+  5. 设备读取 avail.ring 和对应的描述符
+```
+
+### Used Ring (已用环)
+
+设备通过 used ring 告诉驱动"哪些描述符已经处理完了"。
+
+```c
+/* include/uapi/linux/virtio_ring.h */
+
+struct vring_used_elem {
+    __u32 id;      /* 描述符链的起始索引 */
+    __u32 len;     /* 设备实际写入的长度 (对于 WRITE 描述符) */
+};
+
+struct vring_used {
+    __u16 flags;     /* 标志位 */
+    __u16 idx;       /* 索引 (递增) */
+    struct vring_used_elem ring[];  /* 已处理的描述符 */
+};
+```
+
+```
+Used Ring 结构:
+┌─────────────────────────────────────────────────────────────────┐
+│  flags (2 bytes)  │  idx (2 bytes)  │ ring[0..num-1]            │
+│  标志位           │  当前索引       │ {id, len} 数组            │
+└─────────────────────────────────────────────────────────────────┘
+
+数据流 (设备 → 驱动):
+  1. 设备处理完描述符链
+  2. 设备将 {id, len} 写入 used.ring[idx % num]
+  3. 设备递增 used.idx
+  4. 设备发送 interrupt 通知驱动
+  5. 驱动读取 used.ring 并释放描述符
+```
+
+### Kick/Notify 机制
+
+Kick 和 Notify 是 virtio 的中断机制，用于通知对方"有新的数据"。
+
+```
+┌─ Kick/Notify 机制 ──────────────────────────────────────────┐
+│                                                               │
+│  驱动 → 设备 (Kick):                                         │
+│    · 驱动写 avail ring 后, 写设备寄存器                      │
+│    · 触发 VM-Exit (IO/MMIO 访问)                             │
+│    · KVM 处理 VM-Exit, 通知设备 (vhost 或 QEMU)              │
+│                                                               │
+│  设备 → 驱动 (Notify/Interrupt):                             │
+│    · 设备写 used ring 后, 发送中断                           │
+│    · vhost: 直接调用 kvm_set_irq() 注入中断                  │
+│    · QEMU: 通过 eventfd 通知 KVM 注入中断                   │
+│                                                               │
+│  关键优化:                                                     │
+│    · Event Index: 避免不必要的 kick/interrupt                │
+│    · 通过 avail_event 和 used_event 精确控制通知时机         │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 完整数据流示例 (网络包发送)
+
+```
+┌─ TX 路径 (Guest 发送网络包) ───────────────────────────────┐
+│                                                              │
+│  Guest 侧:                                                  │
+│    1. virtio-net 驱动准备网络包                              │
+│    2. 分配描述符:                                            │
+│       desc[0]: 包头 (14 bytes)                              │
+│       desc[1]: 包体 (1500 bytes)                            │
+│       desc[0].next = 1, desc[0].flags = NEXT                │
+│    3. 写入 avail ring:                                       │
+│       avail.ring[avail.idx % num] = 0                       │
+│       avail.idx++                                           │
+│    4. Kick 设备 (写寄存器, 触发 VM-Exit)                    │
+│                                                              │
+│  Host 侧 (vhost):                                           │
+│    5. vhost 线程被唤醒                                       │
+│    6. 读取 avail ring:                                       │
+│       desc_idx = avail.ring[old_idx % num]                  │
+│    7. 读取描述符链:                                          │
+│       desc[0] → desc[1] (通过 next 链接)                    │
+│    8. 从 Guest 内存读取数据 (GPA→HVA→读取)                 │
+│    9. 发送到 TAP 设备 (sock_sendmsg)                        │
+│    10. 写入 used ring:                                       │
+│        used.ring[used.idx % num] = {id: 0, len: 0}         │
+│        used.idx++                                          │
+│    11. 注入中断到 Guest (kvm_set_irq)                       │
+│                                                              │
+│  Guest 侧 (完成):                                            │
+│    12. 收到中断, 读取 used ring                              │
+│    13. 释放描述符, 可以重用                                  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 队列大小和对齐
+
+```
+队列大小 (num):
+  · 通常是 2 的幂次 (128, 256, 512, 1024)
+  · 由设备能力决定 (VIRTIO_NET_F_MRG_RXBUF 等)
+  · 越大: 可以缓冲更多请求, 但占用更多内存
+  · 越小: 内存占用少, 但可能频繁阻塞
+
+内存对齐:
+  · 描述符表: 16 字节对齐
+  · Avail ring: 2 字节对齐
+  · Used ring: 4 字节对齐
+  · 整个 vring: 按页对齐 (4KB)
+```
+
+### 关键优化技术
+
+```
+┌─ 优化技术 ──────────────────────────────────────────────────┐
+│                                                               │
+│  1. 间接描述符 (Indirect Descriptors):                       │
+│     · 一个描述符指向另一个描述符表                           │
+│     · 减少 avail ring 的占用                                │
+│     · 适合 scatter-gather I/O                               │
+│                                                               │
+│  2. Event Index:                                              │
+│     · 精确控制通知时机                                      │
+│     · 避免不必要的 kick/interrupt                           │
+│     · 通过 avail_event 和 used_event 实现                   │
+│                                                               │
+│  3. 批量处理:                                                 │
+│     · 一次 kick 可以提交多个描述符                          │
+│     · 一次 interrupt 可以通知多个完成                        │
+│     · 减少通知开销                                          │
+│                                                               │
+│  4. 内存屏障:                                                 │
+│     · virtio_mb() / virtio_rmb() / virtio_wmb()             │
+│     · 确保内存访问顺序正确                                  │
+│     · 多核环境下至关重要                                    │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## 📐 vhost架构
 
 ### 整体架构
