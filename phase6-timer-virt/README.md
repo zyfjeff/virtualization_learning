@@ -430,6 +430,82 @@ kvmclock 原理:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+**kvmclock_offset 的核心作用** (事实核查补充):
+
+```c
+/* arch/x86/kvm/x86.c:7047 */
+
+/*
+ * kvmclock_offset 是 guest kvmclock 相对 host 的那个 offset
+ * KVM_SET_CLOCK 干的唯一事情就是设它
+ *
+ * 关键: KVM_SET_CLOCK 的完整语义 (Linux 5.16+)
+ */
+case KVM_SET_CLOCK:
+    if (data.flags & ~KVM_CLOCK_VALID_FLAGS)
+        return -EINVAL;
+
+    /* KVM_CLOCK_REALTIME 标志处理 (Firecracker PR #5809 修复的问题) */
+    if (data.flags & KVM_CLOCK_REALTIME) {
+        u64 now_real_ns = ktime_get_real_ns();
+        
+        /* 避免 kvmclock 回退 */
+        if (now_real_ns > data.realtime)
+            data.clock += now_real_ns - data.realtime;
+    }
+
+    if (ka->use_master_clock)
+        now_raw_ns = ka->master_kernel_ns;
+    else
+        now_raw_ns = get_kvmclock_base_ns();
+    
+    /* 核心: 设置 kvmclock_offset */
+    ka->kvmclock_offset = data.clock - now_raw_ns;
+
+/*
+ * ⚠️ 陷阱: Linux 5.16+ 引入 KVM_CLOCK_REALTIME
+ * 
+ * Firecracker PR #5809 的问题:
+ *   - GET_CLOCK 结果包含 KVM_CLOCK_REALTIME 标志
+ *   - 恢复快照时原样 SET_CLOCK 回去
+ *   - KVM 会将"快照到恢复之间流逝的墙钟"加到 kvmclock
+ *   - Guest 的 CLOCK_MONOTONIC 凭空向前跳!
+ *
+ * 修复: 恢复时 clock.flags = 0, 不信任快照中的 flags
+ */
+```
+
+**vDSO 加速机制** (事实核查补充):
+
+```
+vDSO (Virtual Dynamic Shared Object) 是性能关键!
+
+┌─ 无 vDSO (纯 syscall) ─────────────────────────────────────┐
+│  clock_gettime()                                            │
+│    → syscall clock_gettime                                   │
+│    → 陷入内核                                                │
+│    → 读取 clocksource (可能触发 VM-Exit!)                   │
+│    → 返回用户态                                              │
+│  开销: ~100-500 ns                                          │
+└──────────────────────────────────────────────────────────────┘
+
+┌─ 有 vDSO ───────────────────────────────────────────────────┐
+│  clock_gettime()                                            │
+│    → vDSO 函数 (无 syscall!)                                 │
+│    → 读取 pvclock 共享页 (内存读)                           │
+│    → 计算: ns = system_time + scale(rdtsc() - timestamp)    │
+│    → 返回时间                                                │
+│  开销: ~20-30 ns (纯用户态!)                                │
+└──────────────────────────────────────────────────────────────┘
+
+vDSO 的前提:
+  · clocksource 必须支持 vDSO (kvm-clock, tsc 都支持)
+  · pvclock 页必须有 PVCLOCK_TSC_STABLE_BIT 标志
+  · 如果 TSC 不稳定, vDSO 会退化为 syscall
+
+性能差异: 10-100 倍!
+```
+
 **kvmclock 的优势**:
 
 ```
@@ -448,6 +524,135 @@ kvmclock 原理:
 │    - 多CPU一致 (TSC可能不同步)                                   │
 │                                                                   │
 │  → 现代Linux Guest默认使用kvmclock作为clocksource               │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**masterclock 优化** (事实核查补充):
+
+```c
+/* arch/x86/kvm/x86.c:3034-3042 */
+
+/*
+ * masterclock 是 kvmclock 的重要优化
+ * 
+ * 问题: 多 vCPU 时, 每个 vCPU 的 pvclock 页独立更新
+ *       不同 vCPU 读到的时间可能有微小差异 (纳秒级)
+ *       对于需要严格时间一致性的场景 (如数据库), 这是问题
+ *
+ * 解决: 当条件满足时, 使用全局统一的基准时间
+ */
+
+/* 触发条件 */
+ka->use_master_clock = host_tsc_clocksource &&    /* host 用 TSC 做 clocksource */
+                       vcpus_matched &&            /* 所有 vCPU 的 TSC 已对齐 */
+                       !ka->backwards_tsc_observed && /* 未观察到 TSC 倒退 */
+                       ...;
+
+if (ka->use_master_clock) {
+    /* 存下全局快照 */
+    kvm_get_time_and_clockread(&ka->master_kernel_ns, &ka->master_cycle_now);
+}
+
+/* 使用 masterclock 时 */
+if (ka->use_master_clock)
+    now_raw_ns = ka->master_kernel_ns;  /* 全局基准 */
+else
+    now_raw_ns = get_kvmclock_base_ns(); /* 每个 vCPU 独立计算 */
+
+/*
+ * masterclock 的好处:
+ *   · 所有 vCPU 看到完全一致的时间
+ *   · KVM_GET_CLOCK 可以置 KVM_CLOCK_TSC_STABLE 标志
+ *   · pvclock 页有 PVCLOCK_TSC_STABLE_BIT → guest 走 vDSO 无锁快速路径
+ *
+ * masterclock 失效的情况:
+ *   · host TSC 不稳定 (非 invariant TSC)
+ *   · vCPU 的 TSC 未对齐
+ *   · 观察到 TSC 倒退
+ *   · 失效后 guest 每次读都要做跨 CPU 一致性保护, 慢得多
+ */
+```
+
+**ptp_kvm 深度解析** (事实核查补充):
+
+```
+ptp_kvm 名字有误导性 —— 它不跑任何 IEEE 1588 报文!
+
+┌─ 传统 PTP (Precision Time Protocol) ──────────────────────────┐
+│  网络 PTP:                                                     │
+│    · ptp4l 运行 IEEE 1588 协议                                 │
+│    · 时间戳在网卡 PHY 层打 (硬件时间戳)                       │
+│    · 精度: 亚微秒级                                            │
+│    · 需要网络设备支持                                          │
+│    · 需要网络可达                                              │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ ptp_kvm 的实现 ──────────────────────────────────────────────┐
+│  ptp_kvm 不跑 PTP 协议, 而是:                                  │
+│    · 借用 PHC (PTP Hardware Clock) 内核抽象                    │
+│    · 把 KVM 的 host 时间包装成 /dev/ptp0 设备                  │
+│    · 让 chrony 等工具能直接用                                  │
+│                                                                  │
+│  底层是一次 hypercall:                                         │
+│    KVM_HC_CLOCK_PAIRING (arch/x86/kvm/x86.c:9928)             │
+│                                                                  │
+│    struct kvm_clock_pairing {                                   │
+│        u64 sec;      /* host realtime 秒 */                    │
+│        u64 nsec;     /* host realtime 纳秒 */                  │
+│        u64 tsc;      /* 对应的 guest TSC */                    │
+│        u32 flags;                                              │
+│    };                                                          │
+│                                                                  │
+│  Host 侧实现 (x86.c:9946-9951):                                │
+│    if (!kvm_get_walltime_and_clockread(&ts, &cycle))           │
+│        return -KVM_EOPNOTSUPP;                                 │
+│                                                                  │
+│    clock_pairing.sec = ts.tv_sec;                              │
+│    clock_pairing.nsec = ts.tv_nsec;                            │
+│    clock_pairing.tsc = kvm_read_l1_tsc(vcpu, cycle);          │
+│                                                                  │
+│  精髓:                                                         │
+│    · 三元组: (host realtime sec, nsec, 对应的 guest TSC)       │
+│    · host 在同一瞬间原子地读出墙钟和计数器                     │
+│    · guest 拿到后可以精确配对 "host 墙钟" 和 "自己的 TSC"     │
+│    · 没有网络往返、没有抖动、没有不确定的延迟                  │
+│    · 这是网络 PTP 都做不到的精度!                              │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ 部署配置 ────────────────────────────────────────────────────┐
+│  Guest 侧:                                                     │
+│    modprobe ptp_kvm            # 出现 /dev/ptp0                │
+│                                                                  │
+│    # /etc/chrony.conf                                            │
+│    refclock PHC /dev/ptp0 poll 0 dpoll -2 stratum 1            │
+│    makestep 1.0 -1             # 偏差 >1s 时无条件 step        │
+│                                                                  │
+│  为什么精度高于网络 PTP:                                        │
+│    · 网络 PTP: 需要估计网络延迟, 有抖动                        │
+│    · ptp_kvm: hypercall 是确定性的, 无抖动                      │
+│    · 精度: 亚微秒级 vs 毫秒级                                   │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ PVCLOCK_GUEST_STOPPED 机制 ──────────────────────────────────┐
+│  专为 VM 暂停设计的机制:                                       │
+│                                                                  │
+│  问题: VM 被 VMM 暂停时, guest 内核不知情                     │
+│        MONOTONIC 和 BOOTTIME 都不前进                          │
+│        从 guest 视角就是 "CPU 被抢了很久"                      │
+│                                                                  │
+│  解决:                                                         │
+│    · VMM 恢复 VM 后调用 KVM_KVMCLOCK_CTRL (x86.c:5100)        │
+│    · KVM 置一个 request                                        │
+│    · 下次刷 pvclock 页时打上 PVCLOCK_GUEST_STOPPED 标志       │
+│    · guest 读到这个 flag 会执行 pvclock_touch_watchdogs():     │
+│        - touch softlockup watchdog                            │
+│        - reset RCU stall detector                             │
+│        - reset hung task detector                              │
+│    · 然后清 flag                                                │
+│                                                                  │
+│  这才是 "告诉 guest 你被暂停过" 的正确方式:                    │
+│    · 不是伪造时间                                               │
+│    · 而是告知事实并让它宽恕这段空白                            │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -538,16 +743,19 @@ cat /sys/devices/system/clockevents/clockevent0/current_device
 grep -E "constant_tsc|tsc_deadline|tsc_reliable" /proc/cpuinfo
 ```
 
-### 练习2: ftrace 追踪定时器事件
+### 练习2: 观察 pvclock 共享页
 
 ```bash
-# 追踪APIC Timer
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_apic/enable
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_entry/enable
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_exit/enable
+# 在 Host 上查看 pvclock 页的 GPA
+grep -E "pvclock|system_time" /sys/kernel/debug/kvm/*/vcpu* 2>/dev/null | head -10
 
-# 观察定时器相关的VM-Exit
-cat /sys/kernel/debug/tracing/trace_pipe | grep -E "exit|timer"
+# 在 Guest 内查看 pvclock 页内容
+# 需要 root 权限和 debugfs
+cat /sys/kernel/debug/pvclock 2>/dev/null || echo "pvclock debugfs not available"
+
+# 使用 perf 观察 vDSO 调用
+perf record -g clock_gettime sleep 1
+perf report | grep -A 5 "clock_gettime"
 ```
 
 ### 练习3: 对比不同时钟源的性能
@@ -566,6 +774,75 @@ echo pit > /sys/devices/system/clocksource/clocksource0/current_clocksource
 cyclictest -t1 -p 80 -n -i 1000 -l 10000 -q
 ```
 
+### 练习4: 配置 ptp_kvm + chrony
+
+```bash
+# Guest 侧配置:
+modprobe ptp_kvm
+ls -l /dev/ptp*  # 应该看到 /dev/ptp0
+
+# 安装 chrony
+apt-get install chrony  # Debian/Ubuntu
+yum install chrony      # RHEL/CentOS
+
+# 配置 /etc/chrony.conf
+cat > /etc/chrony.conf << EOF
+refclock PHC /dev/ptp0 poll 0 dpoll -2 stratum 1
+makestep 1.0 -1
+EOF
+
+# 启动 chrony
+systemctl restart chrony
+
+# 查看同步状态
+chronyc sources
+chronyc tracking
+
+# 预期: stratum 1, 精度亚微秒级
+```
+
+### 练习5: 观察 kvmclock_offset 变化
+
+```bash
+# 在 Host 上观察 kvmclock_offset
+# 需要 debugfs 和 root 权限
+
+# 方法 1: 通过 KVM_GET_CLOCK ioctl
+cat > /tmp/get_kvmclock.c << 'EOF'
+#include <stdio.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/kvm.h>
+
+int main(int argc, char *argv[]) {
+    int fd = open("/dev/kvm", O_RDWR);
+    struct kvm_clock_data data;
+    
+    ioctl(fd, KVM_GET_CLOCK, &data);
+    printf("clock: %llu\n", data.clock);
+    printf("flags: 0x%x\n", data.flags);
+    printf("realtime: %llu\n", data.realtime);
+    
+    return 0;
+}
+EOF
+
+gcc -o /tmp/get_kvmclock /tmp/get_kvmclock.c
+/tmp/get_kvmclock
+```
+
+### 练习6: ftrace 追踪定时器事件
+
+```bash
+# 追踪APIC Timer
+echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_apic/enable
+echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_entry/enable
+echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_exit/enable
+
+# 观察定时器相关的VM-Exit
+cat /sys/kernel/debug/tracing/trace_pipe | grep -E "exit|timer"
+```
+
 ---
 
 ## ✅ 验证清单
@@ -576,6 +853,11 @@ cyclictest -t1 -p 80 -n -i 1000 -l 10000 -q
 - [ ] 说明 TSC-deadline 为什么比 Periodic/One-shot 模式高效
 - [ ] 解释 vm 迁移时 Guest 时间连续性的保证机制
 - [ ] 说明 kvmclock 的 pvclock 协议如何工作
+- [ ] 解释 vDSO 在时钟读取中的性能优势
+- [ ] 说明 masterclock 优化的原理和触发条件
+- [ ] 解释 ptp_kvm 的实现原理 (hypercall 三元组)
+- [ ] 说明 PVCLOCK_GUEST_STOPPED 机制的作用
+- [ ] 解释 Firecracker PR #5809 的问题和修复 (KVM_CLOCK_REALTIME)
 - [ ] 解释为什么现代 Linux Guest 默认使用 kvm-clock + lapic
 - [ ] 列出 Guest 中查看当前时钟源的命令
 
