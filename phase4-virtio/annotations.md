@@ -549,3 +549,380 @@ static int __vhost_add_used_n(struct vhost_virtqueue *vq,
 │                     │                          │ (bypass QEMU)            │
 └─────────────────────┴──────────────────────────┴──────────────────────────┘
 ```
+
+---
+
+## 9. Virtio Queue 核心代码分析
+
+### 代码层面深度分析
+
+让我们深入内核源码，看看 Virtio Queue 的实际实现。
+
+#### 1. vring 初始化
+
+```c
+/* drivers/virtio/virtio_ring.c */
+
+/* vring 初始化 - 设置 virtqueue 的内存布局 */
+struct virtqueue *vring_create_virtqueue(
+    unsigned int index,
+    unsigned int num,
+    unsigned int vring_align,
+    struct virtio_device *vdev,
+    bool weak_barriers,
+    bool ctx,
+    bool (*notify)(struct virtqueue *),
+    void (*callback)(struct virtqueue *),
+    const char *name)
+{
+    struct vring_virtqueue *vq;
+    void *queue;
+    
+    /* 计算 vring 总大小 */
+    /* 包括：描述符表 + avail ring + used ring */
+    size_t queue_size = vring_size(num, vring_align);
+    
+    /* 分配连续的内存区域 */
+    queue = kmalloc(queue_size, GFP_KERNEL);
+    
+    /* 初始化 vring 结构 */
+    struct vring vring;
+    vring_init(&vring, num, queue, vring_align);
+    
+    /* vring_init 实际做的事: */
+    /*
+     * vring.desc = queue;                          // 描述符表起始地址
+     * vring.avail = (struct vring_avail *)(queue + 
+     *                   num * sizeof(struct vring_desc));  // avail ring
+     * vring.used = (struct vring_used *)(((uintptr_t)&vring.avail->ring[num] + 
+     *                   sizeof(__virtio16) + vring_align - 1) & ~(vring_align - 1));
+     */
+    
+    /* 创建 virtqueue 结构 */
+    vq = kmalloc(sizeof(*vq), GFP_KERNEL);
+    vq->vq.vring = vring;
+    vq->vq.index = index;
+    vq->num = num;
+    vq->notify = notify;
+    vq->callback = callback;
+    
+    /* 初始化索引 */
+    vq->last_used_idx = 0;
+    vq->num_added = 0;
+    
+    return &vq->vq;
+}
+```
+
+#### 2. 驱动侧：添加 buffer 到 avail ring
+
+```c
+/* drivers/virtio/virtio_ring.c */
+
+/* 驱动侧：添加 buffer 到 virtqueue */
+int virtqueue_add(struct virtqueue *_vq,
+                  struct scatterlist *sgs,
+                  unsigned int out_sgs,
+                  unsigned int in_sgs,
+                  void *data,
+                  const void *ctx,
+                  gfp_t gfp)
+{
+    struct vring_virtqueue *vq = to_vvq(_vq);
+    struct vring_desc *desc;
+    unsigned int i;
+    
+    /* 1. 获取下一个可用的描述符索引 */
+    /* avail.idx 指向下一个可用位置 */
+    unsigned int head = vq->free_head;
+    
+    /* 2. 填充描述符链 */
+    desc = vq->vring.desc;
+    i = head;
+    
+    /* 填充输出描述符（设备只读） */
+    for (unsigned int n = 0; n < out_sgs; n++) {
+        desc[i].addr = sg_phys(sgs[n]);  // Guest 物理地址
+        desc[i].len = sg_len(sgs[n]);
+        desc[i].flags = 0;  // 设备只读
+        
+        if (n + 1 < out_sgs + in_sgs) {
+            /* 还有后续描述符，设置 NEXT 标志 */
+            desc[i].flags |= VRING_DESC_F_NEXT;
+            desc[i].next = ++i;
+        }
+    }
+    
+    /* 填充输入描述符（设备可写） */
+    for (unsigned int n = 0; n < in_sgs; n++) {
+        desc[i].addr = sg_phys(sgs[out_sgs + n]);
+        desc[i].len = sg_len(sgs[out_sgs + n]);
+        desc[i].flags = VRING_DESC_F_WRITE;  // 设备可写
+        
+        if (n + 1 < in_sgs) {
+            desc[i].flags |= VRING_DESC_F_NEXT;
+            desc[i].next = ++i;
+        }
+    }
+    
+    /* 3. 更新 free_head，指向下一个空闲描述符 */
+    vq->free_head = desc[i].next;
+    
+    /* 4. 将描述符链的头索引写入 avail ring */
+    /* 关键：使用 memory barrier 确保描述符先写入 */
+    virtio_wmb(vq->weak_barriers);
+    
+    /* avail.ring[idx % num] = head */
+    vq->vring.avail->ring[vq->avail_idx_shadow & (vq->vring.num - 1)] = head;
+    
+    /* 5. 递增 avail.idx */
+    vq->avail_idx_shadow++;
+    
+    /* 关键：使用 memory barrier 确保 idx 更新在最后 */
+    virtio_wmb(vq->weak_barriers);
+    vq->vring.avail->idx = vq->avail_idx_shadow;
+    
+    /* 6. 检查是否需要 kick 设备 */
+    /* 使用 Event Index 优化：避免不必要的 kick */
+    if (virtqueue_need_kick(vq)) {
+        /* 触发 VM-Exit，通知设备 */
+        vq->notify(&vq->vq);
+    }
+    
+    return 0;
+}
+
+/* 判断是否需要 kick 的逻辑 */
+static inline bool virtqueue_need_kick(struct vring_virtqueue *vq)
+{
+    /* 如果设备支持 Event Index */
+    if (virtio_has_feature(vq->vq.vdev, VIRTIO_RING_F_EVENT_IDX)) {
+        /* 读取设备侧的 avail_event */
+        __virtio16 avail_event = vring_avail_event(&vq->vring);
+        
+        /* 判断：当前 idx 是否 >= avail_event */
+        /* 如果是，说明设备已经处理完了之前的请求，需要新的 kick */
+        return vring_need_event(avail_event, vq->avail_idx_shadow, 
+                                vq->avail_idx_shadow - vq->num_added);
+    }
+    
+    /* 否则，检查 used ring 的 flags */
+    return !(vq->vring.used->flags & VRING_USED_F_NO_NOTIFY);
+}
+```
+
+#### 3. 设备侧（vhost）：处理 avail ring
+
+```c
+/* drivers/vhost/vhost.c */
+
+/* vhost 侧：从 avail ring 获取描述符 */
+int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+                      struct iovec iov[],
+                      unsigned int iov_size,
+                      unsigned int *out_num,
+                      unsigned int *in_num,
+                      vhost_logger_t logger,
+                      unsigned long arg)
+{
+    struct vring_desc desc;
+    unsigned int i, head;
+    __virtio16 avail_idx;
+    __virtio16 ring_head;
+    int ret;
+    
+    /* 1. 读取 avail.idx */
+    /* 使用 __get_user 从 Guest 内存读取 */
+    if (__get_user(avail_idx, &vq->avail->idx)) {
+        vq_err(vq, "Failed to access avail idx\n");
+        return -EFAULT;
+    }
+    
+    /* 2. 检查是否有新的描述符 */
+    if (vq->last_avail_idx == vhost16_to_cpu(vq, avail_idx)) {
+        return vq->num;  /* 没有新的描述符 */
+    }
+    
+    /* 3. 从 avail.ring 读取描述符索引 */
+    /* 关键：使用 memory barrier 确保先读取 idx */
+    virtio_rmb();
+    
+    if (__get_user(ring_head, &vq->avail->ring[vq->last_avail_idx % vq->num])) {
+        vq_err(vq, "Failed to read ring head\n");
+        return -EFAULT;
+    }
+    
+    head = vhost16_to_cpu(vq, ring_head);
+    i = head;
+    
+    /* 4. 遍历描述符链 */
+    *out_num = 0;
+    *in_num = 0;
+    
+    do {
+        if (i >= vq->num) {
+            vq_err(vq, "Descriptor index out of bounds\n");
+            return -EFAULT;
+        }
+        
+        /* 读取描述符 */
+        if (__copy_from_user(&desc, &vq->desc[i], sizeof(desc))) {
+            vq_err(vq, "Failed to read descriptor\n");
+            return -EFAULT;
+        }
+        
+        /* 转换 Guest 物理地址到 Host 虚拟地址 */
+        void *addr = vq_meta_trans(vq, vhost64_to_cpu(vq, desc.addr));
+        
+        if (desc.flags & VRING_DESC_F_WRITE) {
+            /* 设备可写（输入） */
+            iov[*in_num].iov_base = addr;
+            iov[*in_num].iov_len = vhost32_to_cpu(vq, desc.len);
+            (*in_num)++;
+        } else {
+            /* 设备只读（输出） */
+            iov[*out_num].iov_base = addr;
+            iov[*out_num].iov_len = vhost32_to_cpu(vq, desc.len);
+            (*out_num)++;
+        }
+        
+        /* 检查是否有下一个描述符 */
+        if (!(desc.flags & VRING_DESC_F_NEXT)) {
+            break;
+        }
+        
+        i = vhost16_to_cpu(vq, desc.next);
+    } while (true);
+    
+    /* 5. 更新 last_avail_idx */
+    vq->last_avail_idx++;
+    
+    return head;  /* 返回描述符链的头索引 */
+}
+```
+
+#### 4. 设备侧（vhost）：写入 used ring
+
+```c
+/* drivers/vhost/vhost.c */
+
+/* vhost 侧：将处理完成的描述符写入 used ring */
+void vhost_add_used(struct vhost_virtqueue *vq,
+                    unsigned int head,
+                    int len)
+{
+    struct vring_used_elem heads = {
+        cpu_to_vhost32(vq, head),
+        cpu_to_vhost32(vq, len)
+    };
+    
+    vhost_add_used_n(vq, &heads, 1);
+}
+
+void vhost_add_used_n(struct vhost_virtqueue *vq,
+                      struct vring_used_elem *heads,
+                      unsigned count)
+{
+    /* 1. 计算 used ring 的位置 */
+    unsigned int start = vq->last_used_idx & (vq->num - 1);
+    struct vring_used_elem *used = vq->used->ring + start;
+    
+    /* 2. 写入 used ring */
+    /* 关键：先写入数据 */
+    if (__copy_to_user(used, heads, count * sizeof(*heads))) {
+        vq_err(vq, "Failed to write used ring\n");
+        return;
+    }
+    
+    /* 3. 使用 memory barrier 确保数据先写入 */
+    smp_wmb();
+    
+    /* 4. 更新 used.idx */
+    vq->last_used_idx += count;
+    
+    if (__put_user(cpu_to_vhost16(vq, vq->last_used_idx),
+                   &vq->used->idx)) {
+        vq_err(vq, "Failed to update used idx\n");
+        return;
+    }
+    
+    /* 5. 检查是否需要通知驱动 */
+    /* 使用 Event Index 优化 */
+    if (vhost_need_event(vhost16_to_cpu(vq, vring_used_event(&vq->vring)),
+                         vq->last_used_idx,
+                         vq->last_used_idx - count)) {
+        /* 发送中断通知驱动 */
+        vhost_signal(&vq->dev, vq);
+    }
+}
+
+/* 发送中断信号 */
+void vhost_signal(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+{
+    /* 通过 eventfd 通知 KVM */
+    if (vq->call_ctx) {
+        eventfd_signal(vq->call_ctx, 1);
+    }
+}
+```
+
+#### 5. 内存屏障的关键作用
+
+```c
+/* 为什么需要内存屏障？ */
+
+/* 场景：多核 CPU 环境下 */
+
+/* 驱动侧（CPU 0） */
+void driver_add_buffer(void)
+{
+    /* 1. 填充描述符 */
+    desc->addr = buffer_addr;
+    desc->len = buffer_len;
+    
+    /* ❌ 如果没有 memory barrier */
+    /* CPU 可能重排序：先更新 idx，后写入描述符 */
+    /* 设备看到新的 idx，但描述符还没写入 */
+    /* 导致设备读取到旧数据或未初始化数据 */
+    
+    /* ✅ 使用 write memory barrier */
+    virtio_wmb(vq->weak_barriers);
+    
+    /* 2. 更新 avail.idx */
+    avail->idx = new_idx;
+    
+    /* 现在保证：描述符先写入，idx 后更新 */
+    /* 设备看到新的 idx 时，描述符已经就绪 */
+}
+
+/* 设备侧（CPU 1，vhost 线程） */
+void device_process_buffer(void)
+{
+    /* 1. 读取 avail.idx */
+    idx = avail->idx;
+    
+    /* ❌ 如果没有 memory barrier */
+    /* CPU 可能重排序：先读取描述符，后读取 idx */
+    /* 导致读取到旧的描述符 */
+    
+    /* ✅ 使用 read memory barrier */
+    virtio_rmb();
+    
+    /* 2. 读取描述符 */
+    desc = &desc_ring[avail->ring[idx]];
+    
+    /* 现在保证：idx 先读取，描述符后读取 */
+    /* 读取到的描述符是最新的 */
+}
+
+/* 内存屏障类型： */
+/* - virtio_wmb(): Write Memory Barrier */
+/*   确保之前的写操作在之后的写操作之前完成 */
+/* - virtio_rmb(): Read Memory Barrier */
+/*   确保之前的读操作在之后的读操作之前完成 */
+/* - virtio_mb(): Full Memory Barrier */
+/*   确保之前的所有操作在之后的所有操作之前完成 */
+```
+
+---
+
