@@ -363,216 +363,415 @@ Kick 和 Notify 是 virtio 的中断机制，用于通知对方"有新的数据"
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 🧪 Virtio Queue 实验
+### 🧪 Virtio Queue 实战练习
 
-现在让我们通过实验来验证 Virtio Queue 的工作原理。
+#### 实验 1: 生产环境性能基准测试与调优
 
-#### 实验 1: 观察 virtio-net 队列状态
+**目标**：在实际生产负载下测试 virtio 性能，并进行调优
 
 ```bash
-# 实验目标：观察 virtio-net 设备的队列信息
+# 场景 1: 高并发网络场景（模拟 Web 服务器）
 
-# 1. 启动一个带 virtio-net 的 VM
-qemu-system-x86_64 -m 2G \
-  -netdev tap,id=net0,vhost=on \
-  -device virtio-net-pci,netdev=net0 \
-  -drive file=disk.img,format=qcow2 \
+# 1. 启动 VM，配置多队列 virtio-net
+qemu-system-x86_64 -m 8G -smp 8 \
+  -netdev tap,id=net0,vhost=on,queues=4 \
+  -device virtio-net-pci,netdev=net0,mq=on,vectors=10 \
+  -drive file=disk.img,format=qcow2,if=virtio \
   -nographic
 
-# 2. 在 Host 上查看 virtio 设备信息
-# 查看 virtio-net 设备
-ls -l /sys/bus/virtio/devices/
+# 2. 在 Guest 内安装测试工具
+apt-get install iperf3 nginx wrk
 
-# 查看队列信息
-cat /sys/bus/virtio/devices/virtio*/queues/*/max_size
-# 输出示例: 256 (队列大小)
+# 3. 测试网络性能（多流并发）
+# 启动 iperf3 server
+iperf3 -s
 
-# 查看队列状态
-cat /sys/bus/virtio/devices/virtio*/queues/*/size
-# 输出示例: 256 (当前使用的队列大小)
+# 在 Host 上运行多流测试
+iperf3 -c <guest_ip> -P 8 -t 60 -R
 
-# 3. 在 Guest 内查看网络接口
-ip link show
-# 应该看到 virtio-net 接口
+# 4. 测试 Web 服务器性能
+# 在 Guest 内启动 nginx
+nginx
 
-# 查看队列统计
-ethtool -S eth0
-# 可以看到每个队列的收发包统计
+# 在 Host 上运行 wrk 测试
+wrk -t8 -c400 -d60s http://<guest_ip>/
+
+# 5. 性能调优
+# 查看当前队列配置
+ethtool -l eth0
+
+# 调整队列大小
+ethtool -G eth0 rx 1024 tx 1024
+
+# 调整 ring buffer
+ethtool -G eth0 rx 2048 tx 2048
+
+# 重新测试，对比性能提升
 ```
 
-#### 实验 2: 使用 perf 分析 virtio 性能
+**分析要点**：
+- 多队列对高并发场景的影响
+- 队列大小与性能的关系
+- 如何根据负载特征调优
+
+---
+
+#### 实验 2: NUMA-aware Virtio 配置与优化
+
+**目标**：理解 NUMA 架构对 virtio 性能的影响，并进行优化
 
 ```bash
-# 实验目标：分析 virtio 数据路径的性能开销
+# 1. 检查 Host NUMA 拓扑
+numactl --hardware
+numactl --show
 
-# 1. 在 Host 上安装 perf
-apt-get install linux-tools-generic
+# 2. 启动 VM，绑定到特定 NUMA node
+numactl --cpunodebind=0 --membind=0 \
+  qemu-system-x86_64 -m 8G -smp 8 \
+  -netdev tap,id=net0,vhost=on \
+  -device virtio-net-pci,netdev=net0 \
+  -drive file=disk.img,format=qcow2,if=virtio \
+  -nographic
 
-# 2. 在 Guest 内运行网络负载
+# 3. 在 Guest 内测试性能
 iperf3 -c <server_ip> -t 60
 
-# 3. 在 Host 上使用 perf 记录事件
-perf record -g -a -e kvm:kvm_exit,kvm:kvm_entry,vhost:vhost_work_add \
-  sleep 10
+# 4. 检查 vhost 线程的 NUMA 亲和性
+ps -eo pid,psr,comm | grep vhost
+numactl --show
 
-# 4. 查看结果
-perf report
+# 5. 优化：将 vhost 线程绑定到正确的 NUMA node
+# 查找 vhost 线程 PID
+VHOST_PID=$(ps -eo pid,comm | grep vhost | awk '{print $1}')
 
-# 分析要点：
-# - kvm_exit 次数：反映 VM-Exit 频率
-# - vhost_work_add 次数：反映 vhost 工作队列活跃度
-# - 调用栈：分析热点函数
+# 绑定到 VM 所在的 NUMA node
+taskset -c 0-7 $VHOST_PID
+
+# 6. 重新测试，对比性能差异
 ```
 
-#### 实验 3: 使用 trace-cmd 追踪 virtio queue 操作
+**分析要点**：
+- NUMA 跨 node 访问的性能损失
+- vhost 线程的 NUMA 亲和性
+- 如何正确配置 NUMA-aware 的 VM
+
+---
+
+#### 实验 3: Virtio 中断风暴排查与优化
+
+**目标**：模拟和排查生产环境中的中断风暴问题
 
 ```bash
-# 实验目标：追踪 virtio queue 的具体操作
+# 1. 启动 VM，配置 virtio-net
+qemu-system-x86_64 -m 4G -smp 4 \
+  -netdev tap,id=net0,vhost=on \
+  -device virtio-net-pci,netdev=net0 \
+  -nographic
 
-# 1. 安装 trace-cmd
-apt-get install trace-cmd
+# 2. 在 Host 上监控中断情况
+watch -n 1 'cat /proc/interrupts | grep -E "vhost|virtio"'
 
-# 2. 开始追踪
-trace-cmd record -e virtio:* -e kvm:* -e vhost:* sleep 5
+# 3. 在 Guest 内模拟高负载（产生大量小包）
+# 使用 ping flood
+ping -f -s 64 <target_ip>
 
-# 3. 在 Guest 内生成网络流量
-iperf3 -c <server_ip> -t 3
+# 或使用 hping3
+hping3 -S --flood -p 80 <target_ip>
 
-# 4. 停止追踪
-trace-cmd stop
+# 4. 观察中断数量激增
+# 在 Host 上观察
+watch -n 0.1 'cat /proc/interrupts | grep vhost'
 
-# 5. 查看追踪结果
-trace-cmd report | grep -E "virtio|vhost" | head -50
+# 5. 使用 perf 分析中断热点
+perf record -g -a -e irq:irq_handler_entry sleep 10
+perf report
 
-# 分析要点：
-# - virtqueue_add: 驱动添加 buffer 到 avail ring
-# - vhost_get_vq_desc: vhost 从 avail ring 获取描述符
-# - vhost_add_used: vhost 写入 used ring
-# - kvm_exit: VM-Exit 事件（kick 触发）
+# 6. 优化：启用中断合并（Interrupt Coalescing）
+# 在 QEMU 启动时添加参数
+-device virtio-net-pci,netdev=net0,interrupt_coalescing=on
+
+# 或使用 ethtool 调整
+ethtool -C eth0 rx-usecs 50 rx-frames 64
+
+# 7. 重新测试，对比中断数量
 ```
 
-#### 实验 4: 创建一个简单的 virtio queue 检查工具
+**分析要点**：
+- 如何识别中断风暴
+- 中断合并（Interrupt Coalescing）的原理和配置
+- 延迟 vs 吞吐的权衡
+
+---
+
+#### 实验 4: Virtio 设备热插拔与迁移测试
+
+**目标**：测试 virtio 设备的热插拔和 live migration
+
+```bash
+# 场景 1: Virtio-net 热插拔
+
+# 1. 启动 VM（不带网卡）
+qemu-system-x86_64 -m 4G -smp 2 \
+  -drive file=disk.img,format=qcow2,if=virtio \
+  -nographic -monitor telnet::4545,server,nowait
+
+# 2. 连接到 QEMU monitor
+telnet localhost 4545
+
+# 3. 热添加 virtio-net 设备
+netdev_add tap,id=net0,vhost=on
+device_add virtio-net-pci,netdev=net0,id=net0
+
+# 4. 在 Guest 内验证
+ip link show
+# 应该看到新添加的网卡
+
+# 5. 热移除设备
+device_del net0
+netdev_del net0
+
+# 场景 2: Live Migration with Virtio
+
+# 1. 启动源 VM
+qemu-system-x86_64 -m 4G -smp 2 \
+  -netdev tap,id=net0,vhost=on \
+  -device virtio-net-pci,netdev=net0 \
+  -drive file=disk.img,format=qcow2,if=virtio \
+  -incoming tcp:0:4444 \
+  -nographic
+
+# 2. 在 Guest 内运行持续的网络负载
+iperf3 -c <server_ip> -t 300 &
+
+# 3. 启动目标 VM（用于接收迁移）
+qemu-system-x86_64 -m 4G -smp 2 \
+  -netdev tap,id=net0,vhost=on \
+  -device virtio-net-pci,netdev=net0 \
+  -drive file=disk.img,format=qcow2,if=virtio \
+  -incoming tcp:0:4444 \
+  -nographic
+
+# 4. 在源 VM monitor 中发起迁移
+migrate -d tcp:target_host:4444
+
+# 5. 监控迁移过程
+info migrate
+
+# 6. 验证迁移后 virtio 设备状态
+ip link show
+ethtool -S eth0
+```
+
+**分析要点**：
+- 热插拔的实现机制
+- Live migration 中 virtio 设备的状态保存和恢复
+- 迁移过程中的性能影响
+
+---
+
+#### 实验 5: Virtio 性能分析与瓶颈定位
+
+**目标**：使用高级工具进行 virtio 性能分析和瓶颈定位
+
+```bash
+# 1. 启动 VM，配置 virtio-net
+qemu-system-x86_64 -m 8G -smp 8 \
+  -netdev tap,id=net0,vhost=on \
+  -device virtio-net-pci,netdev=net0 \
+  -nographic
+
+# 2. 使用 bpftrace 追踪 virtio 数据路径
+bpftrace -e '
+kprobe:vhost_net_buf_add {
+    @start[tid] = nsecs;
+}
+
+kretprobe:vhost_net_buf_add {
+    $duration = nsecs - @start[tid];
+    @latency = hist($duration);
+}
+
+kprobe:vhost_add_used {
+    @used_count = count();
+}
+'
+
+# 3. 在 Guest 内运行网络负载
+iperf3 -c <server_ip> -P 4 -t 60
+
+# 4. 使用 perf 进行火焰图分析
+perf record -F 99 -a -g -- sleep 30
+perf script | ./stackcollapse-perf.pl | ./flamegraph.pl > flame.svg
+
+# 5. 使用 SystemTap 追踪 virtio queue 操作
+stap -e '
+probe kernel.function("vhost_get_vq_desc") {
+    println("vhost_get_vq_desc called, pid=", pid());
+}
+
+probe kernel.function("vhost_add_used") {
+    println("vhost_add_used called, pid=", pid());
+}
+'
+
+# 6. 使用 strace 分析 QEMU 系统调用
+strace -c -p <qemu_pid>
+
+# 7. 分析瓶颈
+# - 是 vhost 线程 CPU 瓶颈？
+# - 是 virtio queue 锁竞争？
+# - 是内存拷贝开销？
+# - 是中断处理开销？
+```
+
+**分析要点**：
+- 如何使用 bpftrace/perf/SystemTap 进行性能分析
+- 如何识别 virtio 数据路径的瓶颈
+- 如何根据分析结果进行优化
+
+---
+
+#### 实验 6: 自定义 Virtio 后端开发
+
+**目标**：开发一个简单的自定义 virtio 后端，理解 virtio 协议
 
 ```c
-/* virtio-queue-inspect.c */
-/* 实验目标：创建一个工具，检查 virtio queue 的内部状态 */
+/* 简化的 virtio-blk 后端示例 */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <linux/virtio_blk.h>
+#include <linux/virtio_ring.h>
 
-/* Virtio 描述符结构 */
-struct vring_desc {
-    uint64_t addr;
-    uint32_t len;
-    uint16_t flags;
-    uint16_t next;
+struct virtio_blk_dev {
+    int fd;
+    void *virtqueue_mem;
+    struct vring_virtqueue *vq;
+    char *disk_image;
 };
 
-/* Avail Ring 结构 */
-struct vring_avail {
-    uint16_t flags;
-    uint16_t idx;
-    uint16_t ring[];
-};
-
-/* Used Ring 结构 */
-struct vring_used_elem {
-    uint32_t id;
-    uint32_t len;
-};
-
-struct vring_used {
-    uint16_t flags;
-    uint16_t idx;
-    struct vring_used_elem ring[];
-};
-
-int main(int argc, char *argv[])
-{
-    if (argc != 2) {
-        printf("Usage: %s <queue_path>\n", argv[0]);
-        printf("Example: %s /sys/bus/virtio/devices/virtio0/queues/tx\n", argv[0]);
-        return 1;
+int main() {
+    struct virtio_blk_dev dev;
+    
+    /* 1. 打开磁盘镜像 */
+    dev.disk_image = mmap_disk_image("disk.img");
+    
+    /* 2. 初始化 virtqueue */
+    dev.virtqueue_mem = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE,
+                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    
+    /* 3. 处理 virtio 请求 */
+    while (1) {
+        struct virtio_blk_outhdr *hdr;
+        struct iovec iov[8];
+        int num_iov;
+        
+        /* 从 avail ring 获取请求 */
+        int head = get_request_from_avail(dev.vq, &hdr, iov, &num_iov);
+        
+        /* 处理请求 */
+        switch (hdr->type) {
+            case VIRTIO_BLK_T_IN:  // 读请求
+                handle_read_request(dev.disk_image, iov, num_iov);
+                break;
+            case VIRTIO_BLK_T_OUT: // 写请求
+                handle_write_request(dev.disk_image, iov, num_iov);
+                break;
+        }
+        
+        /* 将完成的请求放入 used ring */
+        put_completed_request(dev.vq, head, 0);
+        
+        /* 通知前端 */
+        notify_guest(dev.vq);
     }
-    
-    /* 读取队列信息 */
-    char path[256];
-    
-    /* 读取队列大小 */
-    snprintf(path, sizeof(path), "%s/size", argv[1]);
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        perror("Failed to open size file");
-        return 1;
-    }
-    
-    uint32_t queue_size;
-    fscanf(f, "%u", &queue_size);
-    fclose(f);
-    
-    printf("Queue Size: %u\n", queue_size);
-    printf("Descriptor Table Size: %zu bytes\n", queue_size * sizeof(struct vring_desc));
-    printf("Avail Ring Size: %zu bytes\n", 6 + 2 * queue_size);
-    printf("Used Ring Size: %zu bytes\n", 6 + 8 * queue_size);
-    
-    /* 计算总大小 */
-    size_t total_size = queue_size * sizeof(struct vring_desc) +
-                        6 + 2 * queue_size +
-                        6 + 8 * queue_size;
-    printf("Total Queue Size: %zu bytes\n", total_size);
     
     return 0;
 }
-
-/* 编译: gcc -o virtio-queue-inspect virtio-queue-inspect.c */
-/* 运行: ./virtio-queue-inspect /sys/bus/virtio/devices/virtio0/queues/tx */
 ```
 
-#### 实验 5: 对比不同队列大小的性能
+**实现要点**：
+- 理解 virtio ring 的数据结构
+- 实现 avail/used ring 的处理逻辑
+- 实现 virtio-blk 协议
+- 实现通知机制
+
+---
+
+### 🎯 生产环境最佳实践
+
+#### 1. Virtio-net 性能调优清单
 
 ```bash
-# 实验目标：测试不同队列大小对性能的影响
+# 网络性能调优
 
-# 1. 启动 VM，设置队列大小为 128
-qemu-system-x86_64 -m 2G \
-  -netdev tap,id=net0,vhost=on \
-  -device virtio-net-pci,netdev=net0,queue_size=128 \
-  -drive file=disk.img,format=qcow2 \
-  -nographic
+# 1. 启用多队列
+-device virtio-net-pci,mq=on,vectors=$((2*N+2))
+# N = vCPU 数量
 
-# 在 Guest 内测试性能
-iperf3 -c <server_ip> -t 30
+# 2. 调整队列大小
+ethtool -G eth0 rx 1024 tx 1024
 
-# 2. 重新启动 VM，设置队列大小为 256
-qemu-system-x86_64 -m 2G \
-  -netdev tap,id=net0,vhost=on \
-  -device virtio-net-pci,netdev=net0,queue_size=256 \
-  -drive file=disk.img,format=qcow2 \
-  -nographic
+# 3. 启用中断合并
+ethtool -C eth0 rx-usecs 50 rx-frames 64
 
-# 在 Guest 内测试性能
-iperf3 -c <server_ip> -t 30
+# 4. 启用 GRO/GSO
+ethtool -K eth0 gro on gso on tso on
 
-# 3. 重新启动 VM，设置队列大小为 512
-qemu-system-x86_64 -m 2G \
-  -netdev tap,id=net0,vhost=on \
-  -device virtio-net-pci,netdev=net0,queue_size=512 \
-  -drive file=disk.img,format=qcow2 \
-  -nographic
+# 5. NUMA 绑定
+numactl --cpunodebind=0 --membind=0 qemu-system-x86_64 ...
 
-# 在 Guest 内测试性能
-iperf3 -c <server_ip> -t 30
-
-# 分析：
-# - 队列大小 vs 吞吐量
-# - 队列大小 vs 延迟
-# - 队列大小 vs CPU 使用率
+# 6. 启用 vhost
+-netdev tap,vhost=on
 ```
+
+#### 2. Virtio-blk 性能调优清单
+
+```bash
+# 存储性能调优
+
+# 1. 使用 iothread
+-object iothread,id=iothread0
+-device virtio-blk-pci,drive=drive0,iothread=iothread0
+
+# 2. 启用多队列
+-device virtio-blk-pci,num-queues=4
+
+# 3. 调整队列深度
+-device virtio-blk-pci,queue-size=256
+
+# 4. 启用 cache 模式
+-drive file=disk.img,cache=writeback,discard=unmap
+
+# 5. 使用 native AIO
+-drive file=disk.img,aio=native
+```
+
+#### 3. 监控与告警
+
+```bash
+# 监控 virtio 性能指标
+
+# 1. 监控 virtio-net
+watch -n 1 'ethtool -S eth0 | grep -E "rx_packets|tx_packets|rx_errors"'
+
+# 2. 监控 virtio-blk
+iostat -x 1 | grep vda
+
+# 3. 监控 vhost 线程
+top -H -p $(pgrep vhost)
+
+# 4. 设置告警阈值
+# - virtio-net: rx_errors > 0
+# - virtio-blk: await > 10ms
+# - vhost CPU: > 80%
+```
+
+---
 
 ---
 
