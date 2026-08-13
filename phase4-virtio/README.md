@@ -488,7 +488,7 @@ perf report
 
 # 6. 优化：启用中断合并（Interrupt Coalescing）
 # 在 QEMU 启动时添加参数
--device virtio-net-pci,netdev=net0,interrupt_coalescing=on
+-device virtio-net-pci,netdev=net0,
 
 # 或使用 ethtool 调整
 ethtool -C eth0 rx-usecs 50 rx-frames 64
@@ -2030,7 +2030,7 @@ taskset -p 0x2 <vhost_pid>  # 绑定到pCPU 1
 # QEMU启动参数
 qemu-system-x86_64 ... \
   -netdev tap,id=net0,vhost=on \
-  -device virtio-net-pci,netdev=net0,rx_queue_size=1024,tx_queue_size=1024
+  -device virtio-net-pci,netdev=net0,
 ```
 
 **效果**：
@@ -2044,7 +2044,7 @@ qemu-system-x86_64 ... \
 **配置**：
 ```bash
 # QEMU启动参数
--device virtio-net-pci,rx_queue_size=1024,tx_queue_size=1024
+-device virtio-net-pci,
 ```
 
 **效果**：
@@ -2058,7 +2058,7 @@ qemu-system-x86_64 ... \
 **配置**：
 ```bash
 # QEMU启动参数
--device virtio-net-pci,mq=on,vectors=2N+2
+-device virtio-net-pci,mq=on,vectors=$((2*N+2))
 
 # Guest内核参数
 # 自动启用多队列
@@ -2131,7 +2131,7 @@ taskset -p 0x2 <vhost_pid>
 **解决**：
 ```bash
 # QEMU启用multi-queue
--device virtio-net-pci,mq=on,vectors=2N+2
+-device virtio-net-pci,mq=on,vectors=$((2*N+2))
 
 # Guest内核自动启用
 ethtool -L eth0 combined N  # N = vCPU数量
