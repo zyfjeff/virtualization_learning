@@ -110,9 +110,46 @@ kvm-study/
 │       ├── stage4-device.md     ← Stage 4: 设备模拟 (对应 Phase 4-5)
 │       └── stage5-runloop.md    ← Stage 5: 运行循环 (对应 Phase 0, 8)
 └── scripts/                     ← 实践脚本
+    ├── testing/                 ← ★ 统一测试环境 (新增!)
+    │   ├── build-rootfs-ubuntu.sh    ← Ubuntu rootfs 构建（推荐）
+    │   ├── build-rootfs-allinone.sh  ← All-in-One rootfs 构建
+    │   ├── boot-vm-unified.sh        ← 统一 VM 启动脚本
+    │   ├── README-UNIFIED.md         ← 统一测试环境使用指南
+    │   └── MIGRATION-GUIDE.md        ← 迁移指南
     ├── ftrace/                  ← ftrace 脚本集 (trace-vmexit.sh等)
     └── perf/                    ← perf 脚本集 (kvm-overview.sh等)
 ```
+
+## 统一测试环境
+
+> ★ 推荐使用统一的测试环境构建和启动脚本
+
+### 快速开始
+
+```bash
+cd scripts/testing
+
+# 1. 编译内核（如果还没有）
+./build-kernel.sh
+
+# 2. 构建 Ubuntu rootfs（推荐，包含所有测试工具）
+sudo ./build-rootfs-ubuntu.sh
+
+# 3. 启动 VM（统一启动脚本）
+./boot-vm-unified.sh ubuntu --memory 4G --cpus 4 --queues 4
+```
+
+### 特性
+
+- ✅ **统一构建**：所有实验使用同一个基础镜像
+- ✅ **预装工具**：iperf3, ethtool, perf, bpftrace, stress-ng 等
+- ✅ **灵活配置**：支持内存、CPU、队列数、网络类型等配置
+- ✅ **快捷命令**：run-network-test, run-stress-test, tune-virtio
+
+### 详细文档
+
+- [统一测试环境使用指南](scripts/testing/README-UNIFIED.md)
+- [迁移指南](scripts/testing/MIGRATION-GUIDE.md)
 
 ## 学习方法论
 
