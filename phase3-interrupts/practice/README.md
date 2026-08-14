@@ -29,7 +29,7 @@ sudo bash ex1-pi-env-check.sh
 
 # 步骤 2: 启动带设备直通的 VM（实验 3-6 需要）
 # 注意: setup-vfio-vm.sh 在公共目录 scripts/ 下
-sudo bash ../../scripts/setup-vfio-vm.sh start
+sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh start
 
 # 步骤 3: 运行实验
 sudo bash ex3-pi-trace.sh        # PI 中断追踪
@@ -37,7 +37,7 @@ sudo bash ex5-on-sn-observe.sh   # ON/SN 行为观察
 sudo bash ex6-vcpu-migration.sh  # vCPU 迁移观察
 
 # 步骤 4: 清理
-sudo bash ../../scripts/setup-vfio-vm.sh stop
+sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh stop
 ```
 
 ---
@@ -46,9 +46,12 @@ sudo bash ../../scripts/setup-vfio-vm.sh stop
 
 实验 3-6 需要一个运行中的 VM，且设备通过 VFIO 直通给 VM。
 
-**脚本位置**: `/root/code/kvm-study/scripts/setup-vfio-vm.sh`（公共目录，其他 phase 也可使用）
+**脚本位置**: `/root/code/kvm-study/scripts/setup-vfio-vm.sh`
 
 ```bash
+# 首次使用：构建内核和 rootfs
+sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh build
+
 # 启动 VM（自动绑定设备到 vfio-pci）
 sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh start
 

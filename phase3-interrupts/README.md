@@ -834,49 +834,79 @@ PI模式的核心价值:
 
 ## 🔬 实践练习
 
-### 练习1: 查看中断重映射状态
+> **重要**：完整的实践练习和实验脚本已经整理到 `practice/` 目录中。
+
+### 快速开始
+
 ```bash
-# 检查VT-d中断重映射是否启用
-dmesg | grep -E "DMAR.*IR|remapping"
+# 进入实践目录
+cd /root/code/kvm-study/phase3-interrupts/practice/
 
-# 查看IOMMU信息
-dmesg | grep -E "iommu|IRTE"
+# 查看详细指南
+cat README.md
 
-# 检查PI是否启用
-dmesg | grep -i "posted"
+# 环境检查（不需要 VM）
+sudo bash ex1-pi-env-check.sh
+
+# 启动带设备直通的 VM（实验 3-6 需要）
+sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh start
+
+# 运行实验
+sudo bash ex3-pi-trace.sh        # PI 中断追踪
+sudo bash ex5-on-sn-observe.sh   # ON/SN 行为观察
+sudo bash ex6-vcpu-migration.sh  # vCPU 迁移观察
+
+# 清理
+sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh stop
 ```
 
-### 练习2: ftrace 追踪中断路径
-```bash
-# 追踪中断注入
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_inj_virq/enable
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_apic_accept_irq/enable
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_entry/enable
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_exit/enable
+### 实验列表
 
-# 运行VM，观察trace
-cat /sys/kernel/debug/tracing/trace_pipe
+| 编号 | 实验名称 | 需要 VM | 难度 | 预计时间 | 核心知识点 |
+|------|---------|---------|------|---------|-----------|
+| 1 | PI 环境检查 | 否 | ★☆☆ | 10min | APICv/PI 支持检测 |
+| 2 | IRTE 观察 | 否 | ★★☆ | 15min | IRTE 格式、Posted vs Remapped |
+| 3 | PI 中断追踪 | **是** | ★★★ | 20min | 中断投递完整路径 |
+| 4 | PI vs Remapped 性能对比 | **是** | ★★★ | 30min | 零 VM-Exit 性能优势 |
+| 5 | ON/SN 行为观察 | **是** | ★★★ | 20min | 通知合并、抑制机制 |
+| 6 | vCPU 迁移与 NDST 更新 | **是** | ★★★ | 20min | vCPU 调度、NDST 动态更新 |
+
+### 统一测试环境
+
+所有实验使用统一的测试环境构建和启动脚本：
+
+- **构建脚本**: `/root/code/kvm-study/scripts/setup-vfio-vm.sh`
+- **功能**: 自动构建内核和 rootfs，启动带 VFIO 设备直通的 VM
+- **详细说明**: 参见 `practice/README.md`
+
+### 快速实验（不需要 VM）
+
+如果只是想快速了解 PI 的基本概念，可以运行不需要 VM 的实验：
+
+```bash
+# 实验 1: 检查 PI 环境支持
+sudo bash ex1-pi-env-check.sh
+
+# 实验 2: 观察 IRTE 表项
+sudo bash ex2-irte-observe.sh
 ```
 
-### 练习3: bpftrace 追踪 PI 操作
-```bash
-sudo bpftrace -e '
-tracepoint:kvm:kvm_pi_irte_update {
-    printf("PI IRTE update: vcpu=%d gvec=%d girq=%d\n",
-           args->vcpu_id, args->gvec, args->girq);
-}
-'
-```
+### 完整实验（需要 VM）
 
-### 练习4: 对比传统 vs PI 模式
-```bash
-# 1. 禁用APICv, 使用传统模式
-echo 0 > /sys/module/kvm_intel/parameters/enable_apicv
-# 重启VM, 观察 VM-Exit 中的 EXTERNAL_INTERRUPT 次数
+要运行完整的 PI 实验，需要启动带 VFIO 设备直通的 VM：
 
-# 2. 启用APICv+PI
-echo 1 > /sys/module/kvm_intel/parameters/enable_apicv
-# 重启VM, 观察 VM-Exit 是否显著减少
+```bash
+# 1. 启动 VM（首次运行会自动构建环境）
+sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh start
+
+# 2. 在另一个终端运行实验
+sudo bash ex3-pi-trace.sh        # 追踪 PI 中断投递
+sudo bash ex4-pi-vs-remapped.sh  # 对比性能
+sudo bash ex5-on-sn-observe.sh   # 观察 ON/SN 行为
+sudo bash ex6-vcpu-migration.sh  # 观察 vCPU 迁移
+
+# 3. 清理
+sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh stop
 ```
 
 ---
