@@ -436,9 +436,48 @@ SPTE = 0x0000F00000000005
 
 ## 🔬 实践练习
 
-### 练习 1：使用 ftrace 跟踪 EPT 缺页
+> **重要**：完整的实践练习和实验脚本已经整理到 `practice/` 目录中。
+
+### 快速开始
 
 ```bash
+# 进入实践目录
+cd /root/code/kvm-study/phase2-mem-virt/practice/
+
+# 查看详细指南
+cat README.md
+
+# 启动 VM（所有练习都需要）
+sudo bash /root/code/kvm-study/scripts/setup-vm.sh start
+
+# 运行练习
+sudo bash ept_violation_demo      # EPT Violation 演示
+sudo bash memtype_analysis        # 内存类型分析
+
+# 清理
+sudo bash /root/code/kvm-study/scripts/setup-vm.sh stop
+```
+
+### 练习列表
+
+| 编号 | 练习名称 | 需要 VM | 难度 | 预计时间 | 核心知识点 |
+|------|---------|---------|------|---------|-----------|
+| 1 | EPT Violation 演示 | 是 | ★★☆ | 20min | EPT 缺页处理 |
+| 2 | 内存类型分析 | 是 | ★★☆ | 20min | 内存类型映射 |
+
+### 统一测试环境
+
+所有练习使用统一的 VM 启动脚本：
+
+- **启动脚本**: `/root/code/kvm-study/scripts/setup-vm.sh`
+- **详细说明**: 参见 `practice/README.md`
+
+### 快速练习（不需要脚本）
+
+如果只是想快速了解内存虚拟化，可以直接使用 ftrace：
+
+```bash
+# 练习 1: 使用 ftrace 跟踪 EPT 缺页
 # 1. 挂载 debugfs（如果未挂载）
 mount -t debugfs none /sys/kernel/debug
 
@@ -457,31 +496,16 @@ echo 1 > /sys/kernel/debug/tracing/tracing_on
 # 5. 关闭跟踪并查看结果
 echo 0 > /sys/kernel/debug/tracing/tracing_on
 cat /sys/kernel/debug/tracing/trace
-```
 
-### 练习 2：使用 tracepoint 精确跟踪
-
-```bash
-# 使用 KVM 提供的 tracepoint（比 function tracer 更精确）
+# 练习 2: 使用 tracepoint 精确跟踪
 echo kvm_entry > /sys/kernel/debug/tracing/set_event
 echo kvm_exit >> /sys/kernel/debug/tracing/set_event
 echo kvm_page_fault >> /sys/kernel/debug/tracing/set_event
-echo kvm_mmu_paging_element >> /sys/kernel/debug/tracing/set_event
 
 # 也可以使用 perf
 perf record -e kvm:kvm_page_fault -a -g -- sleep 10
 perf report
 ```
-
-### 练习 3：分析 SPTE 值
-
-```bash
-# 通过 debugfs 查看 vCPU 的页表状态
-# （需要 CONFIG_KVM_EXTERNAL_DEBUGGER 或自定义模块）
-
-# 方法: 使用 gdb 附加到 QEMU 进程，查看 KVM 内部结构
-gdb -p <qemu_pid>
-(gdb) p *(struct kvm_vcpu_arch *)0x...
 (gdb) p *(struct kvm_mmu *)0x...
 ```
 

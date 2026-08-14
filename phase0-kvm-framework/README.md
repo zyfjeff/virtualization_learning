@@ -775,16 +775,59 @@ qemu-system-x86_64 -mem-path /dev/hugepages -mem-prealloc ...
 
 ## 📊 实践练习
 
-### 练习1：跟踪VM生命周期
+> **重要**：完整的实践练习和实验脚本已经整理到 `practice/` 目录中。
+
+### 快速开始
 
 ```bash
-# 启用KVM tracepoints
+# 进入实践目录
+cd /root/code/kvm-study/phase0-kvm-framework/practice/
+
+# 查看详细指南
+cat README.md
+
+# 启动 VM（所有练习都需要）
+sudo bash /root/code/kvm-study/scripts/setup-vm.sh start
+
+# 运行练习
+sudo bash ex1-vm-lifecycle.sh    # 跟踪 VM 生命周期
+sudo bash ex2-vcpu-sched.sh      # 分析 vCPU 调度
+sudo bash ex3-memslot.sh         # 调试 memslot
+sudo bash ex4-perf-compare.sh    # 性能对比
+
+# 清理
+sudo bash /root/code/kvm-study/scripts/setup-vm.sh stop
+```
+
+### 练习列表
+
+| 编号 | 练习名称 | 需要 VM | 难度 | 预计时间 | 核心知识点 |
+|------|---------|---------|------|---------|-----------|
+| 1 | 跟踪 VM 生命周期 | 是 | ★☆☆ | 15min | KVM_RUN 调用链 |
+| 2 | 分析 vCPU 调度 | 是 | ★★☆ | 20min | vCPU 线程调度 |
+| 3 | 调试 memslot | 是 | ★★☆ | 20min | 内存 slot 管理 |
+| 4 | 性能对比 | 是 | ★★★ | 30min | 用户态 vs 内核态 |
+
+### 统一测试环境
+
+所有练习使用统一的 VM 启动脚本：
+
+- **启动脚本**: `/root/code/kvm-study/scripts/setup-vm.sh`
+- **功能**: 自动构建内核和 rootfs，启动 VM
+- **详细说明**: 参见 `practice/README.md`
+
+### 快速练习（不需要脚本）
+
+如果只是想快速了解 KVM 框架，可以直接使用 ftrace：
+
+```bash
+# 启用 KVM tracepoints
 echo 1 > /sys/kernel/debug/tracing/events/kvm/enable
 
-# 启动VM
+# 启动 VM
 qemu-system-x86_64 -m 1G ...
 
-# 查看trace
+# 查看 trace
 cat /sys/kernel/debug/tracing/trace_pipe | grep kvm
 
 # 观察到的事件：
@@ -792,31 +835,6 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep kvm
 # kvm_exit: reason EXTERNAL_INTERRUPT, rip 0xffffffff810000a0
 # kvm_page_fault: address 0x7fff12340000, error_code 0x2
 ```
-
-### 练习2：分析vCPU调度
-
-```bash
-# 启用调度tracepoints
-echo 1 > /sys/kernel/debug/tracing/events/sched/enable
-
-# 启动VM并运行工作负载
-# ...
-
-# 分析vCPU调度
-cat /sys/kernel/debug/tracing/trace | grep sched_switch | grep qemu
-
-# 观察vCPU在不同pCPU间的迁移
-```
-
-### 练习3：调试memslot
-
-```bash
-# 使用GDB附加到QEMU
-gdb -p $(pidof qemu-system-x86)
-
-# 查看memslot信息
-(gdb) p *(struct kvm_memslots *)0x...
-(gdb) p ((struct kvm_memslots *)0x...)->slots[0]
 
 # 查看memslot的GPA、HVA、大小
 ```

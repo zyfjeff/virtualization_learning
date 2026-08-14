@@ -151,9 +151,50 @@ VMCS 布局 (6.12.93 arch/x86/include/asm/vmx.h):
 
 ## 实践练习
 
-### 1. CPU虚拟化支持检查
+> **重要**：完整的实践练习和实验脚本已经整理到 `practice/` 目录中。
+
+### 快速开始
+
 ```bash
-# 查看CPU虚拟化特性
+# 进入实践目录
+cd /root/code/kvm-study/phase1-vtx-basics/practice/
+
+# 查看详细指南
+cat README.md
+
+# 运行实验（不需要 VM）
+sudo bash ex1-vmx-verify        # VMX 支持验证
+sudo bash ex2-cpuid-fault       # CPUID Faulting 测试
+sudo bash ex3-msr-test          # MSR 测试
+
+# 运行需要 VM 的实验
+sudo bash /root/code/kvm-study/scripts/setup-vm.sh start
+sudo bash ex5-vmexit-overhead   # VM-Exit 开销测量
+sudo bash /root/code/kvm-study/scripts/setup-vm.sh stop
+```
+
+### 实验列表
+
+| 编号 | 实验名称 | 需要 VM | 难度 | 预计时间 | 核心知识点 |
+|------|---------|---------|------|---------|-----------|
+| 1 | VMX 支持验证 | 否 | ★☆☆ | 10min | VMX 特性检查 |
+| 2 | CPUID Faulting | 否 | ★★☆ | 15min | CPUID 虚拟化 |
+| 3 | MSR 测试 | 否 | ★★☆ | 15min | MSR 读写 |
+| 5 | VM-Exit 开销 | 是 | ★★★ | 20min | VM-Exit 性能 |
+
+### 统一测试环境
+
+需要 VM 的实验使用统一的 VM 启动脚本：
+
+- **启动脚本**: `/root/code/kvm-study/scripts/setup-vm.sh`
+- **详细说明**: 参见 `practice/README.md`
+
+### 快速实验（不需要 VM）
+
+如果只是想快速了解 VT-x 基础，可以运行不需要 VM 的实验：
+
+```bash
+# 实验 1: 检查 CPU 虚拟化支持
 grep -E "vmx|ept|vpid" /proc/cpuinfo
 
 # 关键特性解读:
@@ -163,33 +204,16 @@ grep -E "vmx|ept|vpid" /proc/cpuinfo
 # ept_ad       - EPT Accessed/Dirty位
 # flexpriority - TPR Shadow (灵活优先级)
 # vnmi         - 虚拟NMI
-```
 
-### 2. KVM模块参数查看
-```bash
-# 查看kvm_intel参数
+# 实验 2: 查看 KVM 模块参数
 for f in /sys/module/kvm_intel/parameters/*; do
     echo "$(basename $f) = $(cat $f 2>/dev/null)"
 done
 
-# 查看kvm通用参数
-for f in /sys/module/kvm/parameters/*; do
-    echo "$(basename $f) = $(cat $f 2>/dev/null)"
-done
-```
-
-### 3. ftrace追踪VM-Exit
-```bash
-# 启用kvm_exit tracepoint
+# 实验 3: ftrace 追踪 VM-Exit
 echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_exit/enable
 echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_entry/enable
-
-# 查看实时trace
 cat /sys/kernel/debug/tracing/trace_pipe
-
-# 清理
-echo 0 > /sys/kernel/debug/tracing/events/kvm/kvm_exit/enable
-echo 0 > /sys/kernel/debug/tracing/events/kvm/kvm_entry/enable
 ```
 
 ### 4. 关键tracepoints列表
