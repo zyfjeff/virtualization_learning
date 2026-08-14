@@ -8,7 +8,7 @@
 
 ## 🎯 快速开始
 
-### 一键构建
+### 推荐方式（统一脚本）
 
 ```bash
 cd scripts/testing
@@ -16,7 +16,27 @@ cd scripts/testing
 # 1. 编译内核 (约 5-15 分钟)
 ./build-kernel.sh
 
-# 2. 构建 rootfs (约 1 分钟)
+# 2. 构建 Ubuntu rootfs (推荐，包含所有测试工具)
+sudo ./build-rootfs-ubuntu.sh
+
+# 3. 启动虚拟机（统一启动脚本）
+./boot-vm-unified.sh ubuntu
+
+# 或使用自定义配置
+./boot-vm-unified.sh ubuntu --memory 4G --cpus 4 --queues 4
+```
+
+**详细说明请参考：** [README-UNIFIED.md](README-UNIFIED.md)
+
+### 传统方式（最小化环境）
+
+```bash
+cd scripts/testing
+
+# 1. 编译内核 (约 5-15 分钟)
+./build-kernel.sh
+
+# 2. 构建最小 rootfs (Busybox, 约 1 分钟)
 ./build-rootfs.sh
 
 # 3. 启动虚拟机
@@ -31,11 +51,23 @@ cd scripts/testing
 
 ## 📁 脚本说明
 
+### 推荐脚本（统一方案）
+
 | 脚本 | 功能 | 耗时 | 依赖 |
 |------|------|------|------|
 | `build-kernel.sh` | 编译最小 Linux 内核 | 5-15 分钟 | gcc, make, bc |
+| `build-rootfs-ubuntu.sh` | 构建 Ubuntu rootfs（推荐） | 5-10 分钟 | debootstrap |
+| `build-rootfs-allinone.sh` | 构建 All-in-One rootfs | 1-2 分钟 | busybox-static |
+| `boot-vm-unified.sh` | 统一启动脚本 | - | qemu-system-x86 |
+
+### 传统脚本（最小化环境）
+
+| 脚本 | 功能 | 耗时 | 依赖 |
+|------|------|------|------|
 | `build-rootfs.sh` | 构建最小 rootfs (Busybox) | < 1 分钟 | busybox-static |
 | `boot-vm.sh` | 启动 KVM 虚拟机 | - | qemu-system-x86 |
+
+**详细说明请参考：** [README-UNIFIED.md](README-UNIFIED.md)
 
 ---
 
