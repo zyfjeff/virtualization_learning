@@ -22,6 +22,19 @@ IOMMU 保证隔离性。
 
 ---
 
+## 📂 本章文件
+
+| 文件 | 内容 |
+|------|------|
+| `README.md` | 本文件：VFIO 架构全景 + DMA 映射路径 + KVM-VFIO 桥接 + 常见陷阱 |
+| `annotations.md` | 源码精读：VFIO 分层实现、container/group/device、Type1 IOMMU 后端 |
+| `corrections.md` | ★ 勘误：DMA ownership 认领时机、ACS 认知误区、sysfs 观测盲区（均有实测印证） |
+| `practice/` | ★ 2 个实验程序：ownership 认领时机追踪 / IOVA→HPA 映射验证 |
+
+> 陷阱1、陷阱2 的表述已按 `corrections.md` 修正过，两者冲突时以 `corrections.md` 为准。
+
+---
+
 ## 🏗️ VFIO 架构总览
 
 ### 1.1 为什么需要 VFIO？
@@ -312,6 +325,9 @@ IOMMU 保证隔离性。
 
 ## 🔬 实践练习
 
+> 下面是手工验证步骤。带实测输出的可运行实验（ownership 认领时机、IOVA→HPA 映射验证）
+> 见 [practice/README.md](practice/README.md)。
+
 ### 练习 1：基本设备直通
 
 ```bash
@@ -542,38 +558,67 @@ echo 2 > /proc/irq/<irq_num>/smp_affinity
 
 **场景**：无法直通单个设备
 
-**症状**：`vfio-pci`绑定失败
+**症状**：绑定 `vfio-pci` **会成功**，但随后 `VFIO_GROUP_SET_CONTAINER` 返回 `-EPERM`；
+`VFIO_GROUP_GET_STATUS` 中 `VIABLE` 标志为 0。
 
-**原因**：IOMMU组包含多个设备，无法隔离
+**原因**：IOMMU组包含多个设备，组内仍有设备绑在普通驱动上，DMA ownership 无法认领。
+
+`vfio-pci` 声明了 `.driver_managed_dma = true`（`drivers/vfio/pci/vfio_pci.c:205`），
+probe 阶段刻意不动 `owner_cnt`，所以绑定不会失败。认领发生在 container 附加时
+（`drivers/vfio/container.c:437`），此时才检查：
+
+```c
+/* 来源: drivers/iommu/iommu.c:3214 —— iommu_group_claim_dma_owner() */
+	if (group->owner_cnt) {
+		ret = -EPERM;
+		goto unlock_out;
+	}
+```
 
 **解决**：
 ```bash
-# 查看IOMMU组
-ls /sys/kernel/iommu_groups/
+# 列出组内全部成员
+ls /sys/kernel/iommu_groups/<N>/devices/
 
-# 如果多个设备在同一组，需要直通整个组
+# 组内所有设备都必须绑到 vfio-pci（或处于 unbound），然后整组一起直通
 qemu-system-x86_64 ... \
   -device vfio-pci,host=0000:03:00.0 \
   -device vfio-pci,host=0000:03:00.1  # 同组的其他设备
 ```
 
+> 详见 [corrections.md](corrections.md) 勘误 1，含 kprobe 实测的完整接管时序。
+
 ### 陷阱2：ACS未启用
 
-**场景**：设备间DMA隔离失败
+**场景**：设备与上游桥被划入同一个 IOMMU group，无法单独直通
 
-**症状**：设备DMA访问到其他设备的内存
+**症状**：`/sys/kernel/iommu_groups/<N>/devices/` 里除目标设备外还有上游桥
 
-**原因**：ACS (Access Control Services)未启用
+**原因**：上游链路某一跳不满足 `REQ_ACS_FLAGS`，内核认为无法保证 peer-to-peer DMA 隔离，
+于是把桥拉进同一组：
 
-**解决**：
-```bash
-# 检查ACS
-setpci -s 00:1c.0 ECAP_ACS+6.b
+```c
+/* 来源: drivers/iommu/iommu.c:1543 —— pci_device_group() */
+	if (pci_acs_path_enabled(bus->self, NULL, REQ_ACS_FLAGS))
+		break;
 
-# 如果未启用，在GRUB中添加
-echo "pci=noaer pcie_acs_override=downstream,multifunction" >> /etc/default/grub
-update-grub && reboot
+	pdev = bus->self;          /* 隔离不成立 → 把桥拉进来 */
 ```
+
+**排查**：
+```bash
+# 看上游链路每一跳的 PCIe 类型与 ACS 能力
+lspci -vvv -s 49:01.0 | grep -A2 "Access Control Services"
+```
+
+**注意**：ACS 是硬件能力，**没有内核参数能把它"打开"**。社区流传的
+`pcie_acs_override=downstream,multifunction` 来自第三方补丁，**不在上游内核中**
+（6.12.93 的 `drivers/pci/` 与 `kernel-parameters.txt` 均无此参数），
+在原生内核上写了会被静默忽略；`pci=noaer` 关的是 AER，与 ACS 无关。
+硬件不支持时唯一正规解法是整组一起直通 —— 强行拆组会真实破坏 DMA 隔离。
+
+> 单功能设备"没有 ACS 能力"反而算隔离成立，这一点极易误判，
+> 详见 [corrections.md](corrections.md) 勘误 2。
 
 ### 陷阱3：DMA一致性未处理
 

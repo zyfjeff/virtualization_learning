@@ -20,6 +20,8 @@ phase2-mem-virt/practice/ept_violation_demo
 phase2-mem-virt/practice/memtype_analysis
 phase2-mem-virt/practice/memtest
 phase2-mem-virt/practice/concurrent_test
+phase5-vfio/practice/vfio-claim-trace
+phase5-vfio/practice/vfio-dma-map
 
 # 9p 共享暂存区（只放拷进 guest 的产物）
 scripts/shared/*
