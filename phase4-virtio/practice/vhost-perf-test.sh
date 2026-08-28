@@ -77,7 +77,7 @@ check_prerequisites() {
     # 检查 initramfs
     if [ ! -f "$INITRD" ]; then
         log_error "initramfs 不存在: $INITRD"
-        log_info "运行: bash $KVM_STUDY_ROOT/scripts/testing/build-rootfs-simple.sh"
+        log_info "运行: bash $KVM_STUDY_ROOT/scripts/vm/build-rootfs-minimal.sh"
         return 1
     fi
 

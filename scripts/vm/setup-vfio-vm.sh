@@ -16,11 +16,11 @@ DEVICE="0000:4b:00.0"
 VM_NAME="pi-test-vm"
 PID_FILE="/tmp/${VM_NAME}.pid"
 
-# 项目路径（脚本位于 scripts/ 目录）
+# 项目路径（脚本位于 scripts/vm/ 目录）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KVM_STUDY_ROOT="$(dirname "$SCRIPT_DIR")"  # scripts/ 的父目录 = 项目根目录
-TESTING_DIR="$SCRIPT_DIR/testing"
-IMAGES_DIR="$SCRIPT_DIR/images"
+SCRIPTS_ROOT="$(dirname "$SCRIPT_DIR")"                  # scripts/
+KVM_STUDY_ROOT="$(dirname "$SCRIPTS_ROOT")"              # 项目根目录
+IMAGES_DIR="$SCRIPTS_ROOT/images"
 
 # 内核和 initramfs 路径
 KERNEL="$IMAGES_DIR/bzImage"
@@ -52,7 +52,7 @@ build_images() {
         echo "  [✓] 已复制到: $KERNEL"
     else
         echo "  [i] 构建内核..."
-        echo "  运行: bash $TESTING_DIR/build-kernel.sh"
+        echo "  运行: bash $SCRIPT_DIR/build-kernel.sh"
         echo ""
         echo "  或者手动复制已编译的内核:"
         echo "    cp /root/code/linux-6.12.93/arch/x86_64/boot/bzImage $KERNEL"
@@ -65,9 +65,9 @@ build_images() {
         echo "  [✓] initramfs 已存在: $INITRD"
     else
         echo "  [i] 构建 initramfs..."
-        if [ -f "$TESTING_DIR/build-rootfs-simple.sh" ]; then
-            bash "$TESTING_DIR/build-rootfs-simple.sh"
-            # build-rootfs-simple.sh 输出到 images/ 目录
+        if [ -f "$SCRIPT_DIR/build-rootfs-minimal.sh" ]; then
+            bash "$SCRIPT_DIR/build-rootfs-minimal.sh"
+            # build-rootfs-minimal.sh 输出到 images/ 目录
             if [ -f "$IMAGES_DIR/initramfs.img" ]; then
                 echo "  [✓] initramfs 已构建: $INITRD"
             else
@@ -75,7 +75,7 @@ build_images() {
                 ls "$IMAGES_DIR/" 2>/dev/null
             fi
         else
-            echo "  [错误] 构建脚本不存在: $TESTING_DIR/build-rootfs-simple.sh"
+            echo "  [错误] 构建脚本不存在: $SCRIPT_DIR/build-rootfs-minimal.sh"
             return 1
         fi
     fi
