@@ -19,8 +19,22 @@
 1. 画出设备中断到Guest的完整路径（传统模式和PI模式）
 2. 理解 IRTE 格式及其与 PI 描述符的关联
 3. 跟踪 `vmx_pi_update_irte()` 这个KVM-VT-d桥梁函数
-4. 理解 PI 的 ON/SN/NDV/NDA 字段在调度中如何变化
+4. 理解 PI 的 ON/SN/NV/NDST 字段在调度中如何变化
 5. 用 ftrace 观察中断注入的完整过程
+
+---
+
+## 📂 本章文件
+
+| 文件 | 内容 |
+|------|------|
+| `README.md` | 本文件：技术全景 + 完整中断路径 + 跨层数据结构速览 |
+| `annotations.md` | 源码精读：PI 描述符、IRTE、PIR→IRR 同步、桥梁函数、PIC/IOAPIC 模拟 |
+| `posted-interrupts.md` | ★ Posted 模式系统深入：PI Descriptor / IRTE 格式 / 零 VM-Exit 机制 / KVM 实现 |
+| `msi-affinity-migration.md` | ★ MSI 地址格式与亲和性迁移（Remapped vs Posted 的迁移路径差异） |
+| `practice/` | ★ 6 个实验脚本：环境检查 / IRTE 观察 / PI 追踪 / 性能对比 / ON-SN / vCPU 迁移 |
+
+> 数据结构与桥梁函数在本文件中只作速览，字段级细节以 `posted-interrupts.md` 为准。
 
 ---
 
@@ -298,7 +312,7 @@ MSI 中断投递:
         │
 ③ IOMMU 重映射
    修改向量号 + 目标APIC ID
-   (传统模式: DM=0, 不启用PI)
+   (Remapped 模式: IM=0, 不启用PI)
         │
 ④ 投递到物理 LAPIC
    触发 pCPU 外部中断
@@ -363,6 +377,8 @@ MSI 中断投递:
 
 ## 🔧 核心数据结构（跨层）
 
+> 本节是跨层速览。逐字段深入见 [posted-interrupts.md](posted-interrupts.md) 第一、二部分；逐行源码注解见 [annotations.md](annotations.md) §1、§7。三者冲突时以 posted-interrupts.md 为准。
+
 ### pi_desc — PI描述符 (KVM + VT-d 共享)
 
 ```
@@ -380,29 +396,38 @@ PI Descriptor (64 bytes, 64-byte aligned):
   偏移 0x18 ├────────────────────────────────────────┤
             │          PIR[255:192]                    │
             └────────────────────────────────────────┘
-  偏移 0x20 ┌────┬────┬────┬────┬──────────┬────────┐
-            │ ON │ SN │RSV │ SV │   NDV    │  NDA   │  KVM写: 调度时更新
-            │ 1b │ 1b │ 1b │ 1b │   8b     │  32b   │  IOMMU写: ON位
-            └────┴────┴────┴────┴──────────┴────────┘
+  偏移 0x20 ┌────┬────┬─────┬──────┬─────┬────────┐
+            │ ON │ SN │ RSV │  NV  │ RSV │  NDST  │  KVM写: 调度时更新
+            │ 1b │ 1b │ 14b │  8b  │ 8b  │  32b   │  IOMMU写: ON位
+            └────┴────┴─────┴──────┴─────┴────────┘
+             256  257 271:258 279:272 287:280 319:288
+  偏移 0x28 ┌────────────────────────────────────────┐
+            │        Reserved (24 bytes)              │  bits 511:320
+  偏移 0x3F └────────────────────────────────────────┘
 
-ON  = Outstanding Notification (IOMMU设1 → KVM清0)
-SN  = Suppress Notification (KVM在vCPU调出时设1)
-NDV = Notification Vector (通知中断的向量号)
-NDA = Notification Destination (pCPU的物理APIC ID)
+ON   = Outstanding Notification (bit 256, IOMMU设1 → KVM清0)
+SN   = Suppress Notification (bit 257, KVM在vCPU调出时设1)
+NV   = Notification Vector (bits 279:272, 通知中断的向量号)
+NDST = Notification Destination (bits 319:288, pCPU的物理APIC ID)
+
+对应 Linux 结构体字段 (arch/x86/include/asm/posted_intr.h):
+  ON/SN + 14位保留 → notifications (u16)，NV → nv，NDST → ndst
 ```
 
 ### IRTE — 中断重映射表条目 (128位)
 
 ```
-IRTE (传统模式, DM=0):
+IRTE (Remapped 模式, IM=0):
 ┌─────────────────────── 低64位 ───────────────────────────┐
-│ P │ FPD │ DM │ RH │ TM │ DLM │ AVAIL │ RSV │ Vector │ RSV │ Dest ID │
-│ 1b│ 1b  │ 1b │ 1b │ 1b │  3b │  4b   │ 5b  │  8b    │ 8b  │  32b    │
+│ P │ FPD │ DM │ RH │ TM │ DLM │ AVAIL │ RSV │ IM=0 │ V │ RSV │ DST │
+│ 1b│ 1b  │ 1b │ 1b │ 1b │  3b │  4b   │ 3b  │  1b  │8b │ 8b  │ 32b │
 └──────────────────────────────────────────────────────────┘
+  bit:  0    1     2    3    4   7:5   11:8  14:12   15  23:16 31:24 63:32
 ┌─────────────────────── 高64位 ───────────────────────────┐
 │ SID (Source-ID) │ SQ │ SVT │ Reserved                   │
 │     16b (BDF)   │ 2b │ 2b  │         44b                │
 └──────────────────────────────────────────────────────────┘
+  bit:    79:64    81:80 83:82        127:84
 
 IRTE (Posted模式, IM=1):
 ┌─────────────────────── 低64位 ───────────────────────────┐
@@ -414,41 +439,58 @@ IRTE (Posted模式, IM=1):
 │ 16b │ 2b │ 2b  │ 12b  │            32b                   │
 └──────────────────────────────────────────────────────────┘
 
-字段说明 (参考 VT-d Spec Section 9.10):
-  P     = Present (存在位)
-  FPD   = Fault Processing Disable
-  URG   = Urgent (紧急中断标志)
-  IM    = IRTE Mode (★ 1=Posted模式, 0=Remapped模式)
-  VV    = Virtual Vector (通知向量,会被写入PI Descriptor的NV字段)
+字段说明 (参考 VT-d Spec Section 9.9 / Figure 9-9 = Remapped，Section 9.10 / Figure 9-10 = Posted):
+  两种模式共有:
+  P     = Present (存在位, bit 0)
+  FPD   = Fault Processing Disable (bit 1)
+  IM    = IRTE Mode (★ bit 15: 1=Posted模式, 0=Remapped模式)
+  AVAIL = 软件可用 (bits 11:8, 硬件忽略)
+  SID   = Source Identifier (设备BDF, bits 79:64)
+  SQ    = Source-id Qualifier (bits 81:80)
+  SVT   = Source Validation Type (bits 83:82)
+
+  仅 Remapped 模式:
+  DM    = Destination Mode (bit 2: 0=Physical, 1=Logical)
+  RH    = Redirection Hint (bit 3)
+  TM    = Trigger Mode (bit 4: 0=edge, 1=level)
+  DLM   = Delivery Mode (bits 7:5: 000b=Fixed, 001b=Lowest Priority, 100b=NMI ...)
+  V     = Vector (bits 23:16)
+  DST   = Destination ID (bits 63:32; xAPIC 模式下仅 47:40 有效, x2APIC 模式下 63:32 全部有效)
+
+  仅 Posted 模式:
+  URG   = Urgent (紧急中断标志, bit 14)
+  VV    = Virtual Vector (bits 23:16, 会被写入PI Descriptor的NV字段)
   PDAL  = Posted Descriptor Address Low (bits 63:38, 对应地址bits 31:6)
   PDAH  = Posted Descriptor Address High (bits 127:96, 对应地址bits 63:32)
-  SID   = Source Identifier (设备BDF)
-  SQ    = Source-id Qualifier
-  SVT   = Source Validation Type
 
 关键: PDA字段指向vCPU的pi_desc物理地址(64字节对齐)!
 这是IRTE和PI描述符之间的硬件连接。
 
-**重要: VT-d规范术语说明** (参考 intel-vtd.pdf Section 9.10)
+**重要: VT-d规范术语说明** (参考 intel-vtd.pdf Section 9.9 / 9.10 / 9.11)
 
   在VT-d规范中,Posted模式IRTE的字段命名:
     · IM (IRTE Mode, bit 15): 1=Posted模式, 0=Remapped模式
     · VV (Virtual Vector, bits 23:16): 通知向量
     · PDAL (bits 63:38): PI描述符地址低位
     · PDAH (bits 127:96): PI描述符地址高位
-    
+
   在PI Descriptor中 (Section 9.11):
     · NV (Notification Vector, bits 279:272): 通知向量
-    
+
   两者关系:
     · IRTE.VV 会被IOMMU写入PI Descriptor的NV字段
     · 虽然值相同,但在不同结构中命名不同
     · IRTE中叫VV (Virtual Vector)
     · PI Descriptor中叫NV (Notification Vector)
-    
-  注意: 不要与Remapped模式的DM (Delivery Mode)字段混淆!
-    · Remapped模式: DM字段 (bits 5-7) 指定投递模式
-    · Posted模式: IM字段 (bit 15) 指定IRTE模式
+
+  易混淆点1: 模式选择位是 IM,不是 DM
+    · Remapped 与 Posted 的区分只看 IM (bit 15)
+    · Remapped 模式的 IM=0, Posted 模式的 IM=1
+
+  易混淆点2: Remapped 模式里 DM 和 DLM 是两个不同字段
+    · DM  (Destination Mode, bit 2)  : Destination ID 按 physical 还是 logical 解释
+    · DLM (Delivery Mode, bits 7:5)  : 投递模式 (Fixed / Lowest Priority / NMI ...)
+    · Posted 模式下 bits 7:2 整段为 Reserved,这两个字段都不存在
 ```
 
 ### irq_2_iommu — IRQ到IOMMU的映射
@@ -468,6 +510,8 @@ struct irq_2_iommu {
 ---
 
 ## 🌉 桥梁函数: vmx_pi_update_irte()
+
+> 深入版本见 [posted-interrupts.md](posted-interrupts.md) §4.2 与 [annotations.md](annotations.md) §4。
 
 这是连接 KVM 层和 VT-d 层的关键函数。当设备直通给VM时调用。
 
@@ -508,6 +552,8 @@ vmx_pi_update_irte(vcpu, gvec, girq, set):
 
 ## 🔄 vCPU调度与PI/IRTE状态变化
 
+> 源码级展开见 [posted-interrupts.md](posted-interrupts.md) §4.4 与 [annotations.md](annotations.md) §5。
+
 ```
 时间线:
 ─────┬────────────────┬──────────────────┬──────────────────────┬───→
@@ -516,16 +562,16 @@ vmx_pi_update_irte(vcpu, gvec, girq, set):
      │                │                  │                      │
      │ pi_desc:       │                  │ pi_desc:             │
      │  SN=0 (允许)   │                  │  SN=0 (允许)         │
-     │  NDA=pCPU-0    │                  │  NDA=pCPU-1  ←更新!  │
+     │  NDST=pCPU-0   │                  │  NDST=pCPU-1 ←更新!  │
      │                │                  │                      │
      │ IRTE:          │                  │ IRTE:                │
-     │  IM=1 (Posted)     │                  │  IM=1 (Posted)       │
+     │  IM=1 (Posted) │                  │  IM=1 (Posted)       │
      │  PDA=pi_desc   │                  │  PDA=pi_desc         │
      │  DestID=pCPU-0 │                  │  DestID=pCPU-1 ←更新!│
      │                │                  │                      │
      │ vmx_vcpu_     │ vmx_vcpu_put()  │ vmx_vcpu_load()      │
      │ (正常运行)     │ → pi_set_sn()   │ → pi_clear_sn()      │
-     │                │   SN=1          │ → NDA=pCPU-1 APIC ID │
+     │                │   SN=1          │ → NDST=pCPU-1 APIC ID│
      │                │                 │ → 更新IRTE DestID    │
      │                │                 │                      │
      │                │  如果此时设备    │                      │
@@ -540,281 +586,11 @@ vmx_pi_update_irte(vcpu, gvec, girq, set):
 
 ---
 
-## 🎯 MSI地址格式与亲和性迁移
+## 🎯 MSI 地址格式与亲和性迁移
 
-### MSI Address的两种格式
+这一主题（MSI Address/Data 的两种格式、Remapped 与 Posted 模式下亲和性迁移路径的差异）已拆分为独立文档：
 
-MSI地址根据是否启用IR（中断重映射）有不同的编码方式：
-
-```c
-/* arch/x86/include/asm/msi.h */
-
-typedef struct x86_msi_addr_lo {
-    union {
-        // ═══ 传统模式 (无 IR) ═══
-        struct {
-            u32  reserved_0       :  2,
-                 dest_mode_logical:  1,   // 目标模式
-                 redirect_hint    :  1,
-                 reserved_1       :  1,
-                 virt_destid_8_14 :  7,
-                 destid_0_7       :  8,   // ★ CPU ID (8位)
-                 base_address     : 12;   // 0xFEE00
-        };
-        
-        // ═══ IR 模式 (有 IOMMU) ═══
-        struct {
-            u32  dmar_reserved_0  :  2,
-                 dmar_index_15    :  1,   // ★ IRTE 索引 bit 15
-                 dmar_subhandle_valid: 1,
-                 dmar_format      :  1,   // ★ =1 表示 IR 模式
-                 dmar_index_0_14  : 15,   // ★ IRTE 索引 bits 0-14
-                 dmar_base_address: 12;   // 0xFEE00 (相同基址!)
-        };
-    };
-} arch_msi_msg_addr_lo_t;
-```
-
-**关键区别**：
-- **传统模式**：Address包含目标CPU ID，Data包含实际vector（每个CPU ~230个，N个CPU共N×230个）
-- **IR模式**：Address包含Handle（16位=65536个），Data包含Subhandle
-- **IR的优势**：Source-ID验证（安全隔离）、解耦设备和目标CPU（灵活迁移）、支持Posted模式
-
-**VT-d规范术语说明** (参考 intel-vtd.pdf Section 5.1.2.2)
-
-  在VT-d规范中,Remappable中断格式的字段命名:
-    · Address[31:20] = 0xFEE (Interrupt Identifier)
-    · Address[19:5] = Handle[14:0] (15位)
-    · Address[4] = Interrupt Format (必须为1,表示Remappable格式)
-    · Address[3] = SHV (SubHandle Valid)
-    · Address[2] = Handle[15] (1位)
-    · Address[1:0] = Don't care
-    · Data[15:0] = Subhandle
-    
-  Handle的计算 (Section 5.1.3):
-    if (SHV == 0)
-        interrupt_index = Handle;
-    else
-        interrupt_index = Handle + Subhandle;
-        
-  注意: 内核代码中称为"IRTE索引",规范中称为"Handle"
-  两者是同一概念,只是命名不同。
-
-### 三种模式的亲和性迁移对比
-
-当需要将设备中断从pCPU-0迁移到pCPU-1时，三种模式的处理方式完全不同：
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ 模式 1: 非 IR 模式（无中断重映射）                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│ 设备MSI表直接包含目标:                                          │
-│   Entry 0: Address = 0xFEE00000 | (CPU-0 << 12)               │
-│            Data = vector 32                                      │
-│                                                                  │
-│ 迁移到CPU-1:                                                    │
-│   ① 锁住设备 (防止发中断)                                       │
-│   ② 重新编程设备的MSI表:                                        │
-│      Address = 0xFEE00500 (CPU-1)                               │
-│      Data = ??? (可能要找新vector)                              │
-│   ③ 解锁设备                                                    │
-│                                                                  │
-│ 问题:                                                           │
-│   ✗ 必须动设备的MSI表 (硬件层面)                                │
-│   ✗ 设备可能不支持热更新                                        │
-│   ✗ 操作期间可能丢中断                                          │
-│   ✗ 需要设备驱动配合                                            │
-│   ✗ 复杂度最高                                                  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│ 模式 2: IR 模式（无 PI，DM=0）                                  │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│ 设备MSI表包含IRTE索引:                                          │
-│   Entry 0: Address = IR 基址 + IRTE 索引 10                     │
-│            Data = subhandle                                       │
-│                                                                  │
-│ IRTE[10] 包含:                                                  │
-│   Vector = 32 (系统vector)                                      │
-│   Dest_ID = CPU-0                                               │
-│                                                                  │
-│ 迁移到CPU-1:                                                    │
-│   ① 更新IRTE[10] (在IOMMU中):                                   │
-│      Dest_ID = CPU-1                                            │
-│      Vector = ??? (可能要找新vector)                            │
-│   ② 刷新IOMMU缓存                                               │
-│                                                                  │
-│ 特点:                                                           │
-│   ✓ 不需要动设备的MSI表 (比非IR好)                              │
-│   ✓ 只需更新IOMMU的IRTE                                         │
-│   ⚠️ 但Vector字段可能需要改 (如果新CPU上vector 32已占用)        │
-│   ⚠️ 仍需管理vector分配                                         │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│ 模式 3: IR + PI 模式（IM=1）★                                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│ 设备MSI表包含IRTE索引:                                          │
-│   Entry 0: Address = IR 基址 + IRTE 索引 10                     │
-│            Data = subhandle                                       │
-│                                                                  │
-│ IRTE[10] 包含:                                                  │
-│   NV = 0xf7 (notification vector, 预留的)                       │
-│   Dest_ID = CPU-0                                               │
-│   PDA = pi_desc 物理地址                                        │
-│                                                                  │
-│ 迁移到CPU-1:                                                    │
-│   ① 更新IRTE[10]:                                               │
-│      Dest_ID = CPU-1                                            │
-│      NV = 0xf7 (不用改!)                                        │
-│   ② 更新pi_desc.NDA = CPU-1                                     │
-│   ③ 刷新IOMMU缓存                                               │
-│                                                                  │
-│ 特点:                                                           │
-│   ✓ 不需要动设备的MSI表                                         │
-│   ✓ 只需更新IOMMU的IRTE                                         │
-│   ✓ NV是预留的, 不会冲突, 不用改                                │
-│   ✓ 最简单, 最快速                                              │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Notification Vector的巧妙设计
-
-PI模式之所以在亲和性迁移时更简单，关键在于Notification Vector的设计：
-
-```
-传统模式 vs PI模式的向量管理:
-
-┌─ 传统模式 (每个设备一个vector) ─────────────────────────────┐
-│  设备 A (网卡):  vector = 32 (在CPU-0)                       │
-│  设备 B (NVMe):  vector = 33 (在CPU-0)                       │
-│  设备 C (GPU):   vector = 34 (在CPU-0)                       │
-│                                                              │
-│  每个设备需要独立的vector                                     │
-│  → 需要管理, 可能冲突                                        │
-│  → 迁移时需要找可用的vector                                  │
-└──────────────────────────────────────────────────────────────┘
-
-┌─ PI模式 (所有设备共享notification vector) ──────────────────┐
-│  设备 A (网卡):                                              │
-│    → IOMMU写PI descriptor A的PIR[guest_vector_A]             │
-│    → 发通知中断vector = 0xf7                                 │
-│                                                              │
-│  设备 B (NVMe):                                              │
-│    → IOMMU写PI descriptor B的PIR[guest_vector_B]             │
-│    → 发通知中断vector = 0xf7 (同一个!)                       │
-│                                                              │
-│  设备 C (GPU):                                               │
-│    → IOMMU写PI descriptor C的PIR[guest_vector_C]             │
-│    → 发通知中断vector = 0xf7 (还是同一个!)                   │
-│                                                              │
-│  关键:                                                       │
-│    · 所有PI通知都用vector 0xf7                               │
-│    · 不同设备通过PI descriptor区分 (每个vCPU一个)            │
-│    · 不同guest vector通过PIR位图区分 (256个bit)              │
-│    · 不会冲突!                                               │
-└──────────────────────────────────────────────────────────────┘
-
-源码定义:
-  /* arch/x86/include/asm/irq_vectors.h */
-  #define POSTED_INTR_VECTOR            0xf7
-  #define POSTED_INTR_WAKEUP_VECTOR     0xf6
-  
-  这些向量在系统启动时预留:
-    · 不分配给普通设备
-    · 不参与普通向量分配
-    · 专门用于PI机制
-```
-
-### PI的分层区分机制
-
-PI模式通过三层机制区分不同的中断：
-
-```
-第1层: 哪个vCPU?
-  · 每个vCPU有独立的PI Descriptor
-  · IRTE通过PDA字段区分 (指向不同vCPU的pi_desc)
-  
-第2层: 哪个Guest Vector?
-  · PI Descriptor内有256位的PIR位图
-  · 每个bit对应一个guest vector
-  · IOMMU设置PIR[guest_vector] = 1
-  
-第3层: 通知中断
-  · 所有PI通知都用vector 0xf7
-  · 通过PI descriptor地址区分不同vCPU
-  · 通过PIR位图区分不同guest vector
-```
-
-### 为什么PI模式不会vector冲突？
-
-```
-vCPU迁移时的vector问题:
-
-非PI模式的担忧:
-  · 迁移到新CPU时, 新CPU的vector可能已被占用
-  · 需要找空闲vector, 可能失败
-  · 需要修改IRTE.Vector字段
-
-PI模式的答案:
-  · Notification vector (0xf7) 是系统预留的
-    - 不占用普通vector池 (32-255)
-    - 每个CPU都有, 不会冲突
-  · 所有vCPU共享0xf7
-    - 不同设备通过PI descriptor区分
-    - 不同guest vector通过PIR位图区分
-  · vCPU迁移时:
-    - 只改Dest_ID和NDA
-    - NV不用改 (永远是0xf7)
-    - 不会有vector冲突问题
-
-这是PI模式的巧妙设计:
-  用"共享通知向量 + 分层区分"
-  避免了vector管理复杂性
-  简化了迁移逻辑
-```
-
-### 三种模式总结对比
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     非IR模式        IR模式(无PI)    IR+PI模式   │
-├─────────────────────────────────────────────────────────────────┤
-│ 改哪里?              设备MSI表       IRTE            IRTE+PI desc│
-│                      (硬件层面)      (IOMMU软件)     (IOMMU软件) │
-│                                                                 │
-│ 需要改vector?        是(Data字段)    是(可能)        否(NV预留)  │
-│                      可能冲突        可能冲突         不会冲突    │
-│                                                                 │
-│ 设备感知?            是              否               否         │
-│                      要重编程设备    只改IOMMU       只改IOMMU   │
-│                                                                 │
-│ 锁设备?              是              否               否         │
-│ 可能丢中断?          是              否               否         │
-│                                                                 │
-│ 复杂度:              最高            中等             最低       │
-│ 性能影响:            大              中               小         │
-│ VM-Exit:             -               需要             零次       │
-└─────────────────────────────────────────────────────────────────┘
-
-关键洞察:
-  非IR → 改设备 (硬件层面, 复杂)
-  IR   → 改IOMMU (软件层面, 简单)
-  PI   → 改IOMMU + vector不用管 (最简单)
-  
-PI模式的核心价值:
-  不仅是"零VM-Exit"
-  还简化了亲和性迁移
-  消除了vector管理复杂性
-```
-
----
+- [msi-affinity-migration.md](msi-affinity-migration.md)
 
 ## 📊 关键源码函数速查
 
@@ -1106,7 +882,7 @@ cat /sys/kernel/debug/iommu/irq_remap
 
 **症状**：vCPU在某些pCPU上收不到中断
 
-**原因**：迁移时未更新IRTE的Dest_ID和PI描述符的NDA
+**原因**：迁移时未更新IRTE的Dest_ID和PI描述符的NDST
 
 **解决**：
 ```c

@@ -292,7 +292,7 @@ trace-cmd report | grep -E "EXTERNAL_INTERRUPT|inj_virq" | head -20
 ────────────────  ────────────────────────────  ──────────
 0.0               设备产生 MSI                   硬件
 0.1               MSI 到达 IOMMU                IOMMU
-0.3               IRTE 重映射 (DM=1, PI模式)    IOMMU
+0.3               IRTE 重映射 (IM=1, PI模式)    IOMMU
 0.5               写入 PI desc PIR[vec]=1       内存
 0.6               发送通知中断到 pCPU            IOMMU
 0.8               pCPU 收到通知中断             pCPU

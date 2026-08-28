@@ -207,7 +207,7 @@ VMCS 控制位:
   至少 1 次 VM-Exit
 
 Posted Interrupts 路径:
-  设备 MSI → IOMMU (IRTE DM=1) → PI 描述符 PIR[vec]=1, ON=1
+  设备 MSI → IOMMU (IRTE IM=1) → PI 描述符 PIR[vec]=1, ON=1
   → 通知中断到 pCPU
   → KVM sync_pir_to_irr() → 写入 RVI
   → 硬件 VID 自动注入 (如果 Guest 在运行)

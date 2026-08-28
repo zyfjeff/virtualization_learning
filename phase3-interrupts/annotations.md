@@ -99,15 +99,23 @@ struct intel_ir_data {
 };
 ```
 
-### IRTE 128位格式 (参考 VT-d Spec Section 9.10)
+### IRTE 128位格式 (参考 VT-d Spec Section 9.9 / 9.10)
 
 ```
 Remapped模式 (IM=0, Section 9.9):
 低64位:
-┌──┬───┬──┬──┬──┬───┬───┬───┬───┬────┬───┬────────┐
-│ P│FPD│DM│RH│TM│DLM│AV │RSV│RSV│ VV │RSV│Dest ID │
-│ 1│ 1 │ 1│ 1│ 1│ 3 │ 4 │ 5 │ 8 │ 8  │ 8 │   32   │
-└──┴───┴──┴──┴──┴───┴───┴───┴───┴────┴───┴────────┘
+┌──┬───┬──┬──┬──┬───┬───┬───┬──┬───┬───┬────────┐
+│ P│FPD│DM│RH│TM│DLM│AV │RSV│IM│ V │RSV│Dest ID │
+│ 1│ 1 │ 1│ 1│ 1│ 3 │ 4 │ 3 │ 1│ 8 │ 8 │   32   │
+└──┴───┴──┴──┴──┴───┴───┴───┴──┴───┴───┴────────┘
+bit: 0   1  2  3  4  7:5 11:8 14:12 15 23:16 31:24 63:32
+
+高64位:
+┌──────┬──┬───┬────────────────────────────────┐
+│ SID  │SQ│SVT│ Reserved                       │
+│ 16bit│ 2│ 2 │          44 bits               │
+└──────┴──┴───┴────────────────────────────────┘
+bit: 79:64 81:80 83:82        127:84
 
 Posted模式 (IM=1, Section 9.10):
 低64位:
@@ -134,7 +142,7 @@ PDA (Posted Descriptor Address) = pi_desc的物理地址(64字节对齐)
   
 注意: 
   · IRTE中的VV会被写入PI Descriptor的NV字段
-  · 不要与Remapped模式的DM (Delivery Mode)字段混淆
+  · 不要与Remapped模式的DLM (Delivery Mode, bits 7:5)字段混淆
 ```
 
 ### prepare_irte() — 初始化IRTE
@@ -299,7 +307,7 @@ void vmx_pi_update_irte(struct kvm_vcpu *vcpu,
      * 1. 通过girq找到对应的Linux IRQ和irq_2_iommu
      * 2. 获取IRTE索引
      * 3. 构造PI模式IRTE:
-     *    - DM=1 (PI模式)
+     *    - IM=1 (PI模式)
      *    - PDA = __pa(&vmx->pi_desc) ← vCPU的PI描述符物理地址
      *    - NV  = pi_desc.nv ← 通知向量
      *    - Dest_ID = 当前pCPU的APIC ID
@@ -330,7 +338,7 @@ void vmx_pi_update_irte(struct kvm_vcpu *vcpu,
  *
  * 作用:
  *   1. 清除SN位 → 允许IOMMU发送通知中断
- *   2. 更新NDA → 当前pCPU的物理APIC ID
+ *   2. 更新NDST → 当前pCPU的物理APIC ID
  *
  * ★ 必须使用cmpxchg原子操作，因为IOMMU硬件可能同时写PI.ON
  */
@@ -357,7 +365,7 @@ void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
 
         new.sn = 0;    /* 允许通知 */
 
-        /* NDA = 当前pCPU的物理APIC ID */
+        /* NDST = 当前pCPU的物理APIC ID */
         dest = per_cpu(x86_cpu_to_physical_apicid, cpu);
         new.ndst = dest;
 
@@ -645,7 +653,7 @@ APICv (Virtual APIC) 是一组VMCS控制位的集合：
 1. CPU支持APICv (`cpu_has_vmx_apicv()`)
 2. `enable_apicv=1`
 3. 设备是直通设备 (VFIO)，通过irqfd注册
-4. IOMMU支持中断重映射 (IRTE的DM=1)
+4. IOMMU支持中断重映射 (IRTE的IM=1)
 
 虚拟设备 (virtio等) 的中断通常走传统路径: `kvm_lapic_set_irr()`
 
