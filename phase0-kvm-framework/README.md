@@ -20,6 +20,17 @@
 
 ---
 
+## 📂 本章文件
+
+| 文件 | 内容 |
+|------|------|
+| `README.md` | 本文件：KVM 框架层学习主线 + 整体架构 |
+| `annotations.md` | 源码精读：`kvm_dev_ioctl()` → `vcpu_enter_guest()` 全链路逐函数注解，含 halt-polling |
+| `kvm-framework.md` | ★ VMM 视角深度对比：设计差异 / 数据流 / 并发模型 / 内存管理 |
+| `practice/` | ★ 实战练习：VM 生命周期 / vCPU 调度 / memslot / 性能对比（手工步骤形式） |
+
+---
+
 ## 🏗️ KVM整体架构
 
 ### 1.1 从VMM专家视角看KVM
@@ -786,35 +797,33 @@ cd /root/code/kvm-study/phase0-kvm-framework/practice/
 # 查看详细指南
 cat README.md
 
-# 启动 VM（所有练习都需要）
-sudo bash /root/code/kvm-study/scripts/setup-vm.sh start
+# 启动 VM（所有练习都需要，前台运行，建议单独开一个终端）
+cd /root/code/kvm-study/scripts/testing && ./boot-vm-unified.sh ubuntu --memory 4G --cpus 4
 
-# 运行练习
-sudo bash ex1-vm-lifecycle.sh    # 跟踪 VM 生命周期
-sudo bash ex2-vcpu-sched.sh      # 分析 vCPU 调度
-sudo bash ex3-memslot.sh         # 调试 memslot
-sudo bash ex4-perf-compare.sh    # 性能对比
+# Phase 0 的练习为手工步骤形式（无封装脚本），按 practice/README.md 的
+# 「练习详情」依次执行 ftrace / perf / QEMU trace 命令
 
-# 清理
-sudo bash /root/code/kvm-study/scripts/setup-vm.sh stop
+# 清理：在 Guest 内执行 poweroff（或在 QEMU monitor 中 quit）
 ```
 
 ### 练习列表
 
-| 编号 | 练习名称 | 需要 VM | 难度 | 预计时间 | 核心知识点 |
+详细步骤见 [practice/README.md](practice/README.md)。
+
+| 编号 | 练习名称 | 主要工具 | 难度 | 预计时间 | 核心知识点 |
 |------|---------|---------|------|---------|-----------|
-| 1 | 跟踪 VM 生命周期 | 是 | ★☆☆ | 15min | KVM_RUN 调用链 |
-| 2 | 分析 vCPU 调度 | 是 | ★★☆ | 20min | vCPU 线程调度 |
-| 3 | 调试 memslot | 是 | ★★☆ | 20min | 内存 slot 管理 |
-| 4 | 性能对比 | 是 | ★★★ | 30min | 用户态 vs 内核态 |
+| 1 | [跟踪 VM 生命周期](practice/README.md#练习-1-跟踪-vm-生命周期) | ftrace | ★☆☆ | 15min | KVM_RUN 调用链 |
+| 2 | [分析 vCPU 调度](practice/README.md#练习-2-分析-vcpu-调度) | perf record/report | ★★☆ | 20min | vCPU 线程调度 |
+| 3 | [调试 memslot](practice/README.md#练习-3-调试-memslot) | QEMU monitor / --trace / strace | ★★☆ | 20min | 内存 slot 管理 |
+| 4 | [性能对比](practice/README.md#练习-4-性能对比) | perf stat | ★★★ | 30min | 用户态 vs 内核态 |
 
 ### 统一测试环境
 
 所有练习使用统一的 VM 启动脚本：
 
-- **启动脚本**: `/root/code/kvm-study/scripts/setup-vm.sh`
-- **功能**: 自动构建内核和 rootfs，启动 VM
-- **详细说明**: 参见 `practice/README.md`
+- **构建脚本**: `scripts/testing/build-kernel.sh` + `scripts/testing/build-rootfs-ubuntu.sh`
+- **启动脚本**: `scripts/testing/boot-vm-unified.sh`（前台运行 QEMU）
+- **详细说明**: 参见 `scripts/testing/README-UNIFIED.md` 与 `practice/README.md`
 
 ### 快速练习（不需要脚本）
 

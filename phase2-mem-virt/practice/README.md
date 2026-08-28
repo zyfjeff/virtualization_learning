@@ -16,15 +16,17 @@
 ## 快速开始
 
 ```bash
-# 启动 VM（所有练习都需要）
-sudo bash /root/code/kvm-study/scripts/setup-vm.sh start
+# 编译练习程序
+make
 
-# 在另一个终端运行练习
-sudo bash ept_violation_demo      # EPT Violation 演示
-sudo bash memtype_analysis        # 内存类型分析
+# 启动 VM（所有练习都需要，前台运行，建议单独开一个终端）
+cd /root/code/kvm-study/scripts/testing && ./boot-vm-unified.sh ubuntu --memory 4G --cpus 4
 
-# 清理
-sudo bash /root/code/kvm-study/scripts/setup-vm.sh stop
+# 回到本目录运行练习
+sudo ./ept_violation_demo      # EPT Violation 演示
+sudo ./memtype_analysis        # 内存类型分析
+
+# 清理：在 Guest 内执行 poweroff
 ```
 
 ---
@@ -84,8 +86,8 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep kvm_mmio
 
 所有练习使用统一的 VM 启动脚本：
 
-- **启动脚本**: `/root/code/kvm-study/scripts/setup-vm.sh`
-- **功能**: 自动构建内核和 rootfs，启动 VM
+- **构建脚本**: `scripts/testing/build-kernel.sh` + `scripts/testing/build-rootfs-ubuntu.sh`
+- **启动脚本**: `scripts/testing/boot-vm-unified.sh`（前台运行 QEMU）
 - **详细说明**: 参见 `/root/code/kvm-study/scripts/testing/README-UNIFIED.md`
 
 ---

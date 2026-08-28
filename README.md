@@ -38,23 +38,42 @@ kvm-study/
 ├── notes/                       ← 学习笔记汇总
 │   ├── source-navigation.md     ← 源码导航图
 │   └── debugging-guide.md       ← ★ KVM调试实战指南 (新增!)
-├── phase0-kvm-framework/        ← ★ 第零阶段：KVM框架层深度解析 (新增!)
-│   ├── README.md                ← 框架层核心概念
-│   ├── annotations.md           ← kvm_main.c/x86.c源码注释
-│   └── kvm-framework.md         ← VMM视角对比分析
+├── phase0-kvm-framework/        ← 第零阶段：KVM框架层深度解析
+│   ├── README.md                ← 框架层核心概念 + 本章文件导航
+│   ├── annotations.md           ← kvm_dev_ioctl→vcpu_enter_guest 全链路注释
+│   ├── kvm-framework.md         ← VMM视角对比分析
+│   └── practice/                ← 实战练习（手工步骤形式）
 ├── phase1-vtx-basics/           ← 第一阶段：VT-x + CPU虚拟化
 │   ├── README.md                ← 学习指南 + VMM对比 + 性能优化 + 常见陷阱
 │   ├── annotations.md           ← VT-x源码精读注释
-│   └── cpu-virtualization.md    ← ★ CPUID/MSR/指令虚拟化
+│   ├── cpu-virtualization.md    ← ★ CPUID/MSR/指令虚拟化
+│   └── practice/                ← 4 个 C 练习程序（make 构建）
 ├── phase2-mem-virt/             ← 第二阶段：内存虚拟化(EPT/TDP MMU)
-│   ├── README.md                ← VMM对比 + 大页/脏页/MMIO缓存优化
-│   └── annotations.md
+│   ├── README.md                ← EPT原理 + SPTE格式 + 本章文件导航
+│   ├── annotations.md           ← SPTE/缺页/TDP MMU 源码注释
+│   ├── ept-violation-handling.md← ★ EPT Violation 完整处理流程
+│   ├── tdp-mmu-concurrency.md   ← ★ TDP MMU 并发模型
+│   ├── mmio-identification.md   ← ★ MMIO 识别与 IPAT（含核查报告）
+│   ├── practice/                ← 2 个 C 练习程序（make 构建）
+│   └── archive/                 ← 已归档的过程性文档
 ├── phase3-interrupts/           ← 第三阶段：中断虚拟化 + VT-d中断重映射
-│   ├── README.md                ← VMM对比 + APICv/PI/中断合并优化
-│   └── annotations.md           ← pi_desc + IRTE + PIR→IRR + PI调度
-├── phase4-virtio/               ← ★ 第四阶段：vhost内核态加速 (重构!)
-│   ├── README.md                ← 聚焦vhost，删除用户态virtio细节
-│   └── annotations.md           ← vhost源码注释
+│   ├── README.md                ← 技术全景 + 中断路径 + 数据结构速览
+│   ├── annotations.md           ← pi_desc + IRTE + PIR→IRR + PI调度
+│   ├── posted-interrupts.md     ← ★ Posted 模式系统深入
+│   ├── msi-affinity-migration.md← ★ MSI 地址格式与亲和性迁移
+│   └── practice/                ← 6 个实验脚本 + PI 演示内核模块
+├── phase4-virtio/               ← 第四阶段：virtio / vhost / vhost-user
+│   ├── README.md                ← 为什么需要vhost + 源码路线 + 本章文件导航
+│   ├── annotations.md           ← vhost源码注释
+│   ├── virtio-queue.md          ← ★ Virtqueue 深度解析
+│   ├── vhost-architecture.md    ← ★ vhost 架构与数据结构
+│   ├── vhost-net-datapath.md    ← ★ vhost-net 数据路径
+│   ├── vhost-user-basics.md     ← ★ vhost-user 入门
+│   ├── vhost-user-protocol-latest.md        ← 协议字段速查
+│   ├── vhost-user-new-features-factcheck-v2.md ← 新特性核查(QEMU 11.1.0+DPDK)
+│   ├── vhost-user-new-features-usecases.md  ← 新特性使用场景
+│   ├── practice/                ← 全部练习与实测数据
+│   └── archive/                 ← 已被取代的过程性文档
 ├── phase5-vfio/                 ← 第五阶段：VFIO设备直通
 │   ├── README.md                ← VMM对比 + IOTLB/DMA批处理优化
 │   └── annotations.md

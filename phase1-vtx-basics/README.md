@@ -11,7 +11,7 @@
 7. **理解MSR Bitmap和MSR虚拟化策略** ← 新增
 8. **列举触发VM-Exit的指令及KVM处理方式** ← 新增
 
-## 本章文件
+## 📂 本章文件
 
 | 文件 | 内容 |
 |------|------|
@@ -162,15 +162,19 @@ cd /root/code/kvm-study/phase1-vtx-basics/practice/
 # 查看详细指南
 cat README.md
 
-# 运行实验（不需要 VM）
-sudo bash ex1-vmx-verify        # VMX 支持验证
-sudo bash ex2-cpuid-fault       # CPUID Faulting 测试
-sudo bash ex3-msr-test          # MSR 测试
+# 编译练习程序
+make
 
-# 运行需要 VM 的实验
-sudo bash /root/code/kvm-study/scripts/setup-vm.sh start
-sudo bash ex5-vmexit-overhead   # VM-Exit 开销测量
-sudo bash /root/code/kvm-study/scripts/setup-vm.sh stop
+# 运行实验（不需要 VM）
+sudo ./ex1-vmx-verify        # VMX 支持验证
+sudo ./ex2-cpuid-fault       # CPUID Faulting 测试
+sudo ./ex3-msr-test          # MSR 测试
+
+# 运行需要 VM 的实验：先在另一个终端启动 VM
+cd /root/code/kvm-study/scripts/testing && ./boot-vm-unified.sh ubuntu --memory 4G --cpus 4
+# 回到 practice 目录测量
+sudo ./ex5-vmexit-overhead   # VM-Exit 开销测量
+# 清理：在 Guest 内执行 poweroff
 ```
 
 ### 实验列表
@@ -186,8 +190,8 @@ sudo bash /root/code/kvm-study/scripts/setup-vm.sh stop
 
 需要 VM 的实验使用统一的 VM 启动脚本：
 
-- **启动脚本**: `/root/code/kvm-study/scripts/setup-vm.sh`
-- **详细说明**: 参见 `practice/README.md`
+- **启动脚本**: `scripts/testing/boot-vm-unified.sh`（前台运行 QEMU）
+- **详细说明**: 参见 `scripts/testing/README-UNIFIED.md` 与 `practice/README.md`
 
 ### 快速实验（不需要 VM）
 
