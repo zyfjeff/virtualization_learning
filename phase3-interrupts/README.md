@@ -625,7 +625,7 @@ cat README.md
 sudo bash ex1-pi-env-check.sh
 
 # 启动带设备直通的 VM（实验 3-6 需要）
-sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh start
+sudo bash /root/code/kvm-study/scripts/vm/setup-vfio-vm.sh start
 
 # 运行实验
 sudo bash ex3-pi-trace.sh        # PI 中断追踪
@@ -633,7 +633,7 @@ sudo bash ex5-on-sn-observe.sh   # ON/SN 行为观察
 sudo bash ex6-vcpu-migration.sh  # vCPU 迁移观察
 
 # 清理
-sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh stop
+sudo bash /root/code/kvm-study/scripts/vm/setup-vfio-vm.sh stop
 ```
 
 ### 实验列表
@@ -651,7 +651,7 @@ sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh stop
 
 所有实验使用统一的测试环境构建和启动脚本：
 
-- **构建脚本**: `/root/code/kvm-study/scripts/setup-vfio-vm.sh`
+- **构建脚本**: `/root/code/kvm-study/scripts/vm/setup-vfio-vm.sh`
 - **功能**: 自动构建内核和 rootfs，启动带 VFIO 设备直通的 VM
 - **详细说明**: 参见 `practice/README.md`
 
@@ -673,7 +673,7 @@ sudo bash ex2-irte-observe.sh
 
 ```bash
 # 1. 启动 VM（首次运行会自动构建环境）
-sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh start
+sudo bash /root/code/kvm-study/scripts/vm/setup-vfio-vm.sh start
 
 # 2. 在另一个终端运行实验
 sudo bash ex3-pi-trace.sh        # 追踪 PI 中断投递
@@ -682,7 +682,7 @@ sudo bash ex5-on-sn-observe.sh   # 观察 ON/SN 行为
 sudo bash ex6-vcpu-migration.sh  # 观察 vCPU 迁移
 
 # 3. 清理
-sudo bash /root/code/kvm-study/scripts/setup-vfio-vm.sh stop
+sudo bash /root/code/kvm-study/scripts/vm/setup-vfio-vm.sh stop
 ```
 
 ---

@@ -24,7 +24,7 @@
 ```bash
 # 所有练习都需要一个运行中的 VM
 # 使用统一测试环境启动（前台运行，建议单独开一个终端）
-cd /root/code/kvm-study/scripts/testing && ./boot-vm-unified.sh ubuntu --memory 4G --cpus 4
+cd /root/code/kvm-study/scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
 
 # 回到本目录，按「练习详情」逐个执行
 # 清理：在 Guest 内执行 poweroff
@@ -131,9 +131,9 @@ perf stat -e kvm:kvm_exit -e kvm:kvm_entry sleep 10
 
 所有练习使用统一的 VM 启动脚本：
 
-- **构建脚本**: `scripts/testing/build-kernel.sh` + `scripts/testing/build-rootfs-ubuntu.sh`
-- **启动脚本**: `scripts/testing/boot-vm-unified.sh`（前台运行 QEMU）
-- **详细说明**: 参见 `/root/code/kvm-study/scripts/testing/README-UNIFIED.md`
+- **构建脚本**: `scripts/vm/build-kernel.sh` + `scripts/vm/build-rootfs-ubuntu.sh`
+- **启动脚本**: `scripts/vm/boot-vm.sh`（前台运行 QEMU）
+- **详细说明**: 参见 `/root/code/kvm-study/scripts/README.md`
 
 ---
 

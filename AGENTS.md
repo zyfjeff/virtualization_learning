@@ -21,7 +21,17 @@ phase10-microvm/        MicroVM 架构
 examples/  notes/  scripts/  shared/
 ```
 
-各 phase 下的 `practice/` 存放实践练习，统一测试环境在 `scripts/testing/`。
+各 phase 下的 `practice/` 存放实践练习。实验 VM 环境在 `scripts/`：
+
+| 目录 | 用途 |
+|---|---|
+| `scripts/vm/` | 构建内核与 rootfs、启动实验 VM（`boot-vm.sh` 默认启用 KVM） |
+| `scripts/trace/` | 宿主侧观测脚本（ftrace + perf） |
+| `scripts/images/` | 构建产物，已 gitignore |
+| `scripts/shared/` | 9p 共享暂存区 → guest `/mnt/shared` |
+| `scripts/archive/` | 已弃用脚本与历史文档，不要用于新实验 |
+
+入口文档：`scripts/README.md`。
 
 ## 强制要求：事实核查
 
@@ -62,6 +72,7 @@ examples/  notes/  scripts/  shared/
 4. **PDA 位范围** — `PDAL` bits 63:38（对应地址 bits 31:6），`PDAH` bits 127:96（对应地址 bits 63:32），共 58 位，64 字节对齐。（VT-d Spec 9.10）
 5. **VFIO MSI-X 直通流程** — QEMU 始终在中间协调：Guest 写 MSI-X 表 → QEMU 拦截 (`msix_table_mmio_write`) → `KVM_SET_GSI_ROUTING` + `VFIO_DEVICE_SET_IRQS` → VFIO 内核驱动设置 IRTE。参考 `hw/pci/msix.c:221`、`hw/vfio/pci.c:487`、`accel/kvm/kvm-all.c:2198`、`drivers/iommu/intel/irq_remapping.c:1352`。
 6. **PI 零 VM-Exit** — 见上文核心原则，正常 PI 路径 0 次 VM-Exit、延迟 <1μs。关键词 "without transferring control to the VMM"。（SDM 30.6、VT-d Spec 5.2.5）
+7. **启动 VM 必须显式传 `-enable-kvm -cpu host`** — 缺 `-enable-kvm` 时 QEMU **静默**回退 TCG 纯软件模拟，不报任何错，但宿主侧 `kvm:kvm_exit` / `kvm:kvm_entry` 等 tracepoint 零事件，所有 KVM 追踪实验都会得出"没有 VM-Exit"的错误结论；缺 `-cpu host` 则 guest 内看不到 VMX（`VMX: 0 CPUs with VMX support`）。写文档给出 qemu 命令时不要漏掉这两个参数。判断某次运行是否真的走了 KVM：数 `/proc/<qemu-pid>/fd` 里指向 `/dev/kvm` 的引用，走 KVM 时 >0，TCG 时为 0。`scripts/vm/boot-vm.sh` 已默认带上并会在启动前自检。
 
 ## 文档规范
 
@@ -105,15 +116,18 @@ pdftotext intel-vmx.pdf /tmp/vmx-spec.txt && grep -n "Posted-Interrupt Processin
 pdftotext intel-vtd.pdf /tmp/vtd-spec.txt
 pdftotext virtio-v1.3-csd01.pdf /tmp/virtio-spec.txt
 
-# 统一测试环境（详见 scripts/testing/README-UNIFIED.md）
-cd scripts/testing
+# 实验 VM 环境（详见 scripts/README.md）
+cd scripts/vm
 ./build-kernel.sh
 sudo ./build-rootfs-ubuntu.sh
-./boot-vm-unified.sh ubuntu --memory 4G --cpus 4 --queues 4
+./boot-vm.sh ubuntu --memory 4G --cpus 4 --queues 4   # 默认 -enable-kvm -cpu host
+./boot-vm.sh ubuntu --tcg                             # 显式回退纯软件模拟
 
-# 观测脚本
-ls scripts/ftrace/   # trace-vmexit.sh 等
-ls scripts/perf/     # kvm-overview.sh 等
+# 确认某次运行真的走了 KVM（0 表示走的是 TCG）
+ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm
+
+# 观测脚本（宿主侧，ftrace + perf）
+ls scripts/trace/   # trace-vmexit.sh, kvm-overview.sh 等
 ```
 
 ## 提交前检查清单

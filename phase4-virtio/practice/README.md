@@ -110,7 +110,7 @@ vhost_iotlb 的作用:
   CONFIG_INET=y
 
 构建 initramfs:
-  bash /root/code/kvm-study/scripts/testing/build-rootfs-iperf.sh
+  bash /root/code/kvm-study/scripts/vm/build-rootfs-iperf.sh
 ```
 
 ---

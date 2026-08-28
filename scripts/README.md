@@ -1,363 +1,227 @@
-# 统一测试环境构建指南
+# scripts/ —— 构建并启动实验 VM
 
-## 概述
+本目录是本项目**唯一**的实验环境入口：构建内核与 rootfs、启动一台可做 KVM 实验的 VM，并提供宿主侧观测脚本。各 phase 的 `practice/` 都假定 VM 由这里启动。
 
-本项目现在采用统一的测试环境构建方式，所有实验使用同一个基础镜像，避免重复构建和配置。
+```
+scripts/
+├── vm/        构建与启动实验 VM
+├── trace/     宿主侧观测（ftrace / perf）
+├── images/    构建产物（已 gitignore）
+├── shared/    9p 共享暂存区 → guest /mnt/shared
+└── archive/   已弃用脚本与历史文档
+```
+
+---
 
 ## 快速开始
 
-### 1. 构建统一镜像
+```bash
+cd scripts/vm
+
+# 1. 编译内核（约 5-15 分钟，配置见 kernel-config）
+./build-kernel.sh
+
+# 2. 构建 rootfs（选一个）
+sudo ./build-rootfs-ubuntu.sh      # 推荐：Ubuntu，工具齐全
+sudo ./build-rootfs-minimal.sh     # 最快：busybox，秒级
+
+# 3. 启动
+./boot-vm.sh ubuntu --memory 4G --cpus 4 --queues 4
+```
+
+退出 VM：`Ctrl-A` 然后 `X`。
+
+---
+
+## 关于 KVM 加速（重要）
+
+`boot-vm.sh` **默认传 `-enable-kvm -cpu host`**。这两个参数不是可选项：
+
+- 缺 `-enable-kvm`，QEMU 会静默回退到 TCG 纯软件模拟。此时宿主侧 `kvm:kvm_exit`、`kvm:kvm_entry` 等 tracepoint **不会产生任何事件**，`trace/` 下的脚本全部采不到数据。
+- 缺 `-cpu host`，QEMU 用默认 `qemu64` 模型，guest 内看不到 VMX（表现为 `VMX: 0 CPUs with VMX support`），phase1 的 VT-x 实验无法进行。
+
+脚本会在启动前自检 `/dev/kvm` 是否存在且可写，并检查宿主的嵌套虚拟化开关：
 
 ```bash
-# 构建 Ubuntu 基础镜像（推荐）
-sudo ./build-rootfs-ubuntu.sh
-
-# 或构建 All-in-One 镜像（包含所有工具）
-sudo ./build-rootfs-allinone.sh
+# guest 内要看到 VMX，宿主必须开启嵌套虚拟化
+cat /sys/module/kvm_intel/parameters/nested        # 期望 Y
+modprobe -r kvm_intel && modprobe kvm_intel nested=1
 ```
 
-### 2. 启动 VM
+确认某次运行真的走了 KVM：
 
 ```bash
-# 使用默认配置启动
-./boot-vm-unified.sh ubuntu
-
-# 使用自定义配置启动
-./boot-vm-unified.sh ubuntu --memory 4G --cpus 4 --queues 4
-
-# 使用 user 网络（无需 root 权限创建 TAP）
-./boot-vm-unified.sh ubuntu --net user
-
-# 调试模式
-./boot-vm-unified.sh ubuntu --debug
+ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm   # > 0 表示走 KVM，0 表示 TCG
 ```
 
-## 镜像类型
+需要跑 TCG 做对比时用 `--tcg` 显式声明，脚本会打印告警。
 
-### Ubuntu 镜像（推荐）
+---
 
-**特点：**
-- 基于 Ubuntu 22.04 LTS
-- 包含完整的 apt 包管理
-- 预装所有测试工具
-- 适合长期测试和开发
+## vm/ 各脚本
 
-**预装工具：**
-- 网络：iperf3, ethtool, ip, ping, hping3, tcpdump
-- 系统：lspci, numactl, stress-ng
-- 性能：perf, bpftrace, sysstat
-- 调试：strace, gdb
+| 脚本 | 功能 | 耗时 | 依赖 |
+|------|------|------|------|
+| `build-kernel.sh` | 编译内核，输出到 `../images/` | 5-15 分钟 | gcc, make, bc, flex, bison, libssl-dev |
+| `build-rootfs-ubuntu.sh` | Ubuntu rootfs（推荐） | 5-10 分钟 | debootstrap（需联网） |
+| `build-rootfs-allinone.sh` | busybox + 宿主机测试工具 | 1-2 分钟 | busybox-static |
+| `build-rootfs-minimal.sh` | 最小 busybox initramfs | < 1 分钟 | busybox-static, cpio |
+| `build-rootfs-iperf.sh` | 网络性能专用（phase4） | 1-2 分钟 | busybox-static, iperf3 |
+| `boot-vm.sh` | 启动实验 VM | - | qemu-system-x86 |
+| `setup-vfio-vm.sh` | 带 VFIO 设备直通的 VM（phase3/phase5） | - | qemu, vfio-pci |
+| `test-in-vm.sh` | VM 内跑的测试脚本 | - | - |
 
-**构建命令：**
-```bash
-sudo ./build-rootfs-ubuntu.sh
-```
-
-**输出文件：**
-- `../images/initramfs-ubuntu.img` - initramfs 镜像
-- `../images/disk-ubuntu.img` - 磁盘镜像（10G）
-
-### All-in-One 镜像
-
-**特点：**
-- 基于 busybox
-- 复制宿主机的测试工具
-- 体积较小
-- 适合快速测试
-
-**构建命令：**
-```bash
-sudo ./build-rootfs-allinone.sh
-```
-
-**输出文件：**
-- `../images/initramfs-allinone.img` - initramfs 镜像
-- `../images/disk-allinone.img` - 磁盘镜像（10G）
-
-## 启动参数说明
-
-### 基本参数
+安装依赖：
 
 ```bash
-./boot-vm-unified.sh [镜像类型] [选项]
+# Ubuntu / Debian
+sudo apt install build-essential bc flex bison libssl-dev \
+                 busybox-static cpio debootstrap qemu-system-x86
+
+# CentOS / RHEL / Fedora
+sudo yum install gcc make bc flex bison openssl-devel busybox qemu-kvm
 ```
 
-**镜像类型：**
-- `ubuntu` - Ubuntu 基础系统（默认）
-- `allinone` - All-in-One 系统
-- `minimal` - 最小化系统（旧版本）
+---
 
-**选项：**
-- `--memory <size>` - 内存大小（默认 2G）
-- `--cpus <num>` - CPU 数量（默认 2）
-- `--queues <num>` - virtio-net 队列数（默认 1）
-- `--net <type>` - 网络类型：tap, user, none（默认 tap）
-- `--gui` - 启用图形界面
-- `--debug` - 启用调试模式
-
-### 使用示例
-
-#### 1. 标准测试环境
+## boot-vm.sh 用法
 
 ```bash
-# 4G 内存，4 CPU，4 队列
-./boot-vm-unified.sh ubuntu --memory 4G --cpus 4 --queues 4
+./boot-vm.sh [镜像类型] [选项]
 ```
 
-#### 2. 快速测试（无需 root）
+**镜像类型**（决定读哪个 initramfs）
+
+| 类型 | 镜像文件 | 构建脚本 |
+|------|---------|---------|
+| `ubuntu` | `images/initramfs-ubuntu.img` | `build-rootfs-ubuntu.sh` |
+| `allinone` | `images/initramfs-allinone.img` | `build-rootfs-allinone.sh` |
+| `minimal` | `images/initramfs.img` | `build-rootfs-minimal.sh` |
+
+**选项**
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `--memory <size>` | 2G | 内存大小 |
+| `--cpus <num>` | 2 | vCPU 数量 |
+| `--queues <num>` | 1 | virtio-net 队列数（仅 `--net tap`） |
+| `--net <type>` | tap | `tap` / `user` / `none` |
+| `--gui` | 关 | 图形界面（默认走串口） |
+| `--debug` | 关 | 开 GDB server 并暂停等待连接 |
+| `--tcg` | 关 | 回退 TCG 纯软件模拟 |
+| `--qemu "<args>"` | - | 透传额外参数给 qemu |
+
+示例：
 
 ```bash
-# 使用 user 网络，无需创建 TAP 设备
-./boot-vm-unified.sh ubuntu --net user
+./boot-vm.sh ubuntu --memory 8G --cpus 8 --queues 8   # 性能测试
+./boot-vm.sh ubuntu --net user                        # 免 root 创建 TAP，SSH 走 localhost:2222
+./boot-vm.sh minimal --debug                          # 另开终端 gdb → target remote :1234
+./boot-vm.sh allinone --qemu "-machine q35"           # 透传任意 qemu 参数
 ```
 
-#### 3. 性能测试
+`--net tap` 需要 root 创建 TAP 设备；`--net user` 不需要但性能低。
+
+---
+
+## 9p 共享目录
+
+`boot-vm.sh` 总会把 `scripts/shared/` 以 `mount_tag=hostshare` 导出，rootfs 的 `/init` 会将它挂到 guest 的 `/mnt/shared`。
+
+好处是测试程序在宿主机编译、VM 内直接运行，改完立刻生效，不用重建 initramfs：
 
 ```bash
-# 高性能配置
-./boot-vm-unified.sh ubuntu --memory 8G --cpus 8 --queues 8
+# 宿主机
+cp phase2-mem-virt/practice/memtest scripts/shared/
+
+# guest 内
+/mnt/shared/memtest
 ```
 
-#### 4. 调试模式
+依赖内核选项 `CONFIG_NET_9P=y` 与 `CONFIG_9P_FS=y`（`vm/kernel-config` 已包含）。手工挂载：
 
 ```bash
-# 启用 GDB 调试
-./boot-vm-unified.sh ubuntu --debug
-
-# 在另一个终端连接 GDB
-gdb
-(gdb) target remote :1234
+mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/shared
 ```
 
-## 在 VM 内测试
+---
 
-### 网络性能测试
+## 内核配置
+
+`vm/kernel-config` 是一份最小化配置，关键项：
+
+| 选项 | 用途 |
+|------|------|
+| `CONFIG_KVM=y` / `CONFIG_KVM_INTEL=y` / `CONFIG_KVM_AMD=y` | 嵌套 KVM（guest 内再跑 VM） |
+| `CONFIG_KVM_VFIO=y` | VFIO 设备直通 |
+| `CONFIG_SERIAL_8250_CONSOLE=y` | 串口控制台（ttyS0） |
+| `CONFIG_VIRTIO_PCI/BLK/NET=y` | virtio 设备 |
+| `CONFIG_NET_9P=y` / `CONFIG_9P_FS=y` | 9p 共享目录 |
+| `CONFIG_X86_MSR=y` | 用户态读写 MSR |
+| `CONFIG_FTRACE=y` | ftrace 追踪 |
+
+为缩短编译时间，图形驱动（DRM/VGA）、USB、ext4/xfs/btrfs、无线网络均已关闭。
+
+---
+
+## trace/ 观测脚本
+
+在**宿主机**上运行，需要 VM 正在走 KVM（见上文自检方法）。
+
+| 脚本 | 观测对象 |
+|------|---------|
+| `trace-vmexit.sh` | VM-Exit 原因分布与频率 |
+| `trace-page-fault.sh` | EPT violation / page fault |
+| `trace-irq-inject.sh` | 中断注入路径 |
+| `trace-vfio.sh` | VFIO 设备直通相关事件 |
+| `kvm-overview.sh` | perf 视角的 KVM 整体开销 |
+| `iommu-analysis.sh` | IOMMU / 中断重映射 |
 
 ```bash
-# 启动 iperf3 server
-run-network-test
-
-# 或手动启动
-iperf3 -s
-
-# 在另一个终端运行 client
-iperf3 -c <server_ip> -t 30 -P 4
+sudo ./trace/trace-vmexit.sh -p $(pgrep -f '^qemu-system-x86_64') -d 10
 ```
 
-### 压力测试
-
-```bash
-# 运行完整压力测试
-run-stress-test
-
-# 或单独测试
-stress-ng --cpu 4 --timeout 60s
-stress-ng --vm 2 --vm-bytes 1G --timeout 60s
-stress-ng --hdd 2 --timeout 60s
-```
-
-### Virtio 调优
-
-```bash
-# 自动调优
-tune-virtio
-
-# 或手动调优
-# 查看当前配置
-ethtool -g eth0
-
-# 调整队列大小
-ethtool -G eth0 rx 1024 tx 1024
-
-# 启用中断合并
-ethtool -C eth0 rx-usecs 50 rx-frames 64
-
-# 查看统计
-ethtool -S eth0
-```
-
-### 性能分析
-
-```bash
-# perf 采样
-perf record -g -a sleep 30
-perf report
-
-# bpftrace 追踪
-bpftrace -e 'kprobe:vhost_net_buf_add { @count++; }'
-
-# strace 跟踪
-strace -c -p <pid>
-```
-
-## 快捷命令
-
-Ubuntu 镜像提供以下快捷命令：
-
-- `run-network-test [server_ip]` - 网络性能测试
-- `run-stress-test` - 完整压力测试
-- `tune-virtio` - Virtio 自动调优
-
-## 网络配置
-
-### TAP 网络（推荐）
-
-TAP 网络提供最佳性能，需要 root 权限创建 TAP 设备。
-
-```bash
-# 启动脚本会自动创建 TAP 设备
-./boot-vm-unified.sh ubuntu
-
-# 手动创建 TAP 设备
-sudo ip tuntap add tap0 mode tap
-sudo ip link set tap0 up
-```
-
-### User 网络
-
-User 网络不需要 root 权限，但性能较低。
-
-```bash
-# 使用 user 网络
-./boot-vm-unified.sh ubuntu --net user
-
-# SSH 端口转发
-ssh -p 2222 root@localhost
-```
-
-## 文件结构
-
-```
-scripts/testing/
-├── build-rootfs-ubuntu.sh      # Ubuntu 镜像构建（推荐）
-├── build-rootfs-allinone.sh    # All-in-One 镜像构建
-├── build-rootfs.sh             # 基础镜像构建（旧版本）
-├── build-rootfs-simple.sh      # 最小化镜像构建（旧版本）
-├── build-rootfs-ext4.sh        # ext4 镜像构建（旧版本）
-├── build-kernel.sh             # 内核构建
-├── boot-vm-unified.sh          # 统一启动脚本（推荐）
-├── boot-vm.sh                  # 基础启动脚本（旧版本）
-├── boot-vm-ext4.sh             # ext4 启动脚本（旧版本）
-├── boot-vm-9p.sh               # 9p 启动脚本（旧版本）
-├── test-in-vm.sh               # VM 内测试脚本
-├── README-UNIFIED.md           # 本文档
-└── README.md                   # 原始文档
-```
-
-## 迁移指南
-
-### 从旧脚本迁移
-
-如果你之前使用旧版本的脚本，请按以下步骤迁移：
-
-1. **构建新镜像**
-   ```bash
-   sudo ./build-rootfs-ubuntu.sh
-   ```
-
-2. **使用新启动脚本**
-   ```bash
-   # 旧方式
-   ./boot-vm.sh
-   
-   # 新方式
-   ./boot-vm-unified.sh ubuntu
-   ```
-
-3. **删除旧文件（可选）**
-   ```bash
-   rm -f boot-vm.sh boot-vm-ext4.sh boot-vm-9p.sh
-   rm -f build-rootfs.sh build-rootfs-simple.sh build-rootfs-ext4.sh
-   ```
+---
 
 ## 故障排查
 
-### 1. 无法创建 TAP 设备
+### Kernel panic: VFS: Unable to mount root fs
 
-**问题：** `RTNETLINK answers: Operation not permitted`
-
-**解决：**
-```bash
-# 使用 sudo
-sudo ./boot-vm-unified.sh ubuntu
-
-# 或使用 user 网络
-./boot-vm-unified.sh ubuntu --net user
-```
-
-### 2. 内核不存在
-
-**问题：** `内核不存在: /root/code/linux-6.12.93/arch/x86_64/boot/bzImage`
-
-**解决：**
-```bash
-# 构建内核
-./build-kernel.sh
-```
-
-### 3. 镜像不存在
-
-**问题：** `initramfs 不存在`
-
-**解决：**
-```bash
-# 构建镜像
-sudo ./build-rootfs-ubuntu.sh
-```
-
-### 4. 网络不通
-
-**问题：** VM 内无法访问网络
-
-**解决：**
-```bash
-# 检查 TAP 设备
-ip link show tap0
-
-# 配置 IP（如果需要）
-sudo ip addr add 192.168.100.1/24 dev tap0
-
-# 在 VM 内配置 DHCP
-udhcpc -i eth0
-```
-
-## 性能优化建议
-
-### 1. 使用多队列
+initramfs 里缺少可执行的 `/init`，内核找不到启动入口，于是退回去尝试挂载根文件系统并失败。
 
 ```bash
-# 启动时指定队列数
-./boot-vm-unified.sh ubuntu --queues 4
-
-# 在 VM 内调优
-ethtool -G eth0 rx 1024 tx 1024
+# 确认镜像里有 /init
+zcat images/initramfs-allinone.img | cpio -t | grep '^init$'
 ```
 
-### 2. 启用中断合并
+没有输出说明镜像是旧的构建产物（各 `build-rootfs-*.sh` 现在都会生成 `/init`），重新构建即可。
 
-```bash
-# 在 VM 内配置
-ethtool -C eth0 rx-usecs 50 rx-frames 64
-```
+### guest 内 `VMX: 0 CPUs with VMX support`
 
-### 3. 使用大页内存
+两种原因：启动时没传 `-cpu host`（用本目录的 `boot-vm.sh` 即可，它默认会传），或宿主机没开嵌套虚拟化（见上文「关于 KVM 加速」）。
 
-```bash
-# 启动时启用大页
-./boot-vm-unified.sh ubuntu --memory 4G --machine q35,memory-backend=mem0
-```
+### trace 脚本采不到任何事件
 
-## 参考资料
+先确认 VM 真的走了 KVM 而不是 TCG，方法见上文。
 
-- [Phase 4 实验文档](../../phase4-virtio/README.md)
+### 无法创建 TAP 设备
+
+`RTNETLINK answers: Operation not permitted` —— 用 `sudo` 运行，或改用 `--net user`。
+
+### 镜像 / 内核不存在
+
+按报错提示跑对应的构建脚本；`boot-vm.sh` 会直接告诉你该跑哪一个。
+
+---
+
+## archive/
+
+存放已弃用的脚本与历史文档，**不要用于新实验**。弃用原因见 [archive/README.md](archive/README.md)。
+
+---
+
+## 参考
+
+- [Phase 4 virtio 实验](../phase4-virtio/README.md)
 - [Virtio 规范](https://docs.oasis-open.org/virtio/virtio/v1.1/virtio-v1.1.html)
 - [QEMU 文档](https://www.qemu.org/docs/master/)
-
-## 更新日志
-
-### 2026-08-13
-- 创建统一的测试环境构建脚本
-- 支持 Ubuntu 基础镜像
-- 支持 All-in-One 镜像
-- 统一启动脚本
-- 预装所有测试工具

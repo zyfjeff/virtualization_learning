@@ -162,8 +162,8 @@ A: 可以，但建议使用新脚本。新旧脚本使用不同的镜像文件�
 ## 支持
 
 如有问题，请参考：
-- [README-UNIFIED.md](README-UNIFIED.md) - 统一测试环境使用指南
-- [README.md](README.md) - 原始文档
+- [scripts/README.md](../../README.md) - 实验 VM 环境使用指南（现行）
+- [README-old.md](README-old.md) - 原始文档（已归档）
 
 ---
 

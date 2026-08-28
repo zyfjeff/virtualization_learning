@@ -26,7 +26,7 @@ sudo ./build-rootfs-ubuntu.sh
 ./boot-vm-unified.sh ubuntu --memory 4G --cpus 4 --queues 4
 ```
 
-**详细说明请参考：** [README-UNIFIED.md](README-UNIFIED.md)
+**详细说明请参考：** [scripts/README.md](../../README.md)
 
 ### 传统方式（最小化环境）
 
@@ -67,7 +67,7 @@ cd scripts/testing
 | `build-rootfs.sh` | 构建最小 rootfs (Busybox) | < 1 分钟 | busybox-static |
 | `boot-vm.sh` | 启动 KVM 虚拟机 | - | qemu-system-x86 |
 
-**详细说明请参考：** [README-UNIFIED.md](README-UNIFIED.md)
+**详细说明请参考：** [scripts/README.md](../../README.md)
 
 ---
 

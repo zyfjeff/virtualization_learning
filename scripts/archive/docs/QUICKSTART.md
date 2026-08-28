@@ -76,7 +76,7 @@ images/
 
 ## 📚 详细文档
 
-查看 [README.md](README.md) 获取完整使用说明。
+查看 [scripts/README.md](../../README.md) 获取完整使用说明。
 
 ---
 

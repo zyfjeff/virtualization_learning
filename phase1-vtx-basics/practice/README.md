@@ -21,9 +21,13 @@
 
 ```bash
 # 宿主机上执行
-cd /root/code/kvm-study/scripts/testing
-./boot-vm.sh
+cd /root/code/kvm-study/scripts/vm
+./boot-vm.sh minimal
 ```
+
+> `boot-vm.sh` 默认传 `-enable-kvm -cpu host`。本 phase 的实验要在 guest 内看到 VMX，
+> 还需要宿主开启嵌套虚拟化（`cat /sys/module/kvm_intel/parameters/nested` 应为 `Y`），
+> 脚本启动前会自检并在未开启时告警。
 
 ### 验证环境
 

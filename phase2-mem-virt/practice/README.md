@@ -20,7 +20,7 @@
 make
 
 # 启动 VM（所有练习都需要，前台运行，建议单独开一个终端）
-cd /root/code/kvm-study/scripts/testing && ./boot-vm-unified.sh ubuntu --memory 4G --cpus 4
+cd /root/code/kvm-study/scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
 
 # 回到本目录运行练习
 sudo ./ept_violation_demo      # EPT Violation 演示
@@ -86,9 +86,9 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep kvm_mmio
 
 所有练习使用统一的 VM 启动脚本：
 
-- **构建脚本**: `scripts/testing/build-kernel.sh` + `scripts/testing/build-rootfs-ubuntu.sh`
-- **启动脚本**: `scripts/testing/boot-vm-unified.sh`（前台运行 QEMU）
-- **详细说明**: 参见 `/root/code/kvm-study/scripts/testing/README-UNIFIED.md`
+- **构建脚本**: `scripts/vm/build-kernel.sh` + `scripts/vm/build-rootfs-ubuntu.sh`
+- **启动脚本**: `scripts/vm/boot-vm.sh`（前台运行 QEMU）
+- **详细说明**: 参见 `/root/code/kvm-study/scripts/README.md`
 
 ---
 

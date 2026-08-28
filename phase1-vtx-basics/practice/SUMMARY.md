@@ -98,14 +98,16 @@ kvm-study/
 │       ├── test-cpuid-fault       # 用户态测试
 │       └── test-cpuid-fault-kvm   # KVM 测试
 │
-└── scripts/testing/               # 测试环境
-    ├── build-kernel.sh            # 编译内核
-    ├── build-rootfs-simple.sh     # 构建 rootfs
-    ├── boot-vm.sh                 # 启动 VM
-    ├── kernel-config              # 内核配置
-    └── images/                    # 生成的镜像
-        ├── bzImage                # 内核 (6.5 MB)
-        └── initramfs.img          # rootfs (1.1 MB)
+└── scripts/                      # 实验 VM 环境
+    ├── vm/                       # 构建与启动
+    │   ├── build-kernel.sh            # 编译内核
+    │   ├── build-rootfs-minimal.sh    # 构建 rootfs
+    │   ├── boot-vm.sh                 # 启动 VM（默认启用 KVM）
+    │   └── kernel-config              # 内核配置
+    ├── trace/                    # 宿主侧观测脚本
+    └── images/                   # 生成的镜像
+        ├── bzImage                   # 内核 (6.5 MB)
+        └── initramfs.img             # rootfs (1.1 MB)
 ```
 
 ---

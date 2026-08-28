@@ -95,7 +95,7 @@ interval:s:5 { print(@gpa, 20); clear(@gpa); }
 echo always > /sys/kernel/mm/transparent_hugepage/enabled
 
 # Step 4: 使用 phase7 项目 2 的测试脚本
-sudo ./scripts/ftrace/trace-page-fault.sh -p $QEMU_PID -d 10
+sudo ./scripts/trace/trace-page-fault.sh -p $QEMU_PID -d 10
 ```
 
 ### 场景 4: vCPU 调度抖动

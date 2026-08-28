@@ -128,25 +128,27 @@ kvm-study/
 │       ├── stage3-interrupt.md  ← Stage 3: 中断注入 (对应 Phase 3)
 │       ├── stage4-device.md     ← Stage 4: 设备模拟 (对应 Phase 4-5)
 │       └── stage5-runloop.md    ← Stage 5: 运行循环 (对应 Phase 0, 8)
-└── scripts/                     ← 实践脚本
-    ├── testing/                 ← ★ 统一测试环境 (新增!)
-    │   ├── build-rootfs-ubuntu.sh    ← Ubuntu rootfs 构建（推荐）
-    │   ├── build-rootfs-allinone.sh  ← All-in-One rootfs 构建
-    │   ├── boot-vm-unified.sh        ← 统一 VM 启动脚本
-    │   ├── README-UNIFIED.md         ← 统一测试环境使用指南
-    │   └── MIGRATION-GUIDE.md        ← 迁移指南
-    ├── ftrace/                  ← ftrace 脚本集 (trace-vmexit.sh等)
-    └── perf/                    ← perf 脚本集 (kvm-overview.sh等)
+└── scripts/                     ← 构建并启动实验 VM
+    ├── README.md                ← ★ 实验环境唯一入口文档
+    ├── vm/                      ← 构建与启动
+    │   ├── build-kernel.sh          ← 内核编译
+    │   ├── build-rootfs-ubuntu.sh   ← Ubuntu rootfs（推荐）
+    │   ├── build-rootfs-allinone.sh ← busybox + 宿主工具
+    │   ├── build-rootfs-minimal.sh  ← 最小 busybox initramfs
+    │   ├── boot-vm.sh               ← VM 启动（默认启用 KVM）
+    │   └── setup-vfio-vm.sh         ← VFIO 设备直通 VM
+    ├── trace/                   ← 宿主侧观测 (trace-vmexit.sh, kvm-overview.sh 等)
+    ├── images/                  ← 构建产物（已 gitignore）
+    ├── shared/                  ← 9p 共享暂存区 → guest /mnt/shared
+    └── archive/                 ← 已弃用脚本与历史文档
 ```
 
-## 统一测试环境
-
-> ★ 推荐使用统一的测试环境构建和启动脚本
+## 实验 VM 环境
 
 ### 快速开始
 
 ```bash
-cd scripts/testing
+cd scripts/vm
 
 # 1. 编译内核（如果还没有）
 ./build-kernel.sh
@@ -154,21 +156,21 @@ cd scripts/testing
 # 2. 构建 Ubuntu rootfs（推荐，包含所有测试工具）
 sudo ./build-rootfs-ubuntu.sh
 
-# 3. 启动 VM（统一启动脚本）
-./boot-vm-unified.sh ubuntu --memory 4G --cpus 4 --queues 4
+# 3. 启动 VM
+./boot-vm.sh ubuntu --memory 4G --cpus 4 --queues 4
 ```
 
 ### 特性
 
+- ✅ **默认启用 KVM**：`-enable-kvm -cpu host`，宿主侧 `kvm:*` tracepoint 才有事件、guest 内才能看到 VMX
 - ✅ **统一构建**：所有实验使用同一个基础镜像
 - ✅ **预装工具**：iperf3, ethtool, perf, bpftrace, stress-ng 等
-- ✅ **灵活配置**：支持内存、CPU、队列数、网络类型等配置
-- ✅ **快捷命令**：run-network-test, run-stress-test, tune-virtio
+- ✅ **灵活配置**：内存、CPU、队列数、网络类型均可调，`--tcg` 可回退纯软件模拟
+- ✅ **9p 共享**：`scripts/shared/` 直通 guest `/mnt/shared`，改完立即生效
 
 ### 详细文档
 
-- [统一测试环境使用指南](scripts/testing/README-UNIFIED.md)
-- [迁移指南](scripts/testing/MIGRATION-GUIDE.md)
+- [实验 VM 环境指南](scripts/README.md)
 
 ## 学习方法论
 

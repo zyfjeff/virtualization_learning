@@ -798,7 +798,7 @@ cd /root/code/kvm-study/phase0-kvm-framework/practice/
 cat README.md
 
 # 启动 VM（所有练习都需要，前台运行，建议单独开一个终端）
-cd /root/code/kvm-study/scripts/testing && ./boot-vm-unified.sh ubuntu --memory 4G --cpus 4
+cd /root/code/kvm-study/scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
 
 # Phase 0 的练习为手工步骤形式（无封装脚本），按 practice/README.md 的
 # 「练习详情」依次执行 ftrace / perf / QEMU trace 命令
@@ -821,9 +821,9 @@ cd /root/code/kvm-study/scripts/testing && ./boot-vm-unified.sh ubuntu --memory 
 
 所有练习使用统一的 VM 启动脚本：
 
-- **构建脚本**: `scripts/testing/build-kernel.sh` + `scripts/testing/build-rootfs-ubuntu.sh`
-- **启动脚本**: `scripts/testing/boot-vm-unified.sh`（前台运行 QEMU）
-- **详细说明**: 参见 `scripts/testing/README-UNIFIED.md` 与 `practice/README.md`
+- **构建脚本**: `scripts/vm/build-kernel.sh` + `scripts/vm/build-rootfs-ubuntu.sh`
+- **启动脚本**: `scripts/vm/boot-vm.sh`（前台运行 QEMU）
+- **详细说明**: 参见 `scripts/README.md` 与 `practice/README.md`
 
 ### 快速练习（不需要脚本）
 

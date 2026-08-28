@@ -260,7 +260,7 @@ echo > /sys/kernel/debug/tracing/set_ftrace_filter
 
 ```bash
 # Phase 1 提供的 ftrace 脚本
-/root/code/kvm-study/scripts/ftrace/trace-vmexit.sh
+/root/code/kvm-study/scripts/trace/trace-vmexit.sh
 ```
 
 ### 方法四：perf 事件分析

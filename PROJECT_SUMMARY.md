@@ -147,22 +147,29 @@
 ### 快速开始
 
 ```bash
-# 一键构建测试环境
-cd scripts/testing
-./setup.sh
+cd scripts/vm
 
-# 启动虚拟机
-./boot-vm.sh
+# 1. 编译内核
+./build-kernel.sh
+
+# 2. 构建 rootfs
+sudo ./build-rootfs-ubuntu.sh
+
+# 3. 启动虚拟机（默认启用 KVM）
+./boot-vm.sh ubuntu
 ```
 
 ### 测试脚本
 
 | 脚本 | 功能 | 状态 |
 |------|------|------|
-| `setup.sh` | 一键设置（依赖安装 + 编译） | ✅ 可用 |
 | `build-kernel.sh` | 编译最小 Linux 内核 | ✅ 可用 |
-| `build-rootfs.sh` | 构建 rootfs | ✅ 可用 |
-| `boot-vm.sh` | 启动虚拟机 | ✅ 可用 |
+| `build-rootfs-ubuntu.sh` | 构建 Ubuntu rootfs（推荐） | ✅ 可用 |
+| `build-rootfs-minimal.sh` | 构建最小 busybox initramfs | ✅ 可用 |
+| `boot-vm.sh` | 启动虚拟机（`-enable-kvm -cpu host`） | ✅ 可用 |
+| `setup-vfio-vm.sh` | 启动带 VFIO 直通的虚拟机 | ✅ 可用 |
+
+详见 [scripts/README.md](scripts/README.md)。
 
 ### 示例项目
 
