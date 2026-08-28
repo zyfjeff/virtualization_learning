@@ -11,6 +11,14 @@ modules.order
 Module.symvers
 .*.cmd
 
+# practice 练习程序（无扩展名 ELF，由各目录 Makefile 重建）
+phase1-vtx-basics/practice/ex1-vmx-verify
+phase1-vtx-basics/practice/ex2-cpuid-fault
+phase1-vtx-basics/practice/ex3-msr-test
+phase1-vtx-basics/practice/ex5-vmexit-overhead
+phase2-mem-virt/practice/ept_violation_demo
+phase2-mem-virt/practice/memtype_analysis
+
 # 临时文件
 *.swp
 *.swo
