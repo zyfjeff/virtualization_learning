@@ -149,6 +149,10 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 
 于是桥被拉进组，`03:00.0` 与 `02:00.0` 同处 group 101。
 
+> 组划分的完整规则 —— `pci_device_group()` 的四步判定、`pci_acs_enabled()` 按 PCIe 类型的三类处理、
+> 以及「一个 switch 下 32 个下游端口各自独占一组」的实测拓扑 —— 见
+> [README.md 1.4 IOMMU 组是怎么划出来的](README.md#14-iommu-组是怎么划出来的)。
+
 ---
 
 ## 勘误 3：`/sys/kernel/iommu_groups/N/type` 观测不到 VFIO 接管

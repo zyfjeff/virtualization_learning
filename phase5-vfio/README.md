@@ -26,7 +26,7 @@ IOMMU 保证隔离性。
 
 | 文件 | 内容 |
 |------|------|
-| `README.md` | 本文件：VFIO 架构全景 + DMA 映射路径 + KVM-VFIO 桥接 + 常见陷阱 |
+| `README.md` | 本文件：VFIO 架构全景 + IOMMU 组划分规则 + DMA 映射路径 + KVM-VFIO 桥接 + 常见陷阱 |
 | `annotations.md` | 源码精读：VFIO 分层实现、container/group/device、Type1 IOMMU 后端 |
 | `corrections.md` | ★ 勘误：DMA ownership 认领时机、ACS 认知误区、sysfs 观测盲区、IRTE Posted 化的真实触发路径（均有实测印证） |
 | `practice/` | ★ 3 个实验程序：ownership 认领时机追踪 / IOVA→HPA 映射验证 / MSI-X 中断直通与 IRTE Posted 化 |
@@ -135,6 +135,190 @@ IOMMU 保证隔离性。
 | **IOMMU 组** | IOMMU 拓扑中不可分割的设备集合 |
 | **DMA 映射** | 将 Guest 物理地址映射到设备可见的 IOVA |
 | **MSI-X** | 设备的中断机制，通过 MSIX 表配置 |
+
+### 1.4 IOMMU 组是怎么划出来的
+
+**组不是 VFIO 划的。** 划分发生在设备 probe 阶段的 IOMMU core 里，VFIO 只是消费既成结果 ——
+启动时读 `/sys/kernel/iommu_groups/`，无法改变分组。
+
+```c
+/* 来源: drivers/iommu/iommu.c:427 —— __iommu_probe_device() */
+	group = ops->device_group(dev);
+```
+
+Intel IOMMU 的回调按总线类型分流：
+
+```c
+/* 来源: drivers/iommu/intel/iommu.c:4085 */
+static struct iommu_group *intel_iommu_device_group(struct device *dev)
+{
+	if (dev_is_pci(dev))
+		return pci_device_group(dev);
+	return generic_device_group(dev);
+}
+```
+
+> **判据不是拓扑位置，而是硬件能否保证 peer-to-peer DMA 隔离。**
+> 常见误解是「同一个 switch 下的设备属于一个组」—— 这只在 switch 下游端口缺 ACS 时才成立。
+> ACS 齐备时，同一个 switch 下每个设备各自独占一个组（下文有实测）。
+
+#### 1.4.1 `pci_device_group()` 的四步判定
+
+`drivers/iommu/iommu.c:1515-1576`，按序尝试，任一步撞到既有组就复用，全落空才新建：
+
+| 步 | 行号 | 做什么 |
+|---|---|---|
+| 1 | `:1532` | `pci_for_each_dma_alias()` 沿 DMA alias 向上找，途中遇到已有组就用它 |
+| 2 | `:1543-1555` | **核心**：向上走 PCI 层级，直到 ACS 能保证隔离 |
+| 3 | `:1561` | 查 DMA alias 关系的既有组（quirk 声明的 requester ID 伪装） |
+| 4 | `:1570` | 查同 slot 上未隔离的其他 function |
+| — | `:1575` | 都没有 → `iommu_group_alloc()` 独占一组 |
+
+第 2 步是决定性的：
+
+```c
+/* 来源: drivers/iommu/iommu.c:1543 —— pci_device_group() */
+for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
+	if (!bus->self)
+		continue;
+
+	if (pci_acs_path_enabled(bus->self, NULL, REQ_ACS_FLAGS))
+		break;                 /* 隔离成立 → 就此收手 */
+
+	pdev = bus->self;          /* 不成立 → 把这个桥拉进同一组 */
+
+	group = iommu_group_get(&pdev->dev);
+	if (group)
+		return group;
+}
+```
+
+注意 `pci_acs_path_enabled(bus->self, NULL, ...)` 检查的是**整条路径**
+（`drivers/pci/pci.c:3693`，任一跳不满足即返回 false），所以第一轮迭代就把
+「设备的父桥一直到 root bus」全查了。全通过 → 立即 `break`，`pdev` 仍是设备本身
+→ 走到 `:1575` 独占一组。
+
+要求的四个 flag：
+
+```c
+/* 来源: drivers/iommu/iommu.c:1383 */
+#define REQ_ACS_FLAGS   (PCI_ACS_SV | PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_UF)
+```
+
+即 Source Validation、Request Redirect、Completer Redirect、Upstream Forwarding。
+**不含** `TransBlk` / `EgressCtrl` / `DirectTrans` —— 所以 `lspci` 里看到 `TransBlk-`
+不影响判定，不要误以为隔离不成立。
+
+#### 1.4.2 关键坑：`pci_acs_enabled()` 查的是「有效能力」不是「实际能力」
+
+`drivers/pci/pci.c:3620` 对不同 PCIe 类型有三类完全不同的处理：
+
+| 设备类型 | 行号 | 行为 |
+|---|---|---|
+| Downstream Port / Root Port | `:3657-3659` | **必须真的置了 flag**，读配置空间校验 |
+| 单功能 Endpoint / Upstream Port / Leg End / RC End | `:3667-3672` → `:3681` | **没有 ACS capability 也返回 true** |
+| PCIe-to-PCI 桥、PCI 桥、RC-EC | `:3642-3651` | 无条件 `return false` |
+| 非 PCIe（传统 PCI / PCI-X） | `:3633` | `return false` |
+
+第二类的理由写在注释里：
+
+> most single function endpoints are not required to support ACS because they have no
+> opportunity for peer-to-peer access. We therefore return 'true' regardless of whether
+> the device exposes an ACS capability.
+>
+> —— `drivers/pci/pci.c:3612-3618`
+
+所以 `lspci` 里某一跳**完全没有** ACS capability，并不等于隔离不成立 —— 要先看它的 PCIe 类型。
+
+#### 1.4.3 实测：一个 switch，30+ 个组
+
+宿主上 `48:00.0`（Upstream Port）带 32 个 Downstream Port `49:00.0`–`49:1f.0`，
+构成一个完整的 PCIe switch。实际划分结果：
+
+| 设备 | 角色 | group |
+|---|---|---|
+| `48:00.0` | switch 上游端口 | 1 |
+| `49:00.0` … `49:1f.0` | 32 个下游端口 | **2 … 33，各自一组** |
+| `4a:00.0` | 端点（挂 `49:00.0`） | 34 |
+| `4b:00.0` | 端点（挂 `49:01.0`） | 35 |
+| `5b:00.0` | 端点（挂 `49:11.0`） | 36 |
+| `69:00.0` | 端点（挂 `49:1f.0`） | 37 |
+
+同一个 switch 下拆出了 30 多个独立组。以 `4b:00.0` 为例逐跳验证：
+
+| BDF | PCIe 类型 | ACS 实际情况 | `pci_acs_enabled()` |
+|---|---|---|---|
+| `49:01.0` | Downstream Port | `ACSCtl: SrcValid+ ReqRedir+ CmpltRedir+ UpstreamFwd+` 四个全置 | true（走 `pci.c:3659`） |
+| `48:00.0` | Upstream Port | **完全没有 ACS capability** | true（单功能，走 `pci.c:3681`） |
+| `47:00.0` | Root Port | `ACSCtl` 四个全置 | true（走 `pci.c:3659`） |
+
+三跳全通 → `pci_acs_path_enabled()` = true → 循环第一轮就 `break` → 独占 group 35。
+
+复现命令：
+
+```bash
+# 列出所有多设备组，一眼看出哪些设备无法单独直通
+cd /sys/kernel/iommu_groups
+for g in $(ls -v); do
+    n=$(ls $g/devices | wc -l)
+    [ "$n" -gt 1 ] && echo "group $g ($n): $(ls $g/devices | tr '\n' ' ')"
+done
+
+# 沿上游链路逐跳看 PCIe 类型与 ACS
+lspci -vvv -s 49:01.0 | grep -A2 "Access Control Services"
+```
+
+#### 1.4.4 三种真正会并组的情形
+
+**① 上游有 PCIe-to-PCI 桥** —— 同机 group 101 = `02:00.0` + `03:00.0`：
+
+```
+02:00.0 PCI bridge: ASPEED AST1150 PCI-to-PCI Bridge
+        Capabilities: [80] Express (v2) PCI-Express to PCI/PCI-X Bridge
+```
+
+命中 `PCI_EXP_TYPE_PCIE_BRIDGE` → `pci.c:3642` 无条件 false → 桥被 `iommu.c:1550` 拉进组。
+
+**② 多功能设备各 function 之间无 ACS** —— 同机 group 96 = `00:16.0/.1/.4`
+（Intel MEI Controller，ACS capability 数量为 0），由第 4 步归并：
+
+```c
+/* 来源: drivers/iommu/iommu.c:1397 —— get_pci_function_alias_group() */
+	if (!pdev->multifunction || pci_acs_enabled(pdev, REQ_ACS_FLAGS))
+		return NULL;
+
+	for_each_pci_dev(tmp) {
+		if (tmp == pdev || tmp->bus != pdev->bus ||
+		    PCI_SLOT(tmp->devfn) != PCI_SLOT(pdev->devfn) ||
+		    pci_acs_enabled(tmp, REQ_ACS_FLAGS))
+			continue;
+```
+
+条件是**同 bus 同 slot**、且双方都没有 ACS。同机 group 105–114、168–177 的
+「8 个 function 一组」都走这条路径。
+
+**③ DMA alias** —— 设备用别的 requester ID 发起 DMA（桥后的传统设备、或 quirk 中声明的），
+`pci_for_each_dma_alias()` 会把 alias 双方绑到一起（`iommu.c:1532` / `:1561`）。
+
+#### 1.4.5 这对 VFIO 意味着什么
+
+组是**所有权的最小单位**。`VFIO_GROUP_SET_CONTAINER` 会调 `iommu_group_claim_dma_owner()`，
+组内只要还有设备绑在普通驱动上就直接拒绝：
+
+```c
+/* 来源: drivers/iommu/iommu.c:3214 —— iommu_group_claim_dma_owner() */
+	if (group->owner_cnt) {
+		ret = -EPERM;
+		goto unlock_out;
+	}
+```
+
+失败点是 `SET_CONTAINER` 而**不是** bind —— `vfio-pci` 声明了 `.driver_managed_dma = true`，
+绑定阶段刻意不动 `owner_cnt`，所以绑定一定成功。详见
+[corrections.md](corrections.md) 勘误 1（含 kprobe 实测的完整接管时序）。
+
+ACS 是硬件能力，**没有内核参数能把它「打开」**；硬件不支持时唯一正规解法是整组一起直通。
+详见 [陷阱2](#陷阱2acs未启用) 与 [corrections.md](corrections.md) 勘误 2。
 
 ---
 
@@ -431,6 +615,11 @@ Guest 侧中断计数 +629，而宿主 `/proc/interrupts` 上对应的三个 IRQ
 
 | 函数名 | 文件 | 作用 |
 |--------|------|------|
+| `pci_device_group()` | `drivers/iommu/iommu.c:1515` | PCI 设备的组划分主逻辑，四步判定 |
+| `pci_acs_path_enabled()` | `drivers/pci/pci.c:3693` | 检查整条上游路径的 ACS，任一跳不满足即 false |
+| `pci_acs_enabled()` | `drivers/pci/pci.c:3620` | 单设备 ACS 判定，按 PCIe 类型分三类处理 |
+| `get_pci_function_alias_group()` | `drivers/iommu/iommu.c:1391` | 归并同 slot 上未隔离的多功能 function |
+| `iommu_group_claim_dma_owner()` | `drivers/iommu/iommu.c:3214` | 认领组的 DMA ownership，组内有普通驱动则 `-EPERM`（判断在 `:3222`） |
 | `vfio_file_iommu_group()` | `vfio_main.c` | 获取文件的 IOMMU 组 |
 | `vfio_dma_do_map()` | `vfio_iommu_type1.c` | DMA 映射操作 |
 | `vfio_pin_pages_remote()` | `vfio_iommu_type1.c` | 固定用户页面 |
@@ -514,6 +703,10 @@ dmesg | grep -E "iommu|DMAR|AMD-Vi"
 # 查看 DMAR 表
 cat /sys/firmware/acpi/tables/DMAR 2>/dev/null | hexdump -C | head
 ```
+
+> 拿到本机的分组结果后，对照 [1.4 IOMMU 组是怎么划出来的](#14-iommu-组是怎么划出来的)
+> 逐条推导：哪些组是因为 PCIe-to-PCI 桥而并的，哪些是同 slot 多功能设备，
+> 哪些设备独占一组、以及它上游每一跳的 ACS 状况。
 
 ### 练习 4：性能测试
 
@@ -758,6 +951,9 @@ lspci -vvv -s 49:01.0 | grep -A2 "Access Control Services"
 
 > 单功能设备"没有 ACS 能力"反而算隔离成立，这一点极易误判，
 > 详见 [corrections.md](corrections.md) 勘误 2。
+>
+> 完整的划分规则（四步判定、`pci_acs_enabled()` 的三类处理、一个 switch 拆出 30+ 组的实测）
+> 见 [1.4 IOMMU 组是怎么划出来的](#14-iommu-组是怎么划出来的)。
 
 ### 陷阱3：DMA一致性未处理
 

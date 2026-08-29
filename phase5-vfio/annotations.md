@@ -117,10 +117,18 @@ struct vfio_device_ops {
  *
  * VFIO_CHECK_EXTENSION:
  *   检查是否支持特定扩展
- *   - VFIO_TYPE1_IOMMU: Type 1 IOMMU 支持
- *   - VFIO_TYPE1v2_IOMMU: Type 1 v2（支持页面固定通知）
- *   - VFIO_SPAPR_TCE_IOMMU: SPAPR TCE（PowerPC）
- *   - VFIO_VIRQ_CHAIN: 虚拟中断链
+ *   - VFIO_TYPE1_IOMMU (1): 基础 Type 1 IOMMU（Intel VT-d / AMD-Vi）
+ *   - VFIO_TYPE1v2_IOMMU (3): Type 1 v2，支持安全的 pin/unpin 操作和 DMA unmap 通知
+ *   - VFIO_SPAPR_TCE_IOMMU (2): PowerPC TCE 表支持
+ *   - VFIO_SPAPR_TCE_v2_IOMMU (7): PowerPC TCE v2
+ *   - VFIO_DMA_CC_IOMMU (4): IOMMU 强制 DMA 缓存一致性
+ *   - VFIO_EEH (5): EEH 错误处理（PowerPC 平台）
+ *   - VFIO_TYPE1_NESTING_IOMMU (6): 嵌套 IOMMU 支持（隐含 v2 特性）
+ *   - VFIO_NOIOMMU_IOMMU (8): No-IOMMU 模式（仅用于调试）
+ *   - VFIO_UNMAP_ALL (9): 支持批量解除所有映射
+ *   - VFIO_UPDATE_VADDR (10): 支持更新虚拟地址
+ *
+ *   注: 以上数值为扩展 ID，用于 VFIO_CHECK_EXTENSION ioctl 参数
  *
  * VFIO_SET_IOMMU:
  *   设置容器的 IOMMU 驱动
