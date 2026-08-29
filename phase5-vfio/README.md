@@ -217,7 +217,8 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 |---|---|---|
 | **0. 设备专属 quirk** | `:3624-3626` | 命中就直接定论，**下面几行全部不执行** |
 | 1. Downstream Port / Root Port | `:3657-3659` | 读配置空间校验，但**要求集先被 ACSCap 掩掉**（见下） |
-| 2. 单功能 Endpoint / Upstream Port / Leg End / RC End | `:3667-3672` → `:3681` | **没有 ACS capability 也返回 true** |
+| 2. 单功能 Endpoint / Upstream Port / Leg End / RC End | `:3667-3670` → `:3671` `break` → `:3681` | **没有 ACS capability 也返回 true** |
+| 2'. 同上，但多功能 | `:3674` | 改读设备**自己的** ACS 标志位，没有 capability 即 false |
 | 3. PCIe-to-PCI 桥、PCI 桥、RC-EC | `:3642-3651` | 无条件 `return false` |
 | 4. 非 PCIe（传统 PCI / PCI-X） | `:3633` | `return false` |
 
@@ -229,7 +230,19 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 >
 > —— `drivers/pci/pci.c:3612-3618`
 
-所以 `lspci` 里某一跳**完全没有** ACS capability，并不等于隔离不成立 —— 要先看它的 PCIe 类型。
+所以 `lspci` 里某一跳**完全没有** ACS capability，并不等于隔离不成立。但要看准是哪个条件在起作用：
+**决定「跳到 `:3681` 返回 true」的是 header type 的 multifunction 位**（`:3671`，
+由 `drivers/pci/probe.c:1940` 从配置空间 `0x0e` bit7 读出），**PCIe 类型决定的是另一件事**
+—— 这一支到底读不读设备自己的 ACS 位。桥类即使在单功能下也照样 false，因为
+`:3649-3651` 在读 `multifunction` 之前就 return 了。所以不能简写成「单功能 ⇒ true」。
+
+第 2' 类为什么要读设备自己的位？因为**多功能设备内部的 func↔func 通路在 PCI 拓扑上是隐形的**
+—— 内核从 bus/slot 根本看不见第二个口，只能靠设备在配置空间自己声明
+（`PCI_ACS_DT`，"Direct Translated P2P"，`include/uapi/linux/pci_regs.h:997`）。
+这正是 [1.4.4 ②](#144-三种真正会并组的情形) 归并同 slot function 的前提。
+而单功能设备没有第二个口，问它 ACS 问不出任何信息 —— 它的横向转发决策点在上游的
+Downstream Port，那里由 `:3657-3659` 单独查。`return true` 的含义是**「本跳不提供信息」**，
+不是「本跳没有风险」；隔离性由 `pci_acs_path_enabled()`（`:3693`）逐跳问上去共同保证。
 
 第 1 类也不是「四个 flag 必须全在 `ACSCtl` 里置位」那么简单。校验前先按设备**声明**的
 `ACSCap` 做一次掩码：
