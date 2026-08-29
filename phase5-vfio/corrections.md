@@ -5,6 +5,7 @@
 >
 > 勘误 1~3 在纯宿主侧复现；勘误 4 需要真起一个带该设备直通的 VM
 > （`scripts/vm/setup-vfio-vm.sh`），因为 IRTE 的 Posted 化只有 KVM 能触发。
+> 勘误 5 纠正的是本仓文档自身的引用错误（README 1.4），纯宿主侧可复现。
 
 ---
 
@@ -141,13 +142,15 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 反例 `03:00.0`：其父桥 `02:00.0` 的能力是 `[80] Express (v2) PCI-Express to PCI/PCI-X Bridge`，命中硬编码分支：
 
 ```c
-/* 来源: drivers/pci/pci.c:3642 */
-	case PCI_EXP_TYPE_PCIE_BRIDGE:
+/* 来源: drivers/pci/pci.c:3649 */
+	case PCI_EXP_TYPE_PCI_BRIDGE:
 	...
 		return false;
 ```
 
-于是桥被拉进组，`03:00.0` 与 `02:00.0` 同处 group 101。
+于是 `03:00.0` 与 `02:00.0` 同处 group 101。注意常量名是 `PCI_EXP_TYPE_PCI_BRIDGE`（0x7），
+不是 `PCI_EXP_TYPE_PCIE_BRIDGE`（0x8）；且本机实际的并组路径是第 1 步 DMA alias 而非这里的
+ACS 判定 —— 详见 [勘误 5](#勘误-5readme-14-里两处引用错误与一处过度简化)。
 
 > 组划分的完整规则 —— `pci_device_group()` 的四步判定、`pci_acs_enabled()` 按 PCIe 类型的三类处理、
 > 以及「一个 switch 下 32 个下游端口各自独占一组」的实测拓扑 —— 见
@@ -361,6 +364,101 @@ Posted 联合体里叫 `p_pst`（`dmar.h:240`）。位置、语义与规范一�
 本次实测宿主未开 `CONFIG_X86_POSTED_MSI`，所以 alloc 阶段拿到的是纯 Remapped IRTE
 （`pst=0`，向量为占位的 `MANAGED_IRQ_SHUTDOWN_VECTOR = 0xef`），
 Posted 位完全由 KVM 后续写入 —— 因果链干净可辨。
+
+---
+
+## 勘误 5：README 1.4 里两处引用错误与一处过度简化
+
+**原文**：`README.md` 1.4.2 表格、1.4.4 ①，以及本文件勘误 2 的附节反例。这三处都是本次
+补写 1.4 节时引入的新错误，写完后核查 DMA alias 机制才发现。
+
+### 错误 1：PCIe 类型常量写反了
+
+原文说 `02:00.0` 命中 `PCI_EXP_TYPE_PCIE_BRIDGE`（`pci.c:3642`）。**这两个常量的名字与含义正好相反**：
+
+```c
+/* 来源: include/uapi/linux/pci_regs.h:482 */
+#define   PCI_EXP_TYPE_PCI_BRIDGE  0x7	/* PCIe to PCI/PCI-X Bridge */
+#define   PCI_EXP_TYPE_PCIE_BRIDGE 0x8	/* PCI/PCI-X to PCIe Bridge */
+```
+
+`lspci` 印的 "PCI-Express to PCI/PCI-X Bridge" 是 **0x7 = `PCI_EXP_TYPE_PCI_BRIDGE`**，
+对应 `pci.c:3649`，不是 0x8 / `:3642`。实测读配置空间确认：
+
+```bash
+$ setpci -s 02:00.0 0x82.w     # PCIe Cap @0x80，+2 = PCI_EXP_FLAGS
+0072                           # bits 7:4 = 0x7
+```
+
+两个分支都落到同一个 `return false`（`pci.c:3651`），所以**结论没变，错的是常量名与行号**。
+
+### 错误 2：group 101 的成因说错了
+
+原文说桥被第 2 步的 ACS 循环（`iommu.c:1550`）拉进组。实际走的是**第 1 步 DMA alias**。
+
+关键在于 `pci_for_each_dma_alias()` 对纯 PCIe 的桥根本不回调：
+
+```c
+/* 来源: drivers/pci/search.c:84 */
+		case PCI_EXP_TYPE_ROOT_PORT:
+		case PCI_EXP_TYPE_UPSTREAM:
+		case PCI_EXP_TYPE_DOWNSTREAM:
+			continue;
+		case PCI_EXP_TYPE_PCI_BRIDGE:
+			ret = fn(tmp,
+				 PCI_DEVID(tmp->subordinate->number,
+					   PCI_DEVFN(0, 0)), data);
+```
+
+`03:00.0` 是传统 PCI 设备（`lspci -vvv` 里 Express capability 数量为 0），
+其父桥 `02:00.0` 是 `PCI_EXP_TYPE_PCI_BRIDGE`、`subordinate` = bus 03，命中 `search.c:88`
+这一支，真的回调了 `get_pci_alias_or_group()`：
+
+```c
+/* 来源: drivers/iommu/iommu.c:1470 */
+	data->pdev = pdev;
+	data->group = iommu_group_get(&pdev->dev);
+	return data->group != NULL;
+```
+
+它只看 `pdev`（=桥）有没有组，不看 `alias` 值。`02:00.0` 先被 probe 且已独占 group 101，
+所以返回非 0 → `pci_device_group()` 在 `iommu.c:1533` 就 `return data.group`，
+**ACS 循环一行都没执行**。
+
+> 桥的 `pci_acs_enabled()` 也确实是无条件 false，若 probe 顺序反过来，第 2 步同样会并组 ——
+> 两条路结果一致，但把实际路径写成第 2 步是错的。
+
+顺带解释了 `02:00.0` 自己为什么独占 group 101 而不是并入其上游 root port `00:1c.4` 所在的
+group 99：`02:00.0` 自身的别名枚举只遇到 root port（`search.c:84` → `continue`，不回调），
+第 2 步 `pci_acs_path_enabled(00:1c.4, ...)` 又返回 true，于是新建一组。
+
+### 错误 3（过度简化）：Root Port / Downstream Port 并非「flag 必须真的置位」
+
+原文 1.4.2 表格写「必须真的置了 flag，读配置空间校验」。实际校验前有一次按设备**声明**的
+`ACSCap` 做的掩码：
+
+```c
+/* 来源: drivers/pci/pci.c:3597 —— pci_acs_flags_enabled() */
+	pci_read_config_word(pdev, pos + PCI_ACS_CAP, &cap);
+	acs_flags &= (cap | PCI_ACS_EC);
+```
+
+**没声明的能力被视为「硬连线已启用」直接跳过检查。** 所以 `ACSCap` 里的 `-` 不算失败，
+只有「Cap 里声明了、Ctl 里没开」才算。实测 `00:1c.4`：
+
+```
+ACSCap: SrcValid+ TransBlk+ ReqRedir+ CmpltRedir+ UpstreamFwd- ...
+ACSCtl: SrcValid+ TransBlk- ReqRedir+ CmpltRedir+ UpstreamFwd- ...
+```
+
+`UpstreamFwd` 在 Cap 里是 `-`，被 `:3598` 从 `REQ_ACS_FLAGS` 里掩掉；`TransBlk` 不在
+`REQ_ACS_FLAGS` 内（`iommu.c:1383`），Ctl 里没开也无所谓。剩下 `SrcValid` / `ReqRedir` /
+`CmpltRedir` 三个 Cap、Ctl 都置位 → 返回 true。这正是 `02:00.0` 没并进 group 99 的原因。
+
+**修正**：README 1.4.2 表格该行改为「读配置空间校验，但要求集先被 ACSCap 掩掉」，并补出
+`:3597-3598` 的掩码代码与 `00:1c.4` 的实测；1.4.4 ① 改为按 DMA alias 叙述并给出正确常量；
+1.4.4 ③ 补齐 DMA alias 的四个来源。本文件勘误 2 附节的反例代码块同步改为 `pci.c:3649` /
+`PCI_EXP_TYPE_PCI_BRIDGE`。
 
 ---
 

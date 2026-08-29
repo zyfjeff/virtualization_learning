@@ -215,7 +215,7 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 
 | 设备类型 | 行号 | 行为 |
 |---|---|---|
-| Downstream Port / Root Port | `:3657-3659` | **必须真的置了 flag**，读配置空间校验 |
+| Downstream Port / Root Port | `:3657-3659` | 读配置空间校验，但**要求集先被 ACSCap 掩掉**（见下） |
 | 单功能 Endpoint / Upstream Port / Leg End / RC End | `:3667-3672` → `:3681` | **没有 ACS capability 也返回 true** |
 | PCIe-to-PCI 桥、PCI 桥、RC-EC | `:3642-3651` | 无条件 `return false` |
 | 非 PCIe（传统 PCI / PCI-X） | `:3633` | `return false` |
@@ -229,6 +229,27 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 > —— `drivers/pci/pci.c:3612-3618`
 
 所以 `lspci` 里某一跳**完全没有** ACS capability，并不等于隔离不成立 —— 要先看它的 PCIe 类型。
+
+第一类也不是「四个 flag 必须全在 `ACSCtl` 里置位」那么简单。校验前先按设备**声明**的
+`ACSCap` 做一次掩码：
+
+```c
+/* 来源: drivers/pci/pci.c:3597 —— pci_acs_flags_enabled() */
+	pci_read_config_word(pdev, pos + PCI_ACS_CAP, &cap);
+	acs_flags &= (cap | PCI_ACS_EC);
+```
+
+**没声明的能力被当作「硬连线已启用」直接跳过检查** ——「`ACSCap` 里是 `-`」不算失败，
+只有「`ACSCap` 里有、`ACSCtl` 里没开」才算。宿主上 `00:1c.4` 就是这样通过的：
+
+```
+ACSCap: SrcValid+ TransBlk+ ReqRedir+ CmpltRedir+ UpstreamFwd- ...
+ACSCtl: SrcValid+ TransBlk- ReqRedir+ CmpltRedir+ UpstreamFwd- ...
+```
+
+`UpstreamFwd` 在 Cap 里就是 `-`，被 `:3598` 从 `REQ_ACS_FLAGS` 里掩掉，剩下三个
+Cap/Ctl 都置位 → 返回 true。这也解释了为什么它下游的 `02:00.0` 没有并进 `00:1c.4`
+所在的 group 99。
 
 #### 1.4.3 实测：一个 switch，30+ 个组
 
@@ -275,9 +296,41 @@ lspci -vvv -s 49:01.0 | grep -A2 "Access Control Services"
 ```
 02:00.0 PCI bridge: ASPEED AST1150 PCI-to-PCI Bridge
         Capabilities: [80] Express (v2) PCI-Express to PCI/PCI-X Bridge
+03:00.0 VGA compatible controller: ASPEED Graphics Family
+        # 无任何 Express capability —— 传统 PCI 设备
 ```
 
-命中 `PCI_EXP_TYPE_PCIE_BRIDGE` → `pci.c:3642` 无条件 false → 桥被 `iommu.c:1550` 拉进组。
+`lspci` 印出的 "PCI-Express to PCI/PCI-X Bridge" 对应的常量是
+**`PCI_EXP_TYPE_PCI_BRIDGE`（0x7）**，不是名字更像的 `PCI_EXP_TYPE_PCIE_BRIDGE`（0x8）；
+后者是反方向的 "PCI/PCI-X to PCIe Bridge"（`include/uapi/linux/pci_regs.h:482-483`）。
+实测确认：
+
+```bash
+setpci -s 02:00.0 0x82.w      # PCIe Cap @0x80 + 2 = PCI_EXP_FLAGS
+# 0072  → bits 7:4 = 0x7 = PCI_EXP_TYPE_PCI_BRIDGE
+```
+
+并组发生在**第 1 步 DMA alias**，不是第 2 步的 ACS 循环。`03:00.0` 是传统 PCI 设备，
+自身没有 PCIe requester ID，桥代它发 TLP，所以别名枚举在桥这一跳会真的回调：
+
+```c
+/* 来源: drivers/pci/search.c:84 —— pci_for_each_dma_alias() */
+		case PCI_EXP_TYPE_ROOT_PORT:
+		case PCI_EXP_TYPE_UPSTREAM:
+		case PCI_EXP_TYPE_DOWNSTREAM:
+			continue;                    /* 纯 PCIe 路径：跳过，不回调 */
+		case PCI_EXP_TYPE_PCI_BRIDGE:
+			ret = fn(tmp,
+				 PCI_DEVID(tmp->subordinate->number,
+					   PCI_DEVFN(0, 0)), data);
+```
+
+`02:00.0` 的 `subordinate` 就是 bus 03，且它先于 `03:00.0` 被 probe、已经独占了 group 101。
+回调 `get_pci_alias_or_group()`（`iommu.c:1470`）只看 `tmp` 有没有组，一看有 → 返回非 0
+→ `pci_device_group()` 在 `iommu.c:1533` 直接 `return data.group`，**ACS 循环根本没执行到**。
+
+> 桥的 `pci_acs_enabled()` 确实也是无条件 false（`pci.c:3649-3651`），若 probe 顺序反过来，
+> 第 2 步同样会把它拉进组 —— 两条路殊途同归，但本机实际走的是第 1 步。
 
 **② 多功能设备各 function 之间无 ACS** —— 同机 group 96 = `00:16.0/.1/.4`
 （Intel MEI Controller，ACS capability 数量为 0），由第 4 步归并：
@@ -297,8 +350,32 @@ lspci -vvv -s 49:01.0 | grep -A2 "Access Control Services"
 条件是**同 bus 同 slot**、且双方都没有 ACS。同机 group 105–114、168–177 的
 「8 个 function 一组」都走这条路径。
 
-**③ DMA alias** —— 设备用别的 requester ID 发起 DMA（桥后的传统设备、或 quirk 中声明的），
-`pci_for_each_dma_alias()` 会把 alias 双方绑到一起（`iommu.c:1532` / `:1561`）。
+**③ DMA alias** —— 设备发出的 DMA 携带的 requester ID (RID) 不等于自己的 BDF。
+IOMMU 是按 RID 查上下文表的，两个设备共用同一个 RID 就无法分辨、必须同组。
+`pci_for_each_dma_alias()`（`drivers/pci/search.c:28`）枚举四个来源：
+
+| 来源 | 代码位置 | 说明 |
+|---|---|---|
+| 拓扑：桥代发 | `search.c:88` / `:95` / `:102` | 桥后的传统 PCI 设备没有 PCIe RID，桥用 `(subordinate_bus, 00.0)` 代发 —— 即情形 ① |
+| `dma_alias_mask` | `search.c:49-58` | quirk 为有 bug 的硬件声明的额外 RID，`pci_add_dma_alias()`（`pci.c:6497`）设置 |
+| `pci_real_dma_dev()` | `search.c:39` | 架构钩子，DMA 实际由另一条总线上的设备发出；x86 上只有 VMD 覆盖（`arch/x86/pci/common.c:727`），默认返回自身（`pci.c:6566`） |
+| 桥的 dev_flags | `search.c:70` / `:102` | `PCI_DEV_FLAGS_BRIDGE_XLATE_ROOT`（`quirks.c:4467`）截断向上枚举；`PCI_DEV_FLAG_PCIE_BRIDGE_ALIAS`（`quirks.c:4402`）让非 PCIe 桥也用 subordinate bus 代发 |
+
+典型 quirk：Ricoh / Marvell 的多 function 设备把 DMA 全挂到 func0 或 func1
+（`quirks.c:4269`、`:4287`）；PLX 8000 NTB 直接 `pci_add_dma_alias(pdev, 0, 256)`
+把整条 bus 的 256 个 devfn 全声明成别名（`quirks.c:6057`）。
+
+别名关系由 `pci_devs_are_dma_aliases()`（`pci.c:6523`）判定，第 3 步
+`get_pci_alias_group()`（`iommu.c:1425`）用它反查既有组。注意**别名只能来自 quirk**，
+因为组的创建早于任何驱动 probe：
+
+> IOMMU group creation is performed during device discovery or addition, prior to any
+> potential DMA mapping and therefore prior to driver probing ... DMA aliases should
+> therefore be configured via quirks, such as the PCI fixup header quirk.
+>
+> —— `drivers/pci/pci.c:6491-6495`
+
+本机没有任何别名 quirk 生效（`dmesg` 无 "DMA alias" 行），唯一的别名来源就是情形 ① 的桥。
 
 #### 1.4.5 这对 VFIO 意味着什么
 
@@ -319,6 +396,9 @@ lspci -vvv -s 49:01.0 | grep -A2 "Access Control Services"
 
 ACS 是硬件能力，**没有内核参数能把它「打开」**；硬件不支持时唯一正规解法是整组一起直通。
 详见 [陷阱2](#陷阱2acs未启用) 与 [corrections.md](corrections.md) 勘误 2。
+
+> 本节初版把 PCIe 桥的类型常量、group 101 的成因、以及 Root Port 的 ACS 校验条件都写错了，
+> 修正过程见 [corrections.md](corrections.md) 勘误 5。
 
 ---
 
