@@ -28,10 +28,10 @@ IOMMU 保证隔离性。
 |------|------|
 | `README.md` | 本文件：VFIO 架构全景 + DMA 映射路径 + KVM-VFIO 桥接 + 常见陷阱 |
 | `annotations.md` | 源码精读：VFIO 分层实现、container/group/device、Type1 IOMMU 后端 |
-| `corrections.md` | ★ 勘误：DMA ownership 认领时机、ACS 认知误区、sysfs 观测盲区（均有实测印证） |
-| `practice/` | ★ 2 个实验程序：ownership 认领时机追踪 / IOVA→HPA 映射验证 |
+| `corrections.md` | ★ 勘误：DMA ownership 认领时机、ACS 认知误区、sysfs 观测盲区、IRTE Posted 化的真实触发路径（均有实测印证） |
+| `practice/` | ★ 3 个实验程序：ownership 认领时机追踪 / IOVA→HPA 映射验证 / MSI-X 中断直通与 IRTE Posted 化 |
 
-> 陷阱1、陷阱2 的表述已按 `corrections.md` 修正过，两者冲突时以 `corrections.md` 为准。
+> 陷阱1、陷阱2、陷阱4 的表述已按 `corrections.md` 修正过，两者冲突时以 `corrections.md` 为准。
 
 ---
 
@@ -235,11 +235,13 @@ IOMMU 保证隔离性。
 │              └───────────────────────┘                            │
 │                                                                  │
 │  关键交互点:                                                      │
-│    1. QEMU 将 VFIO 组的 fd 传递给 KVM                           │
-│    2. KVM 获取 VFIO 组的引用                                     │
-│    3. 当设备使用 Posted Interrupts 时，                           │
-│       KVM 需要知道哪些 VFIO 组属于 VM                            │
-│    4. KVM 更新 IRTE 以支持 PI                                    │
+│    1. QEMU 将 VFIO 设备/组的 fd 传给 KVM (KVM_DEV_VFIO_FILE_ADD)  │
+│    2. KVM 取引用，并递增 assigned_device_count                    │
+│    3. 根据设备是否 DMA coherent，注册/注销 noncoherent DMA        │
+│                                                                  │
+│  注意: IRTE 改成 Posted 模式**不走这条路**。                      │
+│  组列表只提供 PI 的前提条件之一(assigned_device_count > 0)，       │
+│  真正的触发是 irq_bypass 的 token 配对，见 3.3 节。               │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -269,6 +271,122 @@ IOMMU 保证隔离性。
  *   与 GROUP_ADD/DEL 类似，但使用文件描述符
  */
 ```
+
+### 3.3 MSI-X 中断直通：从 Remapped 到 Posted
+
+这是 phase3（中断虚拟化）与 phase5 真正接壤的地方。要点是**职责分工**：
+
+| 阶段 | 谁做 | IRTE 状态 |
+|---|---|---|
+| `VFIO_DEVICE_SET_IRQS` 启用 MSI-X | VFIO | Remapped（`IM=0`），中断打进宿主 |
+| irqfd 注册 + token 配对 | irq_bypass | 不变 |
+| `__connect()` 回调进 KVM | KVM | 改写为 Posted（`IM=1`），硬件直投 vCPU |
+
+**VFIO 自己永远建不出 Posted IRTE** —— 它不知道 vCPU 的 PI Descriptor 在哪。
+Posted 化只能由 KVM 发起，而 KVM 要发起就必须先和 VFIO 对上。
+
+#### 接缝：eventfd 指针当 token
+
+VFIO 在装配每个向量的最后一步注册 producer：
+
+```c
+/* 来源: drivers/vfio/pci/vfio_pci_intrs.c:515 */
+	ctx->producer.token = trigger;
+	ctx->producer.irq = irq;
+	ret = irq_bypass_register_producer(&ctx->producer);
+```
+
+KVM 在建立 irqfd 时注册 consumer：
+
+```c
+/* 来源: virt/kvm/eventfd.c:444 */
+		irqfd->consumer.token = (void *)irqfd->eventfd;
+		irqfd->consumer.add_producer = kvm_arch_irq_bypass_add_producer;
+		irqfd->consumer.del_producer = kvm_arch_irq_bypass_del_producer;
+		irqfd->consumer.stop = kvm_arch_irq_bypass_stop;
+		irqfd->consumer.start = kvm_arch_irq_bypass_start;
+		ret = irq_bypass_register_consumer(&irqfd->consumer);
+```
+
+两个 `token` 都是**同一个 eventfd 上下文的指针** —— QEMU 把同一个 eventfd 分别交给
+`VFIO_DEVICE_SET_IRQS` 和 `KVM_IRQFD`，内核两侧便自动认亲。注册**无先后要求**，
+producer 和 consumer 两侧都会扫描对面的链表（`virt/lib/irqbypass.c:108` 与 `:204`）。
+
+#### 配对成功后的调用链
+
+```
+irq_bypass_register_{producer,consumer}()
+  └─ __connect()                                  virt/lib/irqbypass.c:30
+       └─ cons->add_producer()
+            = kvm_arch_irq_bypass_add_producer()   arch/x86/kvm/x86.c:13665
+                 ├─ kvm_arch_start_assignment()    :13673
+                 └─ pi_update_irte()
+                      = vmx_pi_update_irte()       arch/x86/kvm/vmx/posted_intr.c:272
+                           └─ irq_set_vcpu_affinity()
+                                = intel_ir_set_vcpu_affinity()
+                                                   drivers/iommu/intel/irq_remapping.c:1248
+                                     └─ modify_irte()   ← IRTE 落盘为 Posted
+```
+
+KVM 提供的两个关键信息就是 Posted IRTE 里 VFIO 拿不到的部分：
+
+```c
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:319 */
+		vcpu_info.pi_desc_addr = __pa(vcpu_to_pi_desc(vcpu));
+		vcpu_info.vector = irq.vector;
+```
+
+`pi_desc_addr` 变成 IRTE 的 `PDAL`/`PDAH`，`vector` 变成 `VV`（Virtual Vector）。
+
+#### 不是所有中断都会被 Posted 化
+
+`vmx_pi_update_irte()` 先查四个全局前提：
+
+```c
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:135 */
+static bool vmx_can_use_vtd_pi(struct kvm *kvm)
+{
+	return irqchip_in_kernel(kvm) && enable_apicv &&
+		kvm_arch_has_assigned_device(kvm) &&
+		irq_remapping_cap(IRQ_POSTING_CAP);
+}
+```
+
+再逐条路由表项筛，只有单目标 vCPU 的普通中断能过：
+
+```c
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:314 */
+		kvm_set_msi_irq(kvm, e, &irq);
+		if (!kvm_intr_is_single_vcpu(kvm, &irq, &vcpu) ||
+		    !kvm_irq_is_postable(&irq))
+			continue;
+```
+
+被筛掉的（多播、广播、多目标低优先级）会走 `posted_intr.c:338` 的
+`irq_set_vcpu_affinity(host_irq, NULL)` **退回 Remapped 模式**。
+所以一台机器上同一个设备的不同向量，完全可能一部分 Posted、一部分 Remapped。
+
+#### 实测：一个向量的 IRTE 前后对比
+
+在 `0000:4b:00.0` 上抓 `modify_irte` 的原始 128 位（完整过程见
+[practice/README.md](practice/README.md) 练习3）：
+
+| | `pst` (spec **IM**) | 向量 | 目标信息 |
+|---|---|---|---|
+| VFIO 建好时 | **0** = Remapped | `0x21` = 33 | `dest_id` = 宿主 APIC ID |
+| KVM 改写后 | **1** = Posted | `VV` = 33 | `PDAL=0x2e5210b` `PDAH=0x29` → PI Desc `0x29b94842c0` |
+
+`SID` 两次都是 `0x4b00`，即设备 BDF `4b:00.0`，可用来校验探针取参是否正确。
+从 KVM 注册 consumer 到 Posted IRTE 落盘实测约 53 µs。
+
+**Posted 化之后宿主彻底看不到这个中断了**：Guest 内压 80 MB 只读 I/O，
+Guest 侧中断计数 +629，而宿主 `/proc/interrupts` 上对应的三个 IRQ 计数**全程为 0** ——
+`vfio_msihandler()` 根本没被调用，也就没有 `eventfd_signal()`，更没有 VM-Exit。
+
+> ⚠️ 别把它和 `CONFIG_X86_POSTED_MSI` 搞混。后者（6.11+）是**宿主自己**的
+> posted MSI 优化，与 Guest 无关，走的是 `prepare_irte_posted()`
+> （`irq_remapping.c:1111`）+ `posted_msi_supported()` 门控。
+> 本节讲的是 KVM 的 Guest VT-d PI，走 `intel_ir_set_vcpu_affinity()`，两条路互不相干。
 
 ---
 
@@ -320,13 +438,21 @@ IOMMU 保证隔离性。
 | `vfio_pci_mmap()` | `vfio_pci_core.c` | 映射设备 MMIO |
 | `kvm_vfio_group_add()` | `virt/kvm/vfio.c` | 添加 VFIO 组到 KVM |
 | `kvm_vfio_update_coherency()` | `virt/kvm/vfio.c` | 更新 DMA 一致性 |
+| `vfio_pci_set_msi_trigger()` | `vfio_pci_intrs.c` | `SET_IRQS` 的 MSI/MSI-X 入口 |
+| `vfio_msi_set_vector_signal()` | `vfio_pci_intrs.c:447` | 单向量装配：`request_irq` + 注册 producer |
+| `vfio_msihandler()` | `vfio_pci_intrs.c:373` | 宿主中断处理，仅 Remapped 模式下执行 |
+| `irq_bypass_register_producer()` | `virt/lib/irqbypass.c:84` | VFIO 侧注册，按 token 找 consumer |
+| `irq_bypass_register_consumer()` | `virt/lib/irqbypass.c:179` | KVM 侧注册，按 token 找 producer |
+| `kvm_arch_irq_bypass_add_producer()` | `arch/x86/kvm/x86.c:13665` | 配对成功回调，转发到 PI 更新 |
+| `vmx_pi_update_irte()` | `vmx/posted_intr.c:272` | 判定可否 Posted，取 PI Desc 地址 |
+| `intel_ir_set_vcpu_affinity()` | `intel/irq_remapping.c:1248` | 把 IRTE 实际改写为 Posted 格式 |
 
 ---
 
 ## 🔬 实践练习
 
-> 下面是手工验证步骤。带实测输出的可运行实验（ownership 认领时机、IOVA→HPA 映射验证）
-> 见 [practice/README.md](practice/README.md)。
+> 下面是手工验证步骤。带实测输出的可运行实验（ownership 认领时机、IOVA→HPA 映射验证、
+> MSI-X 中断直通与 IRTE Posted 化）见 [practice/README.md](practice/README.md)。
 
 ### 练习 1：基本设备直通
 
@@ -411,18 +537,31 @@ perf record -e intel_iommu:dtlb_walk -a -- sleep 10
 ### 练习 5：中断分析
 
 ```bash
-# 查看直通设备的中断分布
-cat /proc/interrupts | grep vfio
+# 1. 查看直通设备的宿主 IRQ（名字形如 vfio-msix[0](0000:4b:00.0)）
+grep vfio /proc/interrupts
+cat /sys/bus/pci/devices/0000:4b:00.0/msi_irqs
 
-# 分析 MSI-X 中断数量
-# 通过 QEMU monitor:
-info pci
-# 查看设备的 MSI-X 配置
+# 2. 判断有没有走中断重映射（IR- 前缀）
+for n in $(ls /sys/bus/pci/devices/0000:4b:00.0/msi_irqs); do
+  echo "irq $n -> $(cat /sys/kernel/irq/$n/chip_name)"
+done
 
-# 跟踪 VFIO 中断
-echo vfio_irq_set >> /sys/kernel/debug/tracing/set_event
-echo kvm_set_irq >> /sys/kernel/debug/tracing/set_event
+# 3. 观察 KVM 侧的 IRTE 更新（这个 tracepoint 真实存在，
+#    定义在 arch/x86/kvm/trace.h:1080）
+sudo bash -c 'cd /sys/kernel/tracing
+echo 1 > events/kvm/kvm_pi_irte_update/enable
+echo 1 > tracing_on'
+# 启动带直通设备的 VM，然后看 trace
+sudo cat /sys/kernel/tracing/trace | grep kvm_pi_irte_update
 ```
+
+> 注意：内核里**没有** `vfio_irq_set` tracepoint（`vfio_irq_set` 只是
+> `include/uapi/linux/vfio.h:584` 的一个结构体名），本仓早期版本写错过。
+> 要观测 VFIO 侧的装配过程只能下 kprobe，做法见
+> [practice/README.md](practice/README.md) 练习3。
+
+**判读要点**：Posted 模式生效后，第 1 步里那些 IRQ 的计数应当**始终为 0**。
+计数在涨说明中断仍走 Remapped 路径，排查见 [陷阱4](#陷阱4中断停在-remapped-模式性能达不到预期)。
 
 ---
 
@@ -635,19 +774,38 @@ kvm_vfio_update_coherency(kvm, vfio_group);
 // 确保DMA操作使用正确的内存类型
 ```
 
-### 陷阱4：MSI-X表未正确配置
+### 陷阱4：中断停在 Remapped 模式，性能达不到预期
 
-**场景**：直通设备中断无法到达Guest
+**场景**：直通设备中断能到 Guest，但延迟偏高、宿主 CPU 有可观的中断开销
 
-**症状**：Guest设备无响应
+**症状**：宿主 `/proc/interrupts` 上该设备的 IRQ 计数**在涨**。
+Posted 模式下这些计数应当**始终为 0**，因为 `vfio_msihandler()` 不会被调用。
 
-**原因**：MSI-X表未正确配置
-
-**解决**：
 ```bash
-# 查看MSI-X表
-cat /sys/bus/pci/devices/0000:03:00.0/msi_irqs
-
-# 确保中断路由正确
-cat /sys/kernel/debug/kvm/<vm_id>/irq_routing
+# 找出设备的宿主 IRQ 号，观察计数是否增长
+cat /sys/bus/pci/devices/0000:4b:00.0/msi_irqs
+watch -n1 'grep -E "^ *(112|113|114):" /proc/interrupts'
 ```
+
+**原因**：IRTE 没有被改写成 Posted 模式（`IM=0`），中断仍然先进宿主、再经 eventfd
+唤醒 irqfd，多绕一整圈。常见诱因：
+
+1. `enable_apicv=N`，或硬件不支持 IRQ posting；
+2. 该向量的目标不是单个 vCPU（多播/广播/多目标低优先级），被
+   `posted_intr.c:315` 主动排除，这是**设计如此，不是故障**；
+3. Guest 里做了 irqbalance，把向量的 affinity 改成多 CPU 掩码。
+
+**排查**：
+```bash
+cat /sys/module/kvm_intel/parameters/enable_apicv    # 需要 Y
+dmesg | grep -i "posting\|Posted-Interrupt"
+
+# 区分 Remapped / Posted 需要看 IRTE 原始位，chip_name 只能告诉你有没有重映射
+cat /sys/kernel/irq/112/chip_name                   # IR- 前缀 = 有重映射
+```
+
+`/sys/kernel/debug/kvm/` 下**没有** `irq_routing` 这个文件（本仓早期版本写错过）。
+可靠的观测手段是 `kvm_pi_irte_update` tracepoint 或对 `modify_irte` 下 kprobe。
+
+> 完整机制见 [3.3 节](#33-msi-x-中断直通从-remapped-到-posted)，
+> 含实测数据的动手实验见 [practice/README.md](practice/README.md) 练习3。

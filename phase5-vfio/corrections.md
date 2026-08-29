@@ -2,6 +2,9 @@
 
 > 基线：Linux 6.12.93。以下问题在 `0000:4b:00.0`（独占 IOMMU group 35）上实测复现，并已回查源码确认。
 > 宿主实测内核为 6.8.0-51-generic，涉及的代码路径与 6.12.93 一致。
+>
+> 勘误 1~3 在纯宿主侧复现；勘误 4 需要真起一个带该设备直通的 VM
+> （`scripts/vm/setup-vfio-vm.sh`），因为 IRTE 的 Posted 化只有 KVM 能触发。
 
 ---
 
@@ -207,6 +210,156 @@ Intel IOMMU 侧的实现：
 
 ---
 
+## 勘误 4：IRTE 的 Posted 化不由 KVM-VFIO 组列表触发
+
+**原文**：`README.md` 3.1 节「关键交互点」
+
+```
+3. 当设备使用 Posted Interrupts 时，KVM 需要知道哪些 VFIO 组属于 VM
+4. KVM 更新 IRTE 以支持 PI
+```
+
+**实际**：这两条把因果关系接错了。`KVM_DEV_VFIO_FILE_ADD` **不会**触发任何 IRTE 改写。
+
+`kvm_vfio_file_add()` 做的事只有三件，没有一件与 IRTE 有关：
+
+```c
+/* 来源: virt/kvm/vfio.c:178 */
+	kvm_arch_start_assignment(dev->kvm);
+	kvm_vfio_file_set_kvm(kvf->file, dev->kvm);
+	kvm_vfio_update_coherency(dev);
+```
+
+真正触发 Posted 化的是 **`irq_bypass` 的 token 配对**，走的是完全另一条路：
+
+```
+VFIO:  irq_bypass_register_producer()   token = ctx->trigger
+KVM:   irq_bypass_register_consumer()   token = irqfd->eventfd
+         ↓ 两个 token 是同一个 eventfd 上下文指针
+       __connect()                       virt/lib/irqbypass.c:30
+         └─ kvm_arch_irq_bypass_add_producer()   arch/x86/kvm/x86.c:13665
+              └─ vmx_pi_update_irte()            vmx/posted_intr.c:272
+                   └─ intel_ir_set_vcpu_affinity()  intel/irq_remapping.c:1248
+                        └─ modify_irte()          ← IRTE 写成 Posted
+```
+
+配对与 VFIO 组列表毫无关系，只看 token 是否相等：
+
+```c
+/* 来源: virt/lib/irqbypass.c:108 */
+		if (consumer->token == producer->token) {
+			ret = __connect(producer, consumer);
+```
+
+**组列表确实有作用，但只是间接的**：`kvm_arch_start_assignment()` 递增
+`assigned_device_count`，而它是 PI 的前提条件之一：
+
+```c
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:135 */
+static bool vmx_can_use_vtd_pi(struct kvm *kvm)
+{
+	return irqchip_in_kernel(kvm) && enable_apicv &&
+		kvm_arch_has_assigned_device(kvm) &&
+		irq_remapping_cap(IRQ_POSTING_CAP);
+}
+```
+
+不过这个计数**在 irq_bypass 路径里自己也会被加上**，且就在检查之前：
+
+```c
+/* 来源: arch/x86/kvm/x86.c:13673 —— kvm_arch_irq_bypass_add_producer() */
+	kvm_arch_start_assignment(irqfd->kvm);
+
+	spin_lock_irq(&kvm->irqfds.lock);
+	irqfd->producer = prod;
+
+	ret = kvm_x86_call(pi_update_irte)(irqfd->kvm,
+					   prod->irq, irqfd->gsi, 1);
+```
+
+所以即便退化到没有 `KVM_DEV_VFIO_FILE_ADD`，条件依然满足。**组列表不是 Posted 化的
+必要环节**，它的正职是 DMA coherency（`kvm_vfio_update_coherency()`）与设备生命周期。
+
+**实测印证**：kprobe 抓到的顺序是 `bypass_cons` → `kvm_add_prod` → `pi_update` →
+`ir_vcpu_aff` → `modify_irte(Posted)`，全程 53 µs，其中 `kvm_add_prod` 到 IRTE 落盘只有 5 µs。
+详见 `practice/README.md` 练习3。
+
+### 附 1：两处不存在的观测接口
+
+原文给出的两条命令都会失败，属于凭印象写的：
+
+| 原文 | 问题 |
+|---|---|
+| `cat /sys/kernel/debug/kvm/<vm_id>/irq_routing`（陷阱4） | KVM debugfs 下没有 `irq_routing` 这个文件 |
+| `echo vfio_irq_set >> .../set_event`（练习5） | 没有这个 tracepoint。`vfio_irq_set` 只是 `include/uapi/linux/vfio.h:584` 的结构体名 |
+
+可用的替代品：
+
+- `kvm_pi_irte_update` tracepoint —— 真实存在，定义在 `arch/x86/kvm/trace.h:1080`，
+  在 `posted_intr.c:322` 处触发；
+- `/sys/kernel/irq/<N>/chip_name` —— `IR-` 前缀表示走了中断重映射，
+  但**区分不了 Remapped 与 Posted**；
+- 对 `modify_irte` 下 kprobe 读原始 128 位 —— 唯一能直接看到 `IM` 位的办法
+  （宿主未开 `CONFIG_INTEL_IOMMU_DEBUGFS` 时尤其如此）。
+
+### 附 2：Linux 把规范里的 `IM` 位叫 `pst`
+
+读代码时容易找不到 `IM`。Linux 的 `struct irte` 里，规范的 **IRTE Mode (IM) @ bit 15**
+被命名为 `pst`（posted 的缩写）：
+
+```c
+/* 来源: include/linux/dmar.h:207 —— remapped/posted 共享部分 */
+				__u64	present		: 1,  /*  0      */
+					fpd		: 1,  /*  1      */
+					__res0		: 6,  /*  2 -  6 */
+					avail		: 4,  /*  8 - 11 */
+					__res1		: 3,  /* 12 - 14 */
+					pst		: 1,  /* 15      */
+					vector		: 8,  /* 16 - 23 */
+```
+
+Posted 联合体里叫 `p_pst`（`dmar.h:240`）。位置、语义与规范一致（VT-d Spec 9.9 / 9.10），
+只是名字不同 —— **不要因为搜不到 `IM` 就以为内核用了别的位**。
+
+对照表：
+
+| VT-d 规范 | Linux 字段 | 位 |
+|---|---|---|
+| IRTE Mode (IM) | `pst` / `p_pst` | 15 |
+| Virtual Vector (VV) | `p_vector` | 23:16 |
+| PDAL | `pda_l` | 63:38 |
+| PDAH | `pda_h` | 127:96 |
+| SID | `sid` / `p_sid` | 79:64 |
+
+### 附 3：`CONFIG_X86_POSTED_MSI` 不是 KVM 的 PI
+
+内核里有**两条**都叫「posted」的路径，容易混为一谈：
+
+| | 宿主 posted MSI | Guest VT-d PI（本 phase 的主题） |
+|---|---|---|
+| 配置项 | `CONFIG_X86_POSTED_MSI`（6.11+） | `CONFIG_IRQ_REMAP` + KVM |
+| 目的 | 宿主自己合并 MSI 中断，降低宿主 IRQ 开销 | 中断直投 vCPU，零 VM-Exit |
+| 与 Guest 的关系 | **无关** | 核心 |
+| 写 IRTE 的函数 | `prepare_irte_posted()`（`irq_remapping.c:1111`） | `intel_ir_set_vcpu_affinity()`（`:1248`） |
+| 触发点 | alloc 阶段，`posted_msi_supported()` 门控（`:1377`） | irq_bypass 配对后 |
+| PDA 指向 | 宿主 per-CPU PI Descriptor | **vCPU 的** PI Descriptor |
+
+```c
+/* 来源: drivers/iommu/intel/irq_remapping.c:1377 */
+		if (posted_msi_supported()) {
+			prepare_irte_posted(irte);
+			data->irq_2_iommu.posted_msi = 1;
+		}
+```
+
+注意 `struct irq_2_iommu` 里是**两个不同的标志**（`irq_remapping.c:48-49`）：
+`posted_msi`（宿主）与 `posted_vcpu`（Guest，在 `irq_remapping.c:1278` 置位）。
+本次实测宿主未开 `CONFIG_X86_POSTED_MSI`，所以 alloc 阶段拿到的是纯 Remapped IRTE
+（`pst=0`，向量为占位的 `MANAGED_IRQ_SHUTDOWN_VECTOR = 0xef`），
+Posted 位完全由 KVM 后续写入 —— 因果链干净可辨。
+
+---
+
 ## 附：attach 时那次 `iova=0x0, pgcount=2` 的映射不是业务映射
 
 追 `intel_iommu_map_pages` 时会看到一次先于用户 `VFIO_IOMMU_MAP_DMA` 的调用（实测早 107 ms），`iova=0x0 pgsize=4096 pgcount=2`，且 domain 指针与后续业务映射相同、紧跟在 `intel_iommu_attach_device` 之后。
@@ -232,5 +385,12 @@ static void vfio_test_domain_fgsp(struct vfio_domain *domain, struct list_head *
 ## 参考
 
 - 实验程序：`phase5-vfio/practice/`（说明见该目录 `README.md`）
+- 相关章节：`phase3-interrupts/`（Posted Interrupts 与 VT-d IR 机制）
 - 源码基线：`/root/code/linux-6.12.93/`
-- 规范：intel-vtd.pdf；PCIe Base Spec 6.12（ACS）
+  - `virt/lib/irqbypass.c` —— producer/consumer 配对
+  - `virt/kvm/eventfd.c` —— irqfd 与 consumer 注册
+  - `drivers/vfio/pci/vfio_pci_intrs.c` —— MSI-X 装配与 producer 注册
+  - `drivers/iommu/intel/irq_remapping.c` —— IRTE 读写
+  - `include/linux/dmar.h:201` —— `struct irte` 位域定义
+- 规范：intel-vtd.pdf（Section 9.9 Remapped IRTE / 9.10 Posted IRTE）；
+  intel-vmx.pdf（Section 30.6 Posted-Interrupt Processing）；PCIe Base Spec（ACS）
