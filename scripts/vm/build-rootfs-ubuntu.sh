@@ -348,11 +348,21 @@ EOF
 create_initramfs() {
     log_info "打包为 initramfs..."
 
+    local img="$OUTPUT_DIR/initramfs-ubuntu.img"
+
     cd "$ROOTFS_DIR"
-    find . | cpio -o -H newc 2>/dev/null | gzip > "$OUTPUT_DIR/initramfs-ubuntu.img"
+    # set -e 不覆盖管道中间命令，缺 pipefail 时 cpio/gzip 失败会写出截断镜像而构建仍报成功
+    local rc=0
+    ( set -o pipefail; find . | cpio -o -H newc 2>/dev/null | gzip > "$img" ) || rc=$?
     cd - >/dev/null
 
-    local size=$(du -h "$OUTPUT_DIR/initramfs-ubuntu.img" | cut -f1)
+    if [ "$rc" -ne 0 ] || ! gzip -t "$img" 2>/dev/null; then
+        rm -f "$img"
+        log_error "initramfs 打包失败（rc=$rc）或 gzip -t 校验未通过，已删除损坏产物"
+        exit 1
+    fi
+
+    local size=$(du -h "$img" | cut -f1)
     log_info "✓ initramfs 创建完成 ($size)"
 }
 

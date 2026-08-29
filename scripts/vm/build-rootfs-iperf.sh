@@ -115,8 +115,16 @@ build_initramfs() {
     log_info "打包 initramfs..."
 
     cd "$ROOTFS_DIR"
-    find . | cpio -o -H newc | gzip > "$INITRAMFS"
+    # set -e 不覆盖管道中间命令，缺 pipefail 时 cpio/gzip 失败会写出截断镜像而构建仍报成功
+    local rc=0
+    ( set -o pipefail; find . | cpio -o -H newc | gzip > "$INITRAMFS" ) || rc=$?
     cd "$SCRIPT_DIR"
+
+    if [ "$rc" -ne 0 ] || ! gzip -t "$INITRAMFS" 2>/dev/null; then
+        rm -f "$INITRAMFS"
+        log_error "initramfs 打包失败（rc=$rc）或 gzip -t 校验未通过，已删除损坏产物"
+        exit 1
+    fi
 
     local SIZE=$(du -h "$INITRAMFS" | cut -f1)
     log_info "initramfs 创建完成: $INITRAMFS ($SIZE)"
