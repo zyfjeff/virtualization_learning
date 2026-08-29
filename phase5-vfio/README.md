@@ -211,16 +211,17 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 
 #### 1.4.2 关键坑：`pci_acs_enabled()` 查的是「有效能力」不是「实际能力」
 
-`drivers/pci/pci.c:3620` 对不同 PCIe 类型有三类完全不同的处理：
+`drivers/pci/pci.c:3620` 的判定分两层：**先查设备专属 quirk，再按 PCIe 类型分类**。
 
-| 设备类型 | 行号 | 行为 |
+| 层 | 行号 | 行为 |
 |---|---|---|
-| Downstream Port / Root Port | `:3657-3659` | 读配置空间校验，但**要求集先被 ACSCap 掩掉**（见下） |
-| 单功能 Endpoint / Upstream Port / Leg End / RC End | `:3667-3672` → `:3681` | **没有 ACS capability 也返回 true** |
-| PCIe-to-PCI 桥、PCI 桥、RC-EC | `:3642-3651` | 无条件 `return false` |
-| 非 PCIe（传统 PCI / PCI-X） | `:3633` | `return false` |
+| **0. 设备专属 quirk** | `:3624-3626` | 命中就直接定论，**下面几行全部不执行** |
+| 1. Downstream Port / Root Port | `:3657-3659` | 读配置空间校验，但**要求集先被 ACSCap 掩掉**（见下） |
+| 2. 单功能 Endpoint / Upstream Port / Leg End / RC End | `:3667-3672` → `:3681` | **没有 ACS capability 也返回 true** |
+| 3. PCIe-to-PCI 桥、PCI 桥、RC-EC | `:3642-3651` | 无条件 `return false` |
+| 4. 非 PCIe（传统 PCI / PCI-X） | `:3633` | `return false` |
 
-第二类的理由写在注释里：
+第 2 类的理由写在注释里：
 
 > most single function endpoints are not required to support ACS because they have no
 > opportunity for peer-to-peer access. We therefore return 'true' regardless of whether
@@ -230,7 +231,7 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 
 所以 `lspci` 里某一跳**完全没有** ACS capability，并不等于隔离不成立 —— 要先看它的 PCIe 类型。
 
-第一类也不是「四个 flag 必须全在 `ACSCtl` 里置位」那么简单。校验前先按设备**声明**的
+第 1 类也不是「四个 flag 必须全在 `ACSCtl` 里置位」那么简单。校验前先按设备**声明**的
 `ACSCap` 做一次掩码：
 
 ```c
@@ -250,6 +251,79 @@ ACSCtl: SrcValid+ TransBlk- ReqRedir+ CmpltRedir+ UpstreamFwd- ...
 `UpstreamFwd` 在 Cap 里就是 `-`，被 `:3598` 从 `REQ_ACS_FLAGS` 里掩掉，剩下三个
 Cap/Ctl 都置位 → 返回 true。这也解释了为什么它下游的 `02:00.0` 没有并进 `00:1c.4`
 所在的 group 99。
+
+##### 第 0 层：设备专属 quirk 可以完全绕过上面所有规则
+
+这一层最容易被忽略 —— 它在函数最开头，命中就直接返回：
+
+```c
+/* 来源: drivers/pci/pci.c:3620 —— pci_acs_enabled() */
+bool pci_acs_enabled(struct pci_dev *pdev, u16 acs_flags)
+{
+	int ret;
+
+	ret = pci_dev_specific_acs_enabled(pdev, acs_flags);
+	if (ret >= 0)
+		return ret > 0;
+```
+
+`pci_dev_specific_acs_enabled()`（`drivers/pci/quirks.c:5234`）遍历 `pci_dev_acs_enabled[]`
+表（`quirks.c:5052`），三态返回：`-ENOTTY` = 无 quirk 适用（继续走类型判断）、`0` = 不满足、
+`>0` = 满足。用途是让**没有实现 ACS capability、但厂商确认不做内部 p2p** 的设备也算隔离成立。
+
+x86 上影响面最大的一条匹配**所有 Intel 设备**：
+
+```c
+/* 来源: drivers/pci/quirks.c:5122 */
+	{ PCI_VENDOR_ID_INTEL, PCI_ANY_ID, pci_quirk_rciep_acs },
+```
+```c
+/* 来源: drivers/pci/quirks.c:4991 */
+static int pci_quirk_rciep_acs(struct pci_dev *dev, u16 acs_flags)
+{
+	/*
+	 * Intel RCiEP's are required to allow p2p only on translated
+	 * addresses.  Refer to Intel VT-d specification, r3.1, sec 3.16,
+	 * "Root-Complex Peer to Peer Considerations".
+	 */
+	if (pci_pcie_type(dev) != PCI_EXP_TYPE_RC_END)
+		return -ENOTTY;
+
+	return pci_acs_ctrl_enabled(acs_flags,
+		PCI_ACS_SV | PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_UF);
+}
+```
+
+给出的四位正好等于 `REQ_ACS_FLAGS`，`pci_acs_ctrl_enabled()`（`quirks.c:4653`）做的是
+「请求集是否被提供集覆盖」，所以**对 Intel RCiEP 一律返回 1** —— 哪怕设备根本没有 ACS
+capability，也算隔离成立。另一条常见的是 `pci_quirk_mf_endpoint_acs()`（`quirks.c:4975`），
+按型号白名单给多功能网卡（大量 Intel igb/ixgbe、Broadcom、Solarflare）放行。
+
+**实测对照 —— 同为 3 个 function 的两组 Intel 设备，结果完全相反：**
+
+| 设备 | PCIe 类型 | `pci_acs_enabled()` | group |
+|---|---|---|---|
+| `00:08.0` Ubox Registers | RCiEP | true（`pci_quirk_rciep_acs`） | 91 |
+| `00:08.1` Performance counters | **无任何 capability**（`Status: Cap-`） | false（`pci.c:3633`） | 92 |
+| `00:08.2` Ubox Registers | RCiEP | true（`pci_quirk_rciep_acs`） | 93 |
+| `00:16.0/.1/.4` MEI Controller | 无 PCIe capability（只有 PM + MSI） | 三个都 false | **96，三个一组** |
+
+`00:08.x` 三个 function 全部独占，但**原因是两种**：
+
+- `.0` / `.2` 被 quirk 判成隔离成立，`iommu.c:1397` 的门直接 `return NULL`；
+- `.1` 自己是 false、门是通过的，但循环要求候选方**也**不隔离（`iommu.c:1401-1404` 的
+  `pci_acs_enabled(tmp, ...)` → `continue`），同 slot 的 `.0` / `.2` 全被跳过 →
+  找不到搭档 → 仍然 `return NULL`。**它不是「已隔离」，是「想并组但没人肯跟它并」。**
+
+`00:16.x` 逃掉了这条 quirk（不是 RCiEP），三个都 false，于是真的并成 group 96。
+
+> 判断某个设备是否被 quirk 放行：`lspci -vvv` 里既看不到 ACS capability、设备又独占一组，
+> 基本就是这一层的效果。
+>
+> Intel RCiEP 认作隔离的依据是 VT-d 规范而非 PCIe ACS。本仓 `intel-vtd.pdf` 是 **Rev 4.1**，
+> 对应 **Section 3.17 (Root-Complex Peer to Peer Considerations)**（quirk 注释引的是 r3.1 的
+> 3.16，章节号随版本挪过）：peer 请求「must be done only on the translated HPA」——
+> 即 p2p 只能发生在已翻译地址上，因此 IOMMU 的隔离不会被绕过。
 
 #### 1.4.3 实测：一个 switch，30+ 个组
 
@@ -349,6 +423,10 @@ setpci -s 02:00.0 0x82.w      # PCIe Cap @0x80 + 2 = PCI_EXP_FLAGS
 
 条件是**同 bus 同 slot**、且双方都没有 ACS。同机 group 105–114、168–177 的
 「8 个 function 一组」都走这条路径。
+
+反过来，`00:08.0/.1/.2` 同样是 3 个 function 却各自独占（91/92/93），因为前两个被
+[第 0 层的 Intel RCiEP quirk](#第-0-层设备专属-quirk-可以完全绕过上面所有规则) 判成隔离成立 ——
+**多功能设备是否同组，先看有没有 quirk 放行，再看 ACS。**
 
 **③ DMA alias** —— 设备发出的 DMA 携带的 requester ID (RID) 不等于自己的 BDF。
 IOMMU 是按 RID 查上下文表的，两个设备共用同一个 RID 就无法分辨、必须同组。
@@ -697,7 +775,8 @@ Guest 侧中断计数 +629，而宿主 `/proc/interrupts` 上对应的三个 IRQ
 |--------|------|------|
 | `pci_device_group()` | `drivers/iommu/iommu.c:1515` | PCI 设备的组划分主逻辑，四步判定 |
 | `pci_acs_path_enabled()` | `drivers/pci/pci.c:3693` | 检查整条上游路径的 ACS，任一跳不满足即 false |
-| `pci_acs_enabled()` | `drivers/pci/pci.c:3620` | 单设备 ACS 判定，按 PCIe 类型分三类处理 |
+| `pci_acs_enabled()` | `drivers/pci/pci.c:3620` | 单设备 ACS 判定：先查 quirk（`:3624`），再按 PCIe 类型分类 |
+| `pci_dev_specific_acs_enabled()` | `drivers/pci/quirks.c:5234` | ACS quirk 表分发，三态返回；`pci_quirk_rciep_acs()` 匹配所有 Intel RCiEP |
 | `get_pci_function_alias_group()` | `drivers/iommu/iommu.c:1391` | 归并同 slot 上未隔离的多功能 function |
 | `iommu_group_claim_dma_owner()` | `drivers/iommu/iommu.c:3214` | 认领组的 DMA ownership，组内有普通驱动则 `-EPERM`（判断在 `:3222`） |
 | `vfio_file_iommu_group()` | `vfio_main.c` | 获取文件的 IOMMU 组 |
