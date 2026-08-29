@@ -82,7 +82,7 @@ grep -rn "pcie_acs_override" drivers/pci/ Documentation/admin-guide/kernel-param
 
 另外 `pci=noaer` 关闭的是 AER（Advanced Error Reporting），与 ACS 隔离毫无关系，同时出现在这条命令里属于误传。
 
-**修正后的正确认知**：ACS 是硬件能力，不能靠内核参数「打开」。内核的判断逻辑是：
+**修正后的正确认知**：要分清 ACS 的**能力位**（`ACSCap`）与**控制位**（`ACSCtl`）。能力位是硬件属性，不能靠内核参数「打开」；控制位是可写的，而且内核检测到 IOMMU 后默认就会全部置上（`pci_request_acs()` → `pci_std_enable_acs()`），上游另有 `pci=config_acs=` 与 `pci=disable_acs_redir=` 两个参数，但都只能进一步**关掉**隔离，不能凭空造出硬件没有的能力。详见 `README.md` 1.5.2。内核的判断逻辑是：
 
 ```c
 /* 来源: drivers/iommu/iommu.c:1383 */
