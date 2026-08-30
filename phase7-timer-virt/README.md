@@ -855,6 +855,8 @@ Guest 执行 RDTSC:
 
 **VMCS 中的 TSC 控制字段**:
 
+> 命名说明：功能叫 "TSC scaling"，但 Intel VMCS 字段叫 `TSC_MULTIPLIER`，AMD 对应 MSR 叫 `TSC_RATIO`。三者是一回事。
+
 ```
 VMCS TSC 相关字段:
 
@@ -869,23 +871,27 @@ VMCS TSC 相关字段:
 │  读 Guest TSC: RDTSC → 硬件自动加上 offset → 返回给Guest       │
 └──────────────────────────────────────────────────────────────────┘
 
-┌─ TSC_MULTIPLIER (TSC Scaling) ───────────────────────────────────┐
+┌─ TSC scaling ──────────────────────────────────────────────────┐
+│  (VMCS 字段名: TSC_MULTIPLIER; AMD MSR: TSC_RATIO)            │
+│                                                                   │
 │  Guest RDTSC = (Host TSC × TSC_MULTIPLIER) + TSC_OFFSET        │
 │                                                                   │
 │  用途: 让Guest看到不同频率的TSC                                  │
 │    - 嵌套虚拟化: L2 Guest需要看到L1的TSC频率                     │
 │    - 迁移兼容: 不同Host CPU频率不同, 通过缩放统一               │
 │                                                                   │
-│  格式: 48位小数 + 整数部分                                       │
-│    1.0 = 0x0000000100000000 (不缩放)                            │
-│    2.0 = 0x0000000200000000 (2倍速)                              │
-│    0.5 = 0x0000000080000000 (半速)                               │
+│  格式: 64位定点数, 低48位为小数 (VMX, vmx.c:8502)             │
+│    1.0 = 0x0001000000000000 (不缩放, 即 2^48)                 │
+│    2.0 = 0x0002000000000000 (2倍速)                            │
+│    0.5 = 0x0000800000000000 (半速)                             │
+│    注: AMD SVM 用 32 位小数 (svm.c:5478),                     │
+│        1.0 = 0x0000000100000000                                │
 │                                                                   │
-│  硬件支持: CPUID.80000007H:EDX[8] = TSC invariant               │
-│           VMX: IA32_VMX_PROCBASED_CTLS2 bit 25                  │
-│                ("enable TSC scaling" secondary exec control;    │
-│                 KVM: SECONDARY_EXEC_TSC_SCALING, vmx.h:79)      │
-│           SVM: CPUID.8000000AH:EDX + MSR_AMD64_TSC_RATIO        │
+│  启用条件:                                                       │
+│    VMX: IA32_VMX_PROCBASED_CTLS2 bit 25                         │
+│         ("enable TSC scaling" secondary exec control)            │
+│         KVM: SECONDARY_EXEC_TSC_SCALING (vmx.h:79)              │
+│    前提: CPU 支持 Invariant TSC (CPUID.80000007H:EDX[8])       │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1615,11 +1621,191 @@ VM 快照/迁移时, 必须一起处理的四件套:
 │  +   watchdog 抑制   —                 KVM_KVMCLOCK_CTRL        │
 └──────────────────────────────────────────────────────────────────┘
 
-顺序有硬约束:
+顺序有硬约束 (原因见下文):
   SET_TSC_KHZ  必须早于  SET_MSRS       // TSC deadline timer 状态
   SET_SREGS    必须早于  SET_LAPIC      // apic base msr
   SET_LAPIC    必须早于  SET_MSRS       // TSC deadline MSR 需要 LAPIC 就绪
   MSR_IA32_TSC 必须早于  MSR_IA32_TSC_DEADLINE
+```
+
+#### 恢复顺序的硬约束：为什么必须这个顺序？
+
+这些约束源于硬件寄存器之间的依赖关系，违反会导致状态不一致或恢复失败。
+
+```
+┌─ 约束 1: SET_TSC_KHZ 必须早于 SET_MSRS ──────────────────────┐
+│                                                                  │
+│  原因: MSR_IA32_TSC_DEADLINE 的值需要结合 TSC 频率解释        │
+│                                                                  │
+│  TSC deadline timer 的到期时间 = IA32_TSC_DEADLINE 的值        │
+│  但 "这个值对应什么时刻" 取决于 TSC 频率:                       │
+│    · TSC = 3 GHz 时, deadline = 30亿 → 1 秒后到期              │
+│    · TSC = 2 GHz 时, deadline = 30亿 → 1.5 秒后到期            │
+│                                                                  │
+│  KVM 内部处理:                                                  │
+│    KVM_SET_MSRS(MSR_IA32_TSC_DEADLINE, value) 时:              │
+│      → 需要把 deadline 转换为 host TSC 值                      │
+│      → 转换公式依赖 tsc_scaling_ratio (由 KVM_SET_TSC_KHZ 设置)│
+│      → 如果 TSC 频率还没设好, 转换结果错误                    │
+│                                                                  │
+│  错误顺序的后果:                                                │
+│    Guest 的定时器到期时间不正确                                 │
+│    可能导致定时器提前/延迟触发, 甚至永久不触发                  │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ 约束 2: SET_SREGS 必须早于 SET_LAPIC ───────────────────────┐
+│                                                                  │
+│  原因: LAPIC 的基地址在特殊寄存器中                           │
+│                                                                  │
+│  LAPIC 寄存器通过 MMIO 访问, 基地址由 MSR_IA32_APICBASE 决定: │
+│    · 默认基地址: 0xFEE00000                                    │
+│    · 可以重映射到其他地址 (x2APIC 模式等)                      │
+│                                                                  │
+│  KVM 内部处理:                                                  │
+│    KVM_SET_SREGS 包含设置 APICBASE MSR                         │
+│    KVM_SET_LAPIC 需要知道 LAPIC 基地址才能正确解析状态         │
+│                                                                  │
+│  错误顺序的后果:                                                │
+│    LAPIC 状态可能写入错误的地址空间                            │
+│    或者 KVM 无法正确识别 LAPIC 的工作模式 (xAPIC vs x2APIC)   │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ 约束 3: SET_LAPIC 必须早于 SET_MSRS ────────────────────────┐
+│                                                                  │
+│  原因: TSC deadline timer 是 LAPIC 的一部分, 需要 LAPIC 先就绪│
+│                                                                  │
+│  IA32_TSC_DEADLINE MSR 的行为依赖 LAPIC 状态:                 │
+│    · LAPIC 必须已启用 (Global Enable 位)                      │
+│    · LAPIC 必须配置为 TSC deadline 模式 (LVT Timer Register)  │
+│    · 这些配置在 LAPIC 状态中, 不在 MSR 中                     │
+│                                                                  │
+│  KVM 内部处理:                                                  │
+│    KVM_SET_LAPIC: 恢复 LAPIC 基状态 (LVT, TMICT, 模式等)      │
+│    KVM_SET_MSRS(MSR_IA32_TSC_DEADLINE): 设置 deadline 值      │
+│      → 需要检查 LAPIC 是否已配置为 deadline 模式              │
+│      → 如果 LAPIC 还没恢复, 无法正确设置 deadline             │
+│                                                                  │
+│  错误顺序的后果:                                                │
+│    TSC deadline timer 状态不一致                               │
+│    deadline 可能被忽略或触发异常                                │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ 约束 4: MSR_IA32_TSC 必须早于 MSR_IA32_TSC_DEADLINE ────────┐
+│                                                                  │
+│  原因: deadline 是 "绝对 TSC 值", 依赖当前 TSC 值解释        │
+│                                                                  │
+│  Guest 设置 deadline 的典型逻辑:                               │
+│    current_tsc = RDTSC()                                       │
+│    deadline = current_tsc + delta                              │
+│    WRMSR(IA32_TSC_DEADLINE, deadline)                          │
+│                                                                  │
+│  恢复时:                                                        │
+│    如果先设置 deadline = 1000000                               │
+│    然后设置 TSC = 5000000 (比 deadline 还大!)                 │
+│    → deadline 已经 "过期", 立即触发中断                       │
+│                                                                  │
+│  正确顺序:                                                     │
+│    先设置 TSC = 5000000                                        │
+│    再设置 deadline = 6000000 (在 TSC 之后)                    │
+│    → 定时器在正确的未来时刻触发                               │
+│                                                                  │
+│  错误顺序的后果:                                                │
+│    定时器立即触发, 或永久不触发 (取决于实现)                   │
+└──────────────────────────────────────────────────────────────────┘
+
+正确的恢复顺序总结:
+
+  ① SET_TSC_KHZ        // 先设 TSC 频率, 后续 deadline 计算依赖它
+  ② SET_SREGS          // 设置 APIC base 等特殊寄存器
+  ③ SET_LAPIC          // 恢复 LAPIC 状态 (包括 timer 模式)
+  ④ SET_MSRS           // 最后恢复 MSR, 包括:
+       a. MSR_IA32_TSC          // 先设 TSC 值
+       b. MSR_IA32_TSC_DEADLINE // 再设 deadline (必须在 TSC 之后)
+```
+
+#### TSC Scaling 在快照/迁移中如何处理？
+
+> **关键点：TSC_MULTIPLIER 本身不直接保存，而是通过 KVM_SET_TSC_KHZ 间接设置。**
+
+```
+┌─ 保存流程 (源 Host) ──────────────────────────────────────────┐
+│                                                                  │
+│  QEMU 调用 KVM_GET_TSC_KHZ → 得到 guest_tsc_khz             │
+│    · 这是 Guest 看到的 TSC 频率 (已经经过 scaling)            │
+│    · 例如: Host TSC = 3 GHz, 但 Guest 看到的是 2.5 GHz        │
+│    · KVM_GET_TSC_KHZ 返回 2500000                             │
+│                                                                  │
+│  QEMU 把 guest_tsc_khz 存入快照文件                          │
+│                                                                  │
+│  注意: TSC_MULTIPLIER 是 KVM 内部根据频率计算出来的,         │
+│        不直接暴露给用户态                                     │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ 恢复流程 (目标 Host) ────────────────────────────────────────┐
+│                                                                  │
+│  ★ VMM 只需做一件事:                                           │
+│    把源端 KVM_GET_TSC_KHZ 获取的值，原样传给目标端             │
+│    KVM_SET_TSC_KHZ。KVM 会自动根据目标 Host 的 TSC 频率       │
+│    计算 TSC_MULTIPLIER，保证 Guest 看到的频率不变。            │
+│                                                                  │
+│  情况 1: 同 Host 恢复 (或目标 Host TSC 频率相同)              │
+│  ┌────────────────────────────────────────────────────┐       │
+│  │  源 Host TSC = 3 GHz, Guest 看到 3 GHz            │       │
+│  │  目标 Host TSC = 3 GHz                            │       │
+│  │                                                    │       │
+│  │  KVM_SET_TSC_KHZ(3000000)                         │       │
+│  │    → KVM 自动计算 multiplier = 3/3 = 1.0          │       │
+│  │    → Guest 仍然看到 3 GHz (不做缩放)              │       │
+│  └────────────────────────────────────────────────────┘       │
+│                                                                  │
+│  情况 2: 跨 Host 迁移 (目标 Host TSC 频率不同)               │
+│  ┌────────────────────────────────────────────────────┐       │
+│  │  源 Host: TSC = 3 GHz, Guest 看到 2.5 GHz         │       │
+│  │  目标 Host: TSC = 2 GHz, 支持 TSC scaling        │       │
+│  │                                                    │       │
+│  │  VMM 调用: KVM_SET_TSC_KHZ(2500000)  ← 源端的值 │       │
+│  │    → KVM 自动计算: multiplier = 2.5/2 = 1.25      │       │
+│  │    → 写入 VMCS: TSC_MULTIPLIER = 1.25             │       │
+│  │    → Guest 仍然看到 2.5 GHz 的 TSC (频率不变!)   │       │
+│  │                                                    │       │
+│  │  ★ 这就是 TSC scaling 的核心作用:                  │       │
+│  │    VMM 不需要关心目标 Host 频率是多少,            │       │
+│  │    只需要传入 Guest 应该看到的频率,               │       │
+│  │    KVM 自动计算 scaling 值                        │       │
+│  └────────────────────────────────────────────────────┘       │
+│                                                                  │
+│  情况 3: 目标 Host 不支持 TSC scaling                         │
+│  ┌────────────────────────────────────────────────────┐       │
+│  │  如果目标 Host CPU 不支持 TSC scaling 硬件:       │       │
+│  │    → 请求频率 > 硬件频率: 成功, 走软件 catchup   │       │
+│  │      (kvm_guest_time_update 按墙上时间计算      │       │
+│  │       应有 TSC 并调 offset 追平,               │       │
+│  │       x86.c:3277-3283)                          │       │
+│  │    → 请求频率 ≤ 硬件频率: 无法降速模拟,        │       │
+│  │      ioctl 返回 -EINVAL (x86.c:6173-6190)       │       │
+│  │    → Guest 感知到频率变化 (应用可能受影响)        │       │
+│  │                                                    │       │
+│  │  这是为什么迁移前要检查 CPU 兼容性                │       │
+│  └────────────────────────────────────────────────────┘       │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ KVM 内部计算 ────────────────────────────────────────────────┐
+│                                                                  │
+│  KVM_SET_TSC_KHZ(khz) 触发:                                   │
+│    1. 计算 tsc_scaling_ratio = khz × 2^48 / host_tsc_khz     │
+│       (48位定点格式, x86.c:2452; AMD SVM 为 2^32)            │
+│    2. vmcs_write64(TSC_MULTIPLIER, tsc_scaling_ratio)         │
+│                                                                  │
+│  KVM_SET_MSRS(MSR_IA32_TSC, value) 触发:                     │
+│    1. 计算 tsc_offset = value - host_tsc                      │
+│       (考虑 scaling: value = host_tsc × multiplier + offset)  │
+│    2. vmcs_write64(TSC_OFFSET, tsc_offset)                    │
+│                                                                  │
+│  所以: TSC_MULTIPLIER 和 TSC_OFFSET 都是 KVM 根据           │
+│        guest_tsc_khz 和 guest_tsc_value 计算出来的,          │
+│        不直接保存在快照中                                     │
+└──────────────────────────────────────────────────────────────────┘
+```
 
 跳变治理的三条原则:
 
