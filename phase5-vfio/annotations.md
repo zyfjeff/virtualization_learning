@@ -466,6 +466,11 @@ int vfio_pci_core_enable(struct vfio_device *core_vdev)
  * 映射区域:
  *   - PCI BAR 中的 MMIO 区域（非 I/O 端口）
  *   - 通过 mmap 直接暴露给用户态
+ *
+ * ★ 注意: MSI-X 表所在页面会被从 mmap 中剔除（无 IR 时）
+ *   详见 README.md §1.5.9「MSI-X 表与 BAR mmap」
+ *   有 IR 时内核通过 VFIO_REGION_INFO_CAP_MSIX_MAPPABLE 允许整 BAR mmap，
+ *   但 QEMU 默认仍以 msix_table_mmio subregion 拦截 MSI-X 表访问。
  */
 
 /*

@@ -484,6 +484,39 @@ static void vfio_test_domain_fgsp(struct vfio_domain *domain, struct list_head *
 
 ---
 
+## 勘误 6：`has_assigned_device` 只限制 VT-d PI，不限制 KVM-side PI
+
+**原文**：讨论 `vmx_can_use_vtd_pi()` 时容易得出"没有直通设备就不能用 Posted Interrupt"的结论。
+
+**实际**：PI Descriptor 机制有**两种触发源**，`has_assigned_device` 只门控其中一种。
+
+```c
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:135 */
+static bool vmx_can_use_vtd_pi(struct kvm *kvm)
+{
+    return irqchip_in_kernel(kvm) && enable_apicv &&
+        kvm_arch_has_assigned_device(kvm) &&     // ← 只门控 VT-d PI
+        irq_remapping_cap(IRQ_POSTING_CAP);
+}
+```
+
+| | VT-d PI (IOMMU 路径) | KVM-side PI (APICv 路径) |
+|---|---|---|
+| **谁写 PI Descriptor** | IOMMU 硬件 | KVM 软件 |
+| **入口** | `vmx_pi_update_irte()` | `vmx_deliver_interrupt()` |
+| **需要 `has_assigned_device`** | ✅ | ❌ |
+
+`vmx_deliver_interrupt()` 注册为 `kvm_x86_ops.deliver_interrupt`（`main.c:107`），
+由 `lapic.c:1352` 对所有中断源调用。`vmx_deliver_posted_interrupt()` 只检查
+`apicv_active`，不检查 `has_assigned_device`。
+
+**影响范围**：即使纯模拟 VM，只要 APICv 开启，中断也能走 PI Descriptor 路径
+（PIR→IRR 硬件同步），减少 VM-Exit。
+
+**修正**：README §3.3 已补充「两种不同的 Posted Interrupt」小节澄清此问题。
+
+---
+
 ## 参考
 
 - 实验程序：`phase5-vfio/practice/`（说明见该目录 `README.md`）

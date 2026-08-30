@@ -26,7 +26,7 @@ IOMMU 保证隔离性。
 
 | 文件 | 内容 |
 |------|------|
-| `README.md` | 本文件：VFIO 架构全景 + IOMMU 组划分规则 + ACS 七个能力位与 ATS 机制 + DMA 映射路径 + KVM-VFIO 桥接 + 常见陷阱 |
+| `README.md` | 本文件：VFIO 架构全景 + IOMMU 组划分规则 + ACS 七个能力位与 ATS 机制 + MSI-X 表 mmap 安全与 Relocation + DMA 映射路径 + KVM-VFIO 桥接 + 常见陷阱 |
 | `annotations.md` | 源码精读：VFIO 分层实现、container/group/device、Type1 IOMMU 后端 |
 | `corrections.md` | ★ 勘误：DMA ownership 认领时机、ACS 认知误区、sysfs 观测盲区、IRTE Posted 化的真实触发路径（均有实测印证） |
 | `practice/` | ★ 3 个实验程序：ownership 认领时机追踪 / IOVA→HPA 映射验证 / MSI-X 中断直通与 IRTE Posted 化 |
@@ -1129,6 +1129,271 @@ $ lspci -Dvvv | awk '
 `ACSCap` 与 `ACSCtl` 的差别是 ①② 的全部信息量：**Cap 里是 `-` 的位不算失败**
 （会被 `pci.c:3598` 掩掉），只有「Cap 有、Ctl 没开」才是真正的隔离缺失。
 
+#### 1.5.9 MSI-X 表与 BAR mmap：为什么 VFIO 要剥掉那一页
+
+VFIO 在 mmap BAR 时会把 MSI-X 表所在的页面从映射中剔除。这不是 bug，是安全设计。
+
+##### MSI-X 表为什么不能暴露给 guest
+
+MSI-X 表驻留在设备的某个 BAR 中，每个条目 16 字节，核心字段是 **Message Address**——
+它决定了设备中断写到哪个地址：
+
+```
+MSI-X Table Entry (16 bytes):
+┌───────────────────────────────────────────────┐
+│  Message Address (8 bytes)  │  中断投递目标地址 │ ← 关键字段
+├─────────────────────────────┼─────────────────┤
+│  Message Data  (4 bytes)    │  中断向量/数据    │
+├─────────────────────────────┼─────────────────┤
+│  Vector Control (4 bytes)   │  掩码位          │
+└─────────────────────────────┴─────────────────┘
+```
+
+如果 guest 能直接写 Message Address，就能把中断投递到**宿主机任意地址**：
+
+```
+正常:  Message Address = 0xFEE0_0000  → 本机 LAPIC，正常中断
+恶意:  Message Address = 任意物理地址  → 覆盖宿主页内存 / 攻击其他 VM
+```
+
+所以 **没有中断重映射（IR）保护时，绝不能让 guest 直接写 MSI-X 表**。
+
+##### IR 如何从根本上消除 MSI-X 表的安全风险
+
+IR 启用后，VFIO 在分配中断时**改写设备 MSI-X 表的 Message Address/Data**：
+
+```c
+/* 来源: drivers/iommu/intel/irq_remapping.c (简化) */
+msg.address = IR_BASE_ADDR + index;   /* 指向 IOMMU 的 IR 表，不是 APIC */
+msg.data    = index;                   /* IRTE 索引 */
+```
+
+**设备 MSI-X 表里的 Message Address/Data 不再决定中断投递目标——IOMMU 才决定。**
+
+```
+无 IR:  Message Address = 0xFEE0_0000  → 直接指向 LAPIC，IOMMU 不介入
+有 IR:  Message Address = IR_BASE+idx  → 指向 IOMMU，被 IOMMU 拦截并重映射
+```
+
+IOMMU 拦截 MSI TLP 后的完整处理流程：
+
+```
+MSI TLP 到达 IOMMU
+    │
+    ├─ ① 提取 Requester ID (RID) —— 从 PCIe TLP 头取设备 BDF
+    │
+    ├─ ② 用 Data 中的 index 查 IRTE
+    │    IRTE[index] = {
+    │      SID  = 0x4b00,      ← 该中断授权的设备 BDF
+    │      SVT  = 1,           ← 严格验证 SID
+    │      Vector = 0x21,      ← 真正投递的向量号（host 决定）
+    │      DST  = APIC_ID_3,   ← 真正投递的目标（host 决定）
+    │    }
+    │
+    ├─ ③ Source ID 验证（关键安全门控）
+    │    IRTE 的 SVT 字段决定验证精度：
+    │      SVT=0 (NO_VERIFY):      跳过检查
+    │      SVT=1 (VERIFY_SID_SQ):  RID 与 SID 比较（SQ 控制精度）
+    │      SVT=2 (VERIFY_BUS):     只比较 Bus 号（桥后设备）
+    │    SQ 字段进一步控制比较粒度：
+    │      SQ=0: Bus+Dev+Fn 全匹配   SQ=2: Bus+Dev（忽略 Fn）
+    │      SQ=1: 高 15 位匹配         SQ=3: 仅 Bus
+    │    Linux 默认用 SVT=1。RID 不匹配 → 阻断并报告 fault。
+    │
+    ├─ ④ 重映射：原始 MSI 的 Address/Data 被完全丢弃
+    │    中断的向量、目标、投递模式全部来自 IRTE（host 写入）
+    │    Remapped 模式 (IM=0): Vector←IRTE.V, DST←IRTE.DST
+    │    Posted 模式 (IM=1): 直接写 PI Descriptor（PDA→vCPU）
+    │
+    └─ ⑤ 投递到 IRTE 指定的目标
+```
+
+**三层安全保证**：
+
+| 层 | 机制 | 防护效果 |
+|----|------|---------|
+| ① | Message Address 指向 IOMMU，不是 APIC | guest 改 Address → 不再是有效 IR 请求 → 被阻断 |
+| ② | Source ID 验证 (SVT/SID/SQ) | 设备 A 无法冒充设备 B 触发 B 的 IRTE |
+| ③ | 目标重映射由 Host 控制 | IRTE 中的 Vector/DST 由 host 写入，guest 无法修改投递目标 |
+
+Guest 即使恶意篡改 MSI-X 表也无效：
+
+```
+Guest 改 MSI-X: Message Address = 0x0001_0000, Data = 0xDEAD
+→ 该地址不在 IR 范围内 → IOMMU 不当作 IR 请求 → 阻断为 fault
+→ 目标内存不受影响
+
+Guest 改 MSI-X: Message Address = IR_BASE + other_index
+→ 即使 index 碰巧合法 → RID 必须匹配 IRTE.SID
+→ 设备拿不到其他设备的 IRTE 索引 → 仍然被阻断
+```
+
+> **详见 phase3-interrupts/posted-interrupts.md §2** 的 IRTE 格式详解和 SVT/SID/SQ 字段定义。
+
+##### 内核侧：有 IR 和没有 IR 的区别
+
+内核通过 `VFIO_REGION_INFO_CAP_MSIX_MAPPABLE` 能力标记告知用户态是否允许 mmap MSI-X 区域：
+
+```c
+/* include/uapi/linux/vfio.h */
+/*
+ * The MSIX mappable capability informs that MSIX data of a BAR can be mmapped
+ * which allows direct access to non-MSIX registers which happened to be within
+ * the same system page.
+ *
+ * Even though the userspace gets direct access to the MSIX data, the existing
+ * VFIO_DEVICE_SET_IRQS interface must still be used for MSIX configuration.
+ */
+#define VFIO_REGION_INFO_CAP_MSIX_MAPPABLE	3
+```
+
+| 场景 | 内核行为 |
+|------|---------|
+| **无 IR** | 剥掉 MSI-X 页，返回 sparse mmap；无 `MSIX_MAPPABLE` 标记 |
+| **有 IR** | 整 BAR 可 mmap，带 `MSIX_MAPPABLE` 标记；IR 保证设备只能向授权的 APIC 地址发中断 |
+
+没有 IR 时，BAR 的 mmap 被切成 MSI-X 表两侧的碎片：
+
+```
+BAR 布局（无 IR）:
+┌─────────────┬──────────────┬──────────────┐
+│  设备寄存器  │  MSI-X Table │  设备寄存器   │
+│  (mmap 区域0)│  (剥掉!)     │  (mmap 区域1) │
+└─────────────┴──────────────┴──────────────┘
+```
+
+##### QEMU 侧：有 IR 时仍然模拟 MSI-X 表
+
+即使内核允许整 BAR mmap（有 IR + `MSIX_MAPPABLE`），QEMU **默认仍然拦截 MSI-X 表的访问**。
+原因在于 QEMU 的内存区域层级设计：
+
+```c
+/* hw/pci/msix.c:383-385 */
+memory_region_init_io(&dev->msix_table_mmio, OBJECT(dev),
+                      &msix_table_mmio_ops, dev, "msix-table", table_size);
+memory_region_add_subregion(table_bar, table_offset, &dev->msix_table_mmio);
+```
+
+`msix_table_mmio` 作为 BAR MemoryRegion 的 **subregion**，访问优先级高于底层的 mmap。
+所以即使整 BAR 都 mmap 了，guest 访问 MSI-X 表区域仍命中模拟 handler：
+
+```
+Guest 访问 BAR
+    │
+    ├─ 访问 MSI-X 表区域 → msix_table_mmio (QEMU 模拟)
+    │    └─ 写 dev->msix_table 软件副本 → 触发 vfio_msix_vector_do_use()
+    │         └─ VFIO_DEVICE_SET_IRQS → 建立中断路由 (eventfd → KVM irq route → vCPU)
+    │
+    └─ 访问 BAR 其余区域 → mmap 直接到硬件
+```
+
+**QEMU 必须拦截 MSI-X 表写操作**，因为它要从中提取 vector 配置信息来建立中断路由。
+没有这个拦截，QEMU 不知道 guest 配了哪些 vector，也就无法调用 `VFIO_DEVICE_SET_IRQS`，
+中断到不了 guest。
+
+`vfio_pci_fixup_msix_region()` 的逻辑（`hw/vfio/pci.c:1530-1605`）：
+
+```c
+/* 有 MSIX_MAPPABLE 标记 → 不切分，整 BAR 保持一个 mmap */
+if (vfio_device_has_region_cap(&vdev->vbasedev, region->nr,
+                               VFIO_REGION_INFO_CAP_MSIX_MAPPABLE)) {
+    return;  /* 但 msix_table_mmio subregion 仍然会拦截 MSI-X 表区域 */
+}
+
+/* 无标记 → 切分 mmap，把 MSI-X 表页排除在外 */
+/* ... 三种情况：MSI-X 在头部 / 尾部 / 中间 ... */
+```
+
+##### `vfio-no-msix-emulation`：什么时候关掉模拟
+
+QEMU 提供了一个机器属性来禁用 MSI-X 表模拟：
+
+```bash
+-machine q35,vfio-no-msix-emulation=true
+```
+
+对应代码（`hw/vfio/pci.c:1848-1858`）：
+
+```c
+/*
+ * The emulated machine may provide a paravirt interface for MSIX setup
+ * so it is not strictly necessary to emulate MSIX here. This becomes
+ * helpful when frequently accessed MMIO registers are located in
+ * subpages adjacent to the MSIX table but the MSIX data containing page
+ * cannot be mapped because of a host page size bigger than the MSIX table
+ * alignment.
+ */
+if (object_property_get_bool(OBJECT(qdev_get_machine()),
+                             "vfio-no-msix-emulation", NULL)) {
+    memory_region_set_enabled(&vdev->pdev.msix_table_mmio, false);
+}
+```
+
+关掉模拟后，guest 对 MSI-X 表的写直接走 mmap 打到真实硬件。适用场景：
+
+| 场景 | 说明 |
+|------|------|
+| **半虚拟化中断** | guest 通过 hypercall 配置中断，不依赖硬件 MSI-X 表 |
+| **设备轮询模式** | 不用中断，MSI-X 表无人写入 |
+| **同页性能问题** | MSI-X 表与高频 MMIO 寄存器在同一页，模拟拖累性能（ARM 64KB 页尤为突出） |
+
+**标准 KVM 直通场景下不能关**——关了就没有中断路由。
+
+##### MSI-X Relocation：更干净的解法
+
+与其关掉模拟，不如把 MSI-X 表**搬到独立的 BAR**——原始 BAR 完整 mmap，新 BAR 专门模拟。
+
+QEMU 通过 `x-msix-relocation` 属性实现（`hw/vfio/pci.c:1607-1698`）：
+
+```bash
+-device vfio-pci,host=03:00.0,x-msix-relocation=bar5
+```
+
+Relocation 的两种模式：
+
+```c
+/* hw/vfio/pci.c:1670-1687 */
+if (!vdev->bars[target_bar].size) {
+    /* 模式 A: 目标 BAR 空闲 → 创建新 BAR，仅分配 MSI-X 所需空间 */
+    vdev->bars[target_bar].size = msix_sz;
+    vdev->bars[target_bar].mem64 = true;
+    vdev->bars[target_bar].type |= PCI_BASE_ADDRESS_MEM_PREFETCH;
+    vdev->msix->table_offset = 0;
+} else {
+    /* 模式 B: 目标 BAR 已有数据 → 扩展它，MSI-X 放后半段 */
+    vdev->bars[target_bar].size *= 2;
+    vdev->msix->table_offset = vdev->bars[target_bar].size / 2;
+}
+```
+
+Relocation 后的布局：
+
+```
+BAR 4 (原始):
+┌──────────────────────────────────────┐
+│            设备 MMIO 寄存器           │
+│         整 BAR 直接 mmap ✓           │  ← 无模拟，无切分
+└──────────────────────────────────────┘
+
+BAR 5 (新建/扩展):
+┌──────────────────────────────────────┐
+│  MSI-X table + PBA                   │
+│  全部走 QEMU 模拟 ✓                  │  ← 中断路由正常工作
+│  体积小，不影响性能关键路径             │
+└──────────────────────────────────────┘
+```
+
+与 `vfio-no-msix-emulation` 的本质区别：
+
+| | `vfio-no-msix-emulation` | MSI-X Relocation |
+|---|---|---|
+| **做法** | 关掉模拟，guest 直接写硬件 MSI-X 表 | 搬 MSI-X 到独立 BAR，原始 BAR 完整 mmap |
+| **中断处理** | QEMU 不再拦截，需要 paravirt 或不用中断 | **仍正常工作**（在新 BAR 上模拟） |
+| **安全要求** | 必须有 IR | 有无 IR 均可 |
+| **适用性** | 特定场景（paravirt / 轮询） | **通用** |
+
+Relocation 是更干净的解法——既解决了同页性能问题（尤其 ARM 大页场景），又不丢失中断功能。
+
 ---
 
 ## 🔍 DMA 映射详解
@@ -1358,6 +1623,63 @@ static bool vmx_can_use_vtd_pi(struct kvm *kvm)
 被筛掉的（多播、广播、多目标低优先级）会走 `posted_intr.c:338` 的
 `irq_set_vcpu_affinity(host_irq, NULL)` **退回 Remapped 模式**。
 所以一台机器上同一个设备的不同向量，完全可能一部分 Posted、一部分 Remapped。
+
+##### 两种不同的 Posted Interrupt：VT-d PI vs KVM-side PI
+
+> ⚠️ **容易混淆的点**：`vmx_can_use_vtd_pi()` 中有 `has_assigned_device` 条件，
+> 容易让人以为"没有直通设备就不能用 Posted Interrupt"。这是**错误**的理解。
+
+PI Descriptor 机制有**两种触发源**，共享同一套底层硬件（PIR→IRR 自动同步），但入口不同：
+
+| | **VT-d PI** (IOMMU 路径) | **KVM-side PI** (APICv 路径) |
+|---|---|---|
+| **谁写 PI Descriptor** | IOMMU 硬件直接写 | KVM 软件写 (`vmx_deliver_posted_interrupt`) |
+| **触发源** | 直通设备 MSI → IOMMU 拦截 | 任何中断源 → KVM APIC 模拟 |
+| **调用入口** | `vmx_pi_update_irte()` | `vmx_deliver_interrupt()` |
+| **需要 `has_assigned_device`** | ✅ 是（没有直通设备就没有 MSI 给 IOMMU） | ❌ 否 |
+| **需要的条件** | `vmx_can_use_vtd_pi()` 四条件全满足 | `apicv_active` |
+
+```
+中断来源 A: 直通设备 (VT-d PI)
+  设备 MSI → IOMMU → PI Descriptor ← IOMMU 硬件直接写
+                    ↑
+                    需要 vmx_can_use_vtd_pi() = true
+
+中断来源 B: 模拟设备 (KVM-side PI)
+  QEMU → kvm_set_irq() → APIC 模拟 → deliver_interrupt()
+                                        → vmx_deliver_posted_interrupt()
+                                        → PI Descriptor ← KVM 软件写
+                                          ↑
+                                          只需 apicv_active = true
+
+中断来源 C: vCPU 间 IPI (KVM-side PI)
+  kvm_apic_send_ipi() → deliver_interrupt() → vmx_deliver_posted_interrupt()
+```
+
+**`vmx_deliver_interrupt()`** 注册为 `kvm_x86_ops.deliver_interrupt`，由
+`lapic.c:1352` 的 `kvm_x86_call(deliver_interrupt)()` 调用。这意味着 **KVM 侧的
+PI Descriptor 机制对所有中断源都可用**——包括模拟设备、IPI 等，不限于直通设备。
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:4299 */
+void vmx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+                           int trig_mode, int vector)
+{
+    if (vmx_deliver_posted_interrupt(vcpu, vector)) {
+        /* Posted 失败 → 退回传统路径 */
+        kvm_lapic_set_irr(vector, apic);
+        kvm_make_request(KVM_REQ_EVENT, vcpu);
+        kvm_vcpu_kick(vcpu);
+    }
+}
+```
+
+`vmx_deliver_posted_interrupt()` 只检查 `apicv_active`，**不检查 `has_assigned_device`**。
+所以即使纯模拟 VM，只要 APICv 开启，中断也能走 PI Descriptor 路径减少 VM-Exit。
+
+**总结**：`has_assigned_device` 只影响 **IOMMU 直接 posted**（VT-d PI 路径），
+不影响 **KVM 自己写 PI Descriptor**（KVM-side PI 路径）。两者共享 PI Descriptor
+结构和 PIR→IRR 硬件同步机制，但触发源和门控条件不同。
 
 #### 实测：一个向量的 IRTE 前后对比
 
