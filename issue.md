@@ -144,7 +144,7 @@
 
 
 ## VFIO
-1. IOMMU 组是怎么划出来的?（→ phase5-vfio/README.md 1.4）
+1. IOMMU 组是怎么划出来的?（→ phase6-vfio/README.md 1.4）
 2. 内核注释说「单功能端点不需要支持 ACS，因为它们没有 peer-to-peer 通路」，
    但 GDR 的 GPU 和 RDMA 网卡恰恰就是单功能端点且真的在走 P2P，怎么解释？
    （→ 1.4.2：ACS 是交换机属性的能力，端点没有第二个口、问它问不出信息；

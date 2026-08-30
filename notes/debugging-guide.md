@@ -2,21 +2,21 @@
 
 > 面向VMM专家的KVM内核态调试技巧
 >
-> **本文是快速参考卡片**，完整的调试参考手册见 [`phase9-debugging/annotations.md`](../phase9-debugging/annotations.md)
+> **本文是快速参考卡片**，完整的调试参考手册见 [`phase10-debugging/annotations.md`](../phase10-debugging/annotations.md)
 > （包含完整的 trace events 目录、selftests 框架、bpftrace 脚本集等）
 
 ---
 
-## 📖 本指南 vs phase9-debugging
+## 📖 本指南 vs phase10-debugging
 
-| 本指南 (debugging-guide.md) | phase9-debugging |
+| 本指南 (debugging-guide.md) | phase10-debugging |
 |----------------------------|------------------|
 | 快速参考卡片 | 完整参考手册 |
 | 常用命令速查 | trace events 完整目录 |
 | 典型问题处理 | 调试场景决策树 |
 | 现场排查技巧 | selftests + bpftrace |
 
-**建议**: 先看本指南快速上手，遇到问题再查阅 phase9-debugging 获取详细参考
+**建议**: 先看本指南快速上手，遇到问题再查阅 phase10-debugging 获取详细参考
 
 ---
 

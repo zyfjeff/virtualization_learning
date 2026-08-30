@@ -56,13 +56,19 @@ kvm-study/
 │   ├── mmio-identification.md   ← ★ MMIO 识别与 IPAT（含核查报告）
 │   ├── practice/                ← 2 个 C 练习程序（make 构建）
 │   └── archive/                 ← 已归档的过程性文档
-├── phase3-interrupts/           ← 第三阶段：中断虚拟化 + VT-d中断重映射
+├── phase3-iommu/                ← 第三阶段：IOMMU 层（phase6 VFIO 的地基）
+│   ├── README.md                ← 框架 + 概念 + 主流程 + 8 问清单
+│   ├── translation/…/backends.md← 8 篇问题深入文档
+│   ├── annotations.md           ← 源码注释
+│   ├── corrections.md           ← 勘误
+│   └── practice/                ← 4 个实验 + 引用核查脚本
+├── phase4-interrupts/           ← 第四阶段：中断虚拟化 + VT-d中断重映射
 │   ├── README.md                ← 技术全景 + 中断路径 + 数据结构速览
 │   ├── annotations.md           ← pi_desc + IRTE + PIR→IRR + PI调度
 │   ├── posted-interrupts.md     ← ★ Posted 模式系统深入
 │   ├── msi-affinity-migration.md← ★ MSI 地址格式与亲和性迁移
 │   └── practice/                ← 6 个实验脚本 + PI 演示内核模块
-├── phase4-virtio/               ← 第四阶段：virtio / vhost / vhost-user
+├── phase5-virtio/               ← 第五阶段：virtio / vhost / vhost-user
 │   ├── README.md                ← 为什么需要vhost + 源码路线 + 本章文件导航
 │   ├── annotations.md           ← vhost源码注释
 │   ├── virtio-queue.md          ← ★ Virtqueue 深度解析
@@ -74,27 +80,29 @@ kvm-study/
 │   ├── vhost-user-new-features-usecases.md  ← 新特性使用场景
 │   ├── practice/                ← 全部练习与实测数据
 │   └── archive/                 ← 已被取代的过程性文档
-├── phase5-vfio/                 ← 第五阶段：VFIO设备直通
-│   ├── README.md                ← VMM对比 + IOTLB/DMA批处理优化
-│   └── annotations.md
-├── phase6-timer-virt/           ← 第六阶段：时钟虚拟化
-│   ├── README.md                ← VMM对比 + TSC-deadline/kvmclock优化
-│   └── annotations.md           ← 源码级注释
-├── phase7-projects/             ← 第七阶段：综合实践项目
-│   ├── vm-lifecycle-trace.md    ← 项目1: VM生命周期
-│   ├── ept-performance.md       ← 项目2: EPT性能
-│   ├── virtio-analysis.md       ← ★ 项目3: vhost性能分析
-│   ├── vfio-latency.md          ← 项目4: VFIO延迟
-│   ├── irq-path-trace.md        ← 项目5: 中断路径
-│   ├── timer-performance.md     ← 项目6: 时钟性能
-│   └── cpu-virtualization.md    ← 项目7: CPU虚拟化
-├── phase8-performance/          ← ★ 第八阶段：KVM性能优化深入 (新增!)
+├── phase6-vfio/                 ← 第六阶段：VFIO设备直通
+│   ├── README.md                ← VMM对比 + ACS/ATS + IOTLB/DMA批处理优化
+│   ├── corrections.md           ← 勘误
+│   └── practice/                ← VFIO 认领/DMA映射/MSI-X 实测练习
+├── phase7-timer-virt/           ← 第七阶段：时钟虚拟化
+│   ├── README.md                ← VMM对比 + TSC-deadline/kvmclock优化 + 概念区分
+│   ├── annotations.md           ← 源码级注释
+│   ├── corrections.md           ← 勘误
+│   └── practice/                ← 3 个可运行实验（TSC/kvmclock/LAPIC Timer）
+├── phase8-capstone/             ← ★ 第八阶段：毕业建造——最小 VMM
+│   ├── README.md                ← 定位 + 项目阶梯 + 验收标准
+│   ├── project1-minivmm-boot.md ← ★ 可启动最小 VMM（bzImage 引导）
+│   ├── project2-minivmm-virtio.md← 自制 virtio-mmio 设备
+│   ├── project3-minivmm-vfio.md ← VFIO 直通进自己的 VMM
+│   └── project4-minivmm-bench.md← 与 QEMU/Firecracker 性能对标
+├── phase9-performance/          ← 第九阶段：KVM性能优化深入
 │   ├── README.md                ← 性能优化概览 + 调优参数
-│   └── annotations.md           ← halt-polling/VPID/APICv/PLE源码注释
-├── phase9-debugging/            ← ★ 第九阶段：KVM调试与测试 (新增!)
+│   ├── annotations.md           ← halt-polling/VPID/APICv/PLE源码注释
+│   └── practice/                ← EPT/时钟性能测量方法
+├── phase10-debugging/           ← 第十阶段：KVM调试与测试
 │   ├── README.md                ← 调试场景速查 + 决策树
 │   └── annotations.md           ← trace events目录 + selftests + bpftrace
-├── phase10-microvm/             ← ★ 第十阶段：MicroVM架构专项 (新增!)
+├── phase11-microvm/             ← 第十一阶段：MicroVM架构专项
 │   ├── README.md                ← MicroVM技术栈全景
 │   └── annotations.md           ← 启动路径/设备模型/安全模型/guest_memfd
 ├── examples/                    ← 可运行示例代码 (★ 重点!)
@@ -103,6 +111,11 @@ kvm-study/
 │   │   ├── kvm-demo-regs.c      ← ★ 寄存器操作演示 (make && ./kvm-demo-regs)
 │   │   ├── Makefile
 │   │   └── README.md
+│   ├── mini-kvm/                ← ★★ 实战项目: 简化版 KVM 内核模块实现
+│   │   ├── mini-kvm.c           ← 内核模块主代码
+│   │   ├── test-mini-kvm.c      ← 用户空间测试程序
+│   │   ├── Makefile
+│   │   └── stages/              ← 分阶段学习指南 (stage1-5)
 │   ├── minimal-vmx/             ← 最小VMX内核模块
 │   │   ├── vmx-info/            ← ★ VMX能力检测 (安全,不会崩溃)
 │   │   │   └── vmx-info.c
@@ -116,18 +129,6 @@ kvm-study/
 │       ├── trace-vfio-dma.bpf   ← VFIO DMA追踪
 │       ├── kvm-overview.bpf     ← KVM综合概览
 │       └── README.md
-├── mini-kvm/                  ← ★★ 实战项目: 简化版 KVM 实现 (新增!)
-│   ├── README.md                ← 项目说明 + 学习路径
-│   ├── mini-kvm.c               ← 内核模块主代码 (725 行)
-│   ├── mini-kvm.h               ← 内部头文件 (数据结构 + VMCS 编码)
-│   ├── test-mini-kvm.c          ← 用户空间测试程序
-│   ├── Makefile                 ← 构建脚本
-│   └── stages/                  ← 分阶段学习指南
-│       ├── stage1-vmx.md        ← Stage 1: VMX 基础 (对应 Phase 1)
-│       ├── stage2-ept.md        ← Stage 2: EPT 内存虚拟化 (对应 Phase 2)
-│       ├── stage3-interrupt.md  ← Stage 3: 中断注入 (对应 Phase 3)
-│       ├── stage4-device.md     ← Stage 4: 设备模拟 (对应 Phase 4-5)
-│       └── stage5-runloop.md    ← Stage 5: 运行循环 (对应 Phase 0, 8)
 └── scripts/                     ← 构建并启动实验 VM
     ├── README.md                ← ★ 实验环境唯一入口文档
     ├── vm/                      ← 构建与启动
@@ -208,22 +209,28 @@ sudo bpftrace examples/bpf-programs/trace-vmexit.bpf
 | 0 | ★ KVM框架层 | 1-2周 | kvm_main.c, x86.c | ✓ | kvm-demo |
 | 1 | VT-x + CPU虚拟化 | 1-2周 | vmx.c, cpuid.c, x86.c | ✓ | vmx-info.ko |
 | 2 | 内存虚拟化(EPT) | 2-3周 | mmu.c, tdp_mmu.c, spte.c | ✓ | trace-ept-faults.bpf |
-| 3 | 中断虚拟化 + VT-d IR | 2-3周 | lapic.c, posted_intr.c, irq_remapping.c | ✓ | trace-irq-latency.bpf |
-| 4 | ★ vhost内核态加速 | 1周 | vhost.c, net.c | ✓ | iperf3+vhost |
-| 5 | VFIO设备直通 | 2-3周 | vfio_main.c, vfio_pci_core.c | ✓ | trace-vfio-dma.bpf |
-| 6 | 时钟虚拟化 | 1周 | i8254.c, lapic.c(timer), x86.c(kvmclock) | ✓ | cyclictest对比 |
-| 7 | 综合实践 | 持续 | 全部 | - | 7个综合项目 |
-| 8 | ★ KVM性能优化深入 | 1-2周 | kvm_main.c(halt_poll), vmx.c(PLE) | ✓ | perf kvm stat |
-| 9 | ★ KVM调试与测试 | 1周 | trace.h, selftests/ | - | bpftrace 脚本集 |
-| 10 | ★ MicroVM架构专项 | 1-2周 | guest_memfd.c, nested.c | ✓ | Firecracker/Cloud Hypervisor |
+| 3 | ★ IOMMU 层（phase6 的地基） | 2-3周 | iommu.c, intel/iommu.c, dma-iommu.c | ✓ | iommu-analysis.sh |
+| 4 | 中断虚拟化 + VT-d IR | 2-3周 | lapic.c, posted_intr.c, irq_remapping.c | ✓ | trace-irq-latency.bpf |
+| 5 | ★ vhost内核态加速 | 1周 | vhost.c, net.c | ✓ | iperf3+vhost |
+| 6 | VFIO设备直通 | 2-3周 | vfio_main.c, vfio_pci_core.c | ✓ | trace-vfio-dma.bpf |
+| 7 | 时钟虚拟化 | 1周 | i8254.c, lapic.c(timer), x86.c(kvmclock) | ✓ | 3 个 practice 实验 |
+| 8 | ★ 毕业建造：最小 VMM | 持续 | 全部（KVM API 综合） | - | kvm-api-demo 起步 |
+| 9 | ★ KVM性能优化深入 | 1-2周 | kvm_main.c(halt_poll), vmx.c(PLE) | ✓ | perf kvm stat |
+| 10 | ★ KVM调试与测试 | 1周 | trace.h, selftests/ | - | bpftrace 脚本集 |
+| 11 | ★ MicroVM架构专项 | 1-2周 | guest_memfd.c, nested.c | ✓ | Firecracker/Cloud Hypervisor |
+
+> 建议阅读顺序（子系统间依赖）：phase2 → **phase3(IOMMU)** → phase4 → phase6；
+> phase3 同时是 phase6(VFIO) 的地基。phase8 毕业建造建议放在 0-7 之后。
 
 **新增特性**：
 - ✓ 每章包含VMM视角对比，帮助理解KVM设计决策
 - ✓ 每章包含性能优化技术，指导实际调优
 - ✓ 每章包含常见陷阱，避免踩坑
-- ✓ ★ 性能优化专题 (phase8): halt-polling/PLE/VPID 源码级分析
-- ✓ ★ 调试与测试专题 (phase9): 完整 trace events 目录 + selftests + bpftrace
-- ✓ ★ MicroVM架构专项 (phase10): guest_memfd/jailer/启动路径优化
+- ✓ ★ IOMMU 专题 (phase3)：与 EPT 同一心智模型，8 问深入 + 三后端对照
+- ✓ ★ 毕业建造 (phase8)：从裸 KVM API 写可启动最小 VMM，逐级加 virtio/VFIO/性能对标
+- ✓ ★ 性能优化专题 (phase9): halt-polling/PLE/VPID 源码级分析
+- ✓ ★ 调试与测试专题 (phase10): 完整 trace events 目录 + selftests + bpftrace
+- ✓ ★ MicroVM架构专项 (phase11): guest_memfd/jailer/启动路径优化
 - ✓ 配套KVM调试实战指南 (`notes/debugging-guide.md`)
 - ✓ 所有 trace events 和函数行号均基于 6.12.93 实际源码验证
 

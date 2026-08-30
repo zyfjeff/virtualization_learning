@@ -1,6 +1,6 @@
 # Mini-KVM：循序渐进实现一个简化版 KVM
 
-> 伴随 Phase 0-10 课程，渐进式实现一个可运行的简化版 KVM 内核模块
+> 伴随 Phase 0-11 课程，渐进式实现一个可运行的简化版 KVM 内核模块
 >
 > 基于 Linux 6.12.93 内核
 
@@ -13,9 +13,9 @@
 - **KVM 如何管理 VM 和 vCPU** (对应 Phase 0)
 - **VMX 硬件如何执行 VM-Entry/Exit** (对应 Phase 1)
 - **EPT 如何实现内存虚拟化** (对应 Phase 2)
-- **中断如何注入到 Guest** (对应 Phase 3)
-- **设备如何被模拟** (对应 Phase 4-5)
-- **性能优化如何生效** (对应 Phase 8)
+- **中断如何注入到 Guest** (对应 Phase 4)
+- **设备如何被模拟** (对应 Phase 5-6)
+- **性能优化如何生效** (对应 Phase 9)
 
 最终得到一个**可实际加载运行**的内核模块，能：
 - 创建并运行一个极简的 Guest (执行 "Hello from Guest!" 串口输出)
@@ -40,17 +40,17 @@ Stage 2: 内存虚拟化 (Phase 2)
   ├── 内存分配: 为 Guest 分配物理页
   └── EPT Violation 处理: 按需映射
 
-Stage 3: 中断处理 (Phase 3)
+Stage 3: 中断处理 (Phase 4)
   ├── 虚拟 LAPIC: 简化版本地中断控制器
   ├── 中断注入: 通过 VMCS 注入外部中断
   └── NMI/异常: 处理非屏蔽中断
 
-Stage 4: 设备模拟 (Phase 4-5)
+Stage 4: 设备模拟 (Phase 5-6)
   ├── PIO 处理: IO_INSTRUCTION VM-Exit
   ├── MMIO 处理: EPT Violation 触发
   └── 串口模拟: 0x3f8 端口输出 "Hello"
 
-Stage 5: 运行循环 (Phase 0, 8)
+Stage 5: 运行循环 (Phase 0, 9)
   ├── vcpu_run: 主运行循环
   ├── Exit 分发: 根据 exit_reason 处理
   ├── halt-polling: 简化版 polling
@@ -246,9 +246,9 @@ handle_io(vcpu)
 |-----------|-----------|---------|
 | Stage 1: VMX 基础 | Phase 1 | vmx_vcpu_run, vmx_handle_exit |
 | Stage 2: EPT 内存 | Phase 2 | kvm_tdp_mmu_map, make_spte |
-| Stage 3: 中断处理 | Phase 3 | vmx_inject_irq, vmx_sync_pir_to_irr |
-| Stage 4: 设备模拟 | Phase 4-5 | handle_io, handle_mmio |
-| Stage 5: 运行循环 | Phase 0, 8 | vcpu_run, halt-polling |
+| Stage 3: 中断处理 | Phase 4 | vmx_inject_irq, vmx_sync_pir_to_irr |
+| Stage 4: 设备模拟 | Phase 5-6 | handle_io, handle_mmio |
+| Stage 5: 运行循环 | Phase 0, 9 | vcpu_run, halt-polling |
 
 ---
 

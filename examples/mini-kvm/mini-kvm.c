@@ -3,7 +3,7 @@
  * mini-kvm.c - 简化版 KVM 内核模块
  *
  * 教学项目：循序渐进实现一个简化版 KVM
- * 对应课程：Phase 0-10 (kvm-study/phase*)
+ * 对应课程：Phase 0-11 (kvm-study/phase*)
  *
  * 本模块实现：
  *   Stage 1: VMX 基础 - VMXON, VMCS, VM-Entry
@@ -534,7 +534,7 @@ int mini_kvm_ept_map_page(struct mini_kvm *kvm, u64 gpa, u64 hpa)
  * Stage 5: VM-Exit 处理与运行循环
  * ============================================================================
  *
- * 对应课程：Phase 0 (KVM framework) + Phase 8 (性能优化)
+ * 对应课程：Phase 0 (KVM framework) + Phase 9 (性能优化)
  * 关键源码：arch/x86/kvm/x86.c::vcpu_run()
  *           arch/x86/kvm/vmx/vmx.c::vmx_handle_exit()
  *           arch/x86/kvm/vmx/vmx.c::handle_pause()

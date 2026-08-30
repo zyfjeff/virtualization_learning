@@ -208,7 +208,7 @@ Rootfs:  Busybox (initramfs, 1.1 MB)
 - GPA → HPA 地址转换
 - 大页支持（2MB/1GB）
 
-### Phase 3: 中断虚拟化
+### Phase 4: 中断虚拟化
 - 虚拟 LAPIC/IOAPIC
 - APICv 机制
 - Posted Interrupts
@@ -232,7 +232,7 @@ Rootfs:  Busybox (initramfs, 1.1 MB)
 - 拦截指令：~1500 ns
 - 性能差异：150 倍
 
-**测试环境**：完全可用，可以继续进行 Phase 2-10 的学习和测试。
+**测试环境**：完全可用，可以继续进行 Phase 2-11 的学习和测试。
 
 ---
 

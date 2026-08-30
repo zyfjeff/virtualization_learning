@@ -66,9 +66,9 @@ ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm   # > 0 表示走
 | `build-rootfs-ubuntu.sh` | Ubuntu rootfs（推荐） | 5-10 分钟 | debootstrap（需联网） |
 | `build-rootfs-allinone.sh` | busybox + 宿主机测试工具 | 1-2 分钟 | busybox-static |
 | `build-rootfs-minimal.sh` | 最小 busybox initramfs | < 1 分钟 | busybox-static, cpio |
-| `build-rootfs-iperf.sh` | 网络性能专用（phase4） | 1-2 分钟 | busybox-static, iperf3 |
+| `build-rootfs-iperf.sh` | 网络性能专用（phase5） | 1-2 分钟 | busybox-static, iperf3 |
 | `boot-vm.sh` | 启动实验 VM | - | qemu-system-x86 |
-| `setup-vfio-vm.sh` | 带 VFIO 设备直通的 VM（phase3/phase5） | - | qemu, vfio-pci |
+| `setup-vfio-vm.sh` | 带 VFIO 设备直通的 VM（phase4/phase6） | - | qemu, vfio-pci |
 | `test-in-vm.sh` | VM 内跑的测试脚本 | - | - |
 
 安装依赖：
@@ -222,6 +222,6 @@ zcat images/initramfs-allinone.img | cpio -t | grep '^init$'
 
 ## 参考
 
-- [Phase 4 virtio 实验](../phase4-virtio/README.md)
+- [Phase 5 virtio 实验](../phase5-virtio/README.md)
 - [Virtio 规范](https://docs.oasis-open.org/virtio/virtio/v1.1/virtio-v1.1.html)
 - [QEMU 文档](https://www.qemu.org/docs/master/)

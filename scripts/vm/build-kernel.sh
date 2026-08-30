@@ -12,7 +12,7 @@
 #   ../images/bzImage - 内核镜像
 #   ../images/System.map - 符号表（用于调试）
 #
-# 对应课程: Phase 0-10 所有测试
+# 对应课程: Phase 0-11 所有测试
 
 set -e
 

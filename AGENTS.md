@@ -10,14 +10,15 @@
 phase0-kvm-framework/   KVM 框架层
 phase1-vtx-basics/      VT-x + CPU 虚拟化
 phase2-mem-virt/        内存虚拟化 (EPT/TDP MMU)
-phase3-interrupts/      中断虚拟化 + VT-d IR
-phase4-virtio/          virtio / vhost / vhost-user
-phase5-vfio/            VFIO 设备直通
-phase6-timer-virt/      时钟虚拟化
-phase7-projects/        综合实践
-phase8-performance/     性能优化
-phase9-debugging/       调试与测试
-phase10-microvm/        MicroVM 架构
+phase3-iommu/           IOMMU 层 (phase6 VFIO 的地基)
+phase4-interrupts/      中断虚拟化 + VT-d IR
+phase5-virtio/          virtio / vhost / vhost-user
+phase6-vfio/            VFIO 设备直通
+phase7-timer-virt/      时钟虚拟化
+phase8-capstone/        毕业建造：最小 VMM
+phase9-performance/     性能优化
+phase10-debugging/       调试与测试
+phase11-microvm/        MicroVM 架构
 examples/  notes/  scripts/  shared/
 ```
 
@@ -51,7 +52,7 @@ examples/  notes/  scripts/  shared/
 | ARM SMMU v3 规范 | `arm-smmuv3.pdf` | ARM SMMUv3 架构、Stage-1/2 翻译、STE/CD 格式、CMDQ 命令 |
 | PCIe Base 规范 | `pcie-base-spec-r6.0.pdf` | PCIe 6.0、TLP/DLLP、ACS/ATS/AER、MSI/MSI-X、配置空间 |
 
-已有文档大多以 QEMU 10.1.0-rc2 为基线；phase4 的 `vhost-user-new-features-factcheck-v2.md` 与 `-usecases.md` 基于 11.1.0 + DPDK。**引用时必须写明版本**，两个版本行为不一致时说明差异。
+已有文档大多以 QEMU 10.1.0-rc2 为基线；phase5 的 `vhost-user-new-features-factcheck-v2.md` 与 `-usecases.md` 基于 11.1.0 + DPDK。**引用时必须写明版本**，两个版本行为不一致时说明差异。
 
 核查流程：
 
@@ -81,7 +82,7 @@ examples/  notes/  scripts/  shared/
 11. **ACS 判定：`ACSCap` 里的 `-` 不算失败** — `pci_acs_flags_enabled()` 先按设备声明的 `ACSCap` 掩掉要求集（`drivers/pci/pci.c:3598`，`acs_flags &= (cap | PCI_ACS_EC)`），**没声明的能力被当作硬连线已启用**。只有「Cap 里有、Ctl 里没开」才算不通过。另外 `REQ_ACS_FLAGS` 只含 SV/RR/CR/UF（`drivers/iommu/iommu.c:1383`），`TransBlk-` / `EgressCtrl-` 与判定无关。更靠前的一层是 **quirk**：`pci_acs_enabled()` 开头先调 `pci_dev_specific_acs_enabled()`（`drivers/pci/pci.c:3624`），命中就直接定论、PCIe 类型判断根本不执行。x86 上 `{ PCI_VENDOR_ID_INTEL, PCI_ANY_ID, pci_quirk_rciep_acs }`（`drivers/pci/quirks.c:5122`）把**所有 Intel RCiEP** 判成隔离成立，即使它们没有 ACS capability —— 分析 Intel 平台的分组结果时必须先查这一层。
 12. **`pci_enable_acs()` 的 quirk 判据是反的** — 源码写的是 `if (pci_dev_specific_enable_acs(dev)) enable_acs = true;`（`drivers/pci/pci.c:1083`，外面还包着一层 `if (pci_acs_enable)` @ `:1082`）。`pci_dev_specific_enable_acs()` 命中 quirk 时返回 **0**、没命中返回 **-ENOTTY**（`drivers/pci/quirks.c:5438`），所以**「没有 quirk」才会走标准写入**，命中 quirk 反而跳过（quirk 自己写过寄存器了）。照返回值字面猜方向会得出完全相反的结论。另外 `pos = dev->acs_cap; if (!pos) return;`（`:1087-1089`）意味着没有 ACS capability 的设备根本走不到标准写入。
 13. **ACS 不是只读的，真有内核参数能改它** — 与「ACS 是硬件能力、没法用参数打开」这句流传的话相反：检测到 IOMMU 时 `pci_request_acs()`（`drivers/iommu/intel/dmar.c:935` 调用）会让 `pci_acs_init()` → `pci_std_enable_acs()`（`drivers/pci/pci.c:1052`）在每次 probe 时**主动写 `ACS Control`**（SV/RR/CR/UF 按 cap 掩码全开；`TB` 只给 `external_facing` / `untrusted` 设备或 `pci=noats`），复位恢复路径 `pci_restore_state()`（`:1963`）还会再写一次。上游真实存在的两个参数是 `pci=disable_acs_redir=`（`Documentation/admin-guide/kernel-parameters.txt:4657`，文档自己标注 "this **removes** isolation"）与 `pci=config_acs=`（`:4666`，"this **may remove** isolation"）；`pcie_acs_override=` 仍然不是上游代码。**`config_acs` 的标志串是从右往左解析的**（`__pci_config_acs()` 的 `end = delimit - p - 1` / `end--`，`pci.c:976-997`），文档示例 `pci=config_acs=10x` 表示的是「RR 开、TB 关、SV 不动」，从左往右读会配反。
-14. **ATS 的三个命名与时序坑** — (a) `STU` 是 **Smallest Translation Unit**，不是缓存粒度；寄存器里存的是位移量之差（`drivers/pci/ats.c:115`：`PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU)`，`PCI_ATS_MIN_STU`=12），字段值 `n` 表示 2^(12+n) 字节。(b) `PCI_ATS_CAP` 的 Page Aligned Request 在 **bit5**（`0x0020`，`include/uapi/linux/pci_regs.h`），不是 bit15。(c) Invalidate Queue Depth 的 `0` 有两种身份，别混：寄存器字段值 `0` 按 ATS spec 表示「可收 32 个 Invalidate Request」，`pci_ats_queue_depth()` 因此对 PF 返回 `PCI_ATS_MAX_QDEP` = 32（`ats.c:179`）；而**返回值** `0` 表示「该 function 不独占失效队列」，VF 走的就是这条路（`ats.c:175-176`：`if (dev->is_virtfn) return 0;`）。(d) VT-d spec Section 4.5.2 的关闭时序（quiesce → 清 `E` → global Device-TLB Invalidate + Wait → 改 context entry）用词是 "Recommended / should"，**Linux 的实现把第 3、4 步调换了**：`device_block_translation()`（`drivers/iommu/intel/iommu.c:3394`）在 `:3407` 清 `E`、`:3413` 清 context entry，Device-TLB 失效推迟到 `__context_flush_dev_iotlb()`（`pasid.c:885`），而它开头就有 `if (!info->ats_enabled) return;` —— 写文档时不要说成「Linux 严格按规范顺序做」。详见 [phase5 1.5](phase5-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力)。
+14. **ATS 的三个命名与时序坑** — (a) `STU` 是 **Smallest Translation Unit**，不是缓存粒度；寄存器里存的是位移量之差（`drivers/pci/ats.c:115`：`PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU)`，`PCI_ATS_MIN_STU`=12），字段值 `n` 表示 2^(12+n) 字节。(b) `PCI_ATS_CAP` 的 Page Aligned Request 在 **bit5**（`0x0020`，`include/uapi/linux/pci_regs.h`），不是 bit15。(c) Invalidate Queue Depth 的 `0` 有两种身份，别混：寄存器字段值 `0` 按 ATS spec 表示「可收 32 个 Invalidate Request」，`pci_ats_queue_depth()` 因此对 PF 返回 `PCI_ATS_MAX_QDEP` = 32（`ats.c:179`）；而**返回值** `0` 表示「该 function 不独占失效队列」，VF 走的就是这条路（`ats.c:175-176`：`if (dev->is_virtfn) return 0;`）。(d) VT-d spec Section 4.5.2 的关闭时序（quiesce → 清 `E` → global Device-TLB Invalidate + Wait → 改 context entry）用词是 "Recommended / should"，**Linux 的实现把第 3、4 步调换了**：`device_block_translation()`（`drivers/iommu/intel/iommu.c:3394`）在 `:3407` 清 `E`、`:3413` 清 context entry，Device-TLB 失效推迟到 `__context_flush_dev_iotlb()`（`pasid.c:885`），而它开头就有 `if (!info->ats_enabled) return;` —— 写文档时不要说成「Linux 严格按规范顺序做」。详见 [phase6 1.5](phase6-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力)。
 
 ## 文档规范
 

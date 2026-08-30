@@ -1,6 +1,6 @@
 # Stage 4: 设备模拟
 
-> 对应课程 Phase 4-5: vhost + VFIO
+> 对应课程 Phase 5-6: vhost + VFIO
 >
 > 关键源码: `arch/x86/kvm/vmx/vmx.c::handle_io()`
 >           `arch/x86/kvm/vmx/vmx.c::handle_ept_violation()` (MMIO)

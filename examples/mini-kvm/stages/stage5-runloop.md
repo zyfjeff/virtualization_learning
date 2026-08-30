@@ -1,6 +1,6 @@
 # Stage 5: 运行循环与优化
 
-> 对应课程 Phase 0, 8: KVM Framework + Performance Optimization
+> 对应课程 Phase 0, 9: KVM Framework + Performance Optimization
 >
 > 关键源码: `arch/x86/kvm/x86.c::vcpu_run()`
 >           `arch/x86/kvm/x86.c::vcpu_enter_guest()`

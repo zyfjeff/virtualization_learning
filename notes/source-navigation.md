@@ -226,7 +226,7 @@ mmio_caching=1         ← MMIO缓存
 
 ---
 
-## ★ Phase 8: 性能优化相关源码
+## ★ Phase 9: 性能优化相关源码
 
 ### halt-polling
 ```
@@ -262,7 +262,7 @@ arch/x86/kvm/trace.h          ← kvm_track_tsc, kvm_write_tsc_offset trace even
 
 ---
 
-## ★ Phase 9: 调试与测试相关源码
+## ★ Phase 10: 调试与测试相关源码
 
 ### Trace Events 定义位置
 ```
@@ -297,7 +297,7 @@ tools/testing/selftests/kvm/   ← 完整测试框架目录
 
 ---
 
-## ★ Phase 10: MicroVM 相关源码
+## ★ Phase 11: MicroVM 相关源码
 
 ### VM 创建启动路径
 ```

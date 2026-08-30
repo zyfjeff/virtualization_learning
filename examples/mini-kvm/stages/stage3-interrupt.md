@@ -1,6 +1,6 @@
 # Stage 3: 中断处理
 
-> 对应课程 Phase 3: Interrupts (APIC, Posted Interrupts)
+> 对应课程 Phase 4: Interrupts (APIC, Posted Interrupts)
 >
 > 关键源码: `arch/x86/kvm/lapic.c`
 >           `arch/x86/kvm/vmx/posted_intr.c`
