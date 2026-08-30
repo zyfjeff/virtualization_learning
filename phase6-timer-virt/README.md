@@ -7,14 +7,248 @@
 
 ---
 
+## 📂 本章文件
+
+| 文件 | 内容 |
+|------|------|
+| `README.md` | 本文件：概念 → 硬件时钟源全景 → KVM 各时钟虚拟化详解 → 实践练习 → 陷阱 |
+| [`annotations.md`](annotations.md) | 源码精读：PIT / APIC Timer / TSC / kvmclock / Timer Advance 关键代码逐段注释（引用均逐条核对） |
+| [`corrections.md`](corrections.md) | 勘误：对本章旧版（及写作过程中）发现的错误的逐条更正与源码依据 |
+| [`practice/`](practice/README.md) | 动手实验：3 个基于 KVM API 的 C 程序（TSC scaling / kvmclock / LAPIC Timer） |
+
+---
+
 ## 📋 学习目标
 
 完成本章节后，你应该能够：
-1. 画出 x86 平台所有时钟源的演进关系图
-2. 理解 KVM 如何虚拟化每种时钟（PIT / APIC Timer / TSC / kvmclock）
-3. 掌握 TSC Offset 和 TSC Scaling 在 VMCS 中的工作方式
-4. 理解 TSC-deadline 模式为什么是最高效的定时器
-5. 解释 Guest 迁移后时间跳变的原因和解决方法
+1. 区分 Linux 各类时钟（REALTIME / MONOTONIC / BOOTTIME / MONOTONIC_RAW）及其受时间调整的影响
+2. 区分 **clocksource 与 clockevent** 两个子系统，解释为什么 TSC 是前者、
+   TSC-deadline（LAPIC timer 的一种模式）是后者
+3. 画出 x86 平台时钟设备的演进与归属关系
+4. 理解 KVM 如何虚拟化每种时钟（PIT / APIC Timer / TSC / kvmclock）
+5. 掌握 TSC Offset 和 TSC Scaling 在 VMCS 中的工作方式
+6. 理解 TSC-deadline 为什么是最高效的定时器（从 clockevent 编程成本角度）
+7. 对比 `tsc` 与 `kvm-clock` 两个 clocksource 的差异、优缺点与选型逻辑（rating 让位）
+8. 解释 VM 启动时三个时间基准（kvmclock 纪元 / guest TSC / masterclock）的首次同步
+9. 解释 PTP KVM 如何实现亚微秒级墙上时间同步
+10. 解释 Guest 迁移后时间跳变的原因和解决方法
+
+---
+
+## 🕰️ Linux 时钟系统基本概念
+
+> 理解时钟虚拟化之前，必须先理解 Linux 内核管理时间的数据结构。
+> 所有 KVM 时钟机制（kvmclock、wall_clock、ptp_kvm）都是对这套体系在虚拟化场景下的映射。
+
+### 内核核心数据结构：`struct timekeeper`
+
+```c
+/* kernel/time/timekeeping.c (简化) */
+struct timekeeper {
+    /* 共享同一个 clocksource (通常是 TSC) */
+    struct tk_read_base tkr_mono;   /* 用于 REALTIME + MONOTONIC */
+    struct tk_read_base tkr_raw;    /* 用于 MONOTONIC_RAW */
+
+    u64         xtime_sec;          /* REALTIME 的秒部分 */
+    struct timespec64 wall_to_monotonic; /* REALTIME 与 MONOTONIC 的偏移 */
+
+    ktime_t     offs_real;          /* = -wall_to_monotonic */
+    ktime_t     offs_mono;          /* = 0 (monotonic 从 boot 起算) */
+    ktime_t     offs_boot;          /* 挂起时间累积 */
+    ktime_t     offs_tai;           /* = offs_real + tai_offset */
+};
+```
+
+### 各时钟的关系
+
+```
+                          clocksource (TSC)
+                               │
+                    ┌──────────┼──────────────┐
+                    ▼          ▼              ▼
+                tkr_mono    tkr_raw      (同一个硬件计数器)
+              mult + shift  raw_mult
+                    │          │
+          ┌─────────┤          │
+          ▼         ▼          ▼
+    ┌──────────┐ ┌──────┐ ┌─────────────┐
+    │ REALTIME │ │MONO  │ │ MONOTONIC   │
+    │ (墙上时间)│ │      │ │ _RAW        │
+    │          │ │      │ │ (纯硬件tick) │
+    └────┬─────┘ └──┬───┘ └─────────────┘
+         │          │
+         │ × mult   │ × mult
+         │ + offs   │ + offs(=0)
+         │ _real    │ _mono
+         ▼          ▼
+    CLOCK_     CLOCK_
+    REALTIME   MONOTONIC
+         │
+         │ + offs_boot (睡眠累积)
+         ▼
+    CLOCK_BOOTTIME
+
+数学公式:
+  CLOCK_REALTIME      = cycles × mult + offs_real
+                      = cycles × mult - wall_to_monotonic
+
+  CLOCK_MONOTONIC     = cycles × mult + 0
+                      = cycles × mult
+
+  CLOCK_MONOTONIC_RAW = cycles × raw_mult  (不受 NTP 调整)
+
+  CLOCK_BOOTTIME      = cycles × mult + offs_boot
+                      = CLOCK_MONOTONIC + 挂起时间
+
+  REALTIME - MONOTONIC = wall_to_monotonic (常量, 只在 step 调整时变)
+```
+
+### 各时钟对比
+
+| 时钟 | ID | 起点 | 受 NTP step 影响 | 受 NTP slew 影响 | 典型用途 |
+|------|----|------|-----------------|-----------------|---------|
+| **CLOCK_REALTIME** | 0 | Unix epoch (1970) | ✅ 可以跳变/回退 | ✅ 变慢/快 | `date`, 文件时间戳, 网络协议 |
+| **CLOCK_MONOTONIC** | 1 | 系统启动 | ❌ 永不回退 | ✅ 变慢/快 | 测量间隔, 超时, 性能统计 |
+| **CLOCK_MONOTONIC_RAW** | 4 | 系统启动 | ❌ | ❌ | 精确间隔测量 (无调整) |
+| **CLOCK_BOOTTIME** | 7 | 系统启动 | ❌ 永不回退 | ✅ 变慢/快 | 包含挂起时间的单调时钟 |
+| **CLOCK_TAI** | 11 | TAI epoch | ✅ (含闰秒) | ✅ | 科学计算 (不含闰秒偏移) |
+
+> **关键区分**：MONOTONIC 不受 NTP **step**（跳变）影响，但受 NTP **slew**（频率微调）影响 ——
+> 因为 REALTIME 和 MONOTONIC 共享同一个 `tkr_mono.mult`，NTP slew 改变 `mult` 时两者同步变化。
+
+### NTP 的两种调整方式
+
+```
+① NTP step adjustment (钟面跳变):
+  ┌────────────────────────────────────────────┐
+  │  REALTIME:  ────────────┐  ┌────────────   │  ← 直接跳到正确时间
+  │                         │  │               │
+  │  MONOTONIC: ───────────────────────────     │  ← 不受影响
+  │                                             │
+  │  触发: settimeofday(), clock_settime()      │
+  │  内核: timekeeping_inject_offset()          │
+  │    → tk_xtime_add()          改 xtime       │
+  │    → tk_set_wall_to_mono()   改偏移, 不改 mult│
+  └────────────────────────────────────────────┘
+
+② NTP frequency slew (频率微调):
+  ┌────────────────────────────────────────────┐
+  │  REALTIME:  ────────╱─────────────────      │  ← 速率微调
+  │                    ╱                        │
+  │  MONOTONIC: ───────╱─────────────────       │  ← 也受影响! (共享 mult)
+  │                  ╱                          │
+  │  MONO_RAW:  ─────────────────────           │  ← 不受影响
+  │                                             │
+  │  触发: adjtimex(), ntp_adjtime()            │
+  │  内核: timekeeping_adjust()                 │
+  │    → 修改 tkr_mono.mult (微调时钟频率)      │
+  └────────────────────────────────────────────┘
+```
+
+### 时间调整对各时钟的影响汇总
+
+```
+调整类型              REALTIME  MONOTONIC  MONO_RAW  BOOTTIME
+─────────────────────────────────────────────────────────────
+NTP step              ✅ 跳变    ❌ 不变    ❌ 不变    ❌ 不变
+(settimeofday)                      (不会回退)
+
+NTP frequency slew   ✅ 变慢/快  ✅ 变慢/快  ❌ 不变    ✅ 变慢/快
+(adjtimex)                        (共享 mult)            (共享 mult)
+
+闰秒插入              ✅ +1s     ❌ 不变    ❌ 不变    ❌ 不变
+
+系统挂起/恢复         ❌ 不变    ❌ 不变    ❌ 不变    ✅ +挂起时间
+```
+
+---
+
+## 🧭 关键概念区分：clocksource vs clockevent
+
+> Linux 把硬件时钟分成**两个完全不同的子系统**。本章最容易混淆的说法
+> （"TSC-deadline 是一种时钟源"、"Constant TSC 演进出了 TSC-deadline"）
+> 都源于没分清这两者。先建立这个区分，再往下读。
+
+### 两个问题，两个子系统
+
+| | **clocksource（时间源）** | **clockevent（事件源）** |
+|---|---|---|
+| 回答的问题 | **"现在几点了？"** | **"在未来某时刻叫醒我"** |
+| 角色 | 只读计数器，被 timekeeping 反复读 | 可编程定时器，编程后到点发中断 |
+| 核心结构 | `struct clocksource`<br/>`read()` + `mult/shift` + `rating`<br/>（include/linux/clocksource.h:101） | `struct clock_event_device`<br/>`set_next_event()` + `next_event` + `features`<br/>（include/linux/clockchips.h:100） |
+| 消费者 | timekeeping → CLOCK_REALTIME / MONOTONIC / ... | tick、hrtimer、调度、NO_HZ 空闲 |
+| 选择机制 | rating 高者胜，`/sys/.../current_clocksource` 可运行时切换 | rating + features，`/sys/.../current_device` |
+
+### x86 设备的归属表
+
+| 设备 | clocksource | clockevent | 说明 |
+|---|---|---|---|
+| **TSC** | ✅ `tsc`（rating 300，tsc.c:1187） | ❌ | 纯计数器，只能读，产生不了中断 |
+| **kvm-clock** | ✅ `kvm-clock`（rating 400，kvmclock.c:157） | ❌ | 半虚拟化时钟源 |
+| **LAPIC Timer**（one-shot/periodic） | ❌ | ✅ `lapic`（rating 100，apic.c:494） | |
+| **LAPIC Timer**（TSC-deadline 模式） | ❌ | ✅ `lapic-deadline`（apic.c:585） | **TSC 只是它的时间基准** |
+| HPET | ✅ `hpet` | ✅ 比较器 | 双重角色 |
+| PIT | ✅ `pit`（低 rating，校准/看门狗用） | ✅ channel 0 → IRQ0 | 双重角色 |
+| ACPI PM Timer | ✅ `acpi_pm` | ❌ | |
+
+### TSC-deadline 是 clockevent，不是时钟源
+
+这是本章最关键的澄清。TSC-deadline 是 **LAPIC timer 这个 clockevent 设备的一种工作模式**
+（特性位 `X86_FEATURE_TSC_DEADLINE_TIMER` = CPUID.01H:ECX[24]，cpufeatures.h:137；
+名字里有 "TSC" 只是因为它的**时间基准**是 TSC）：
+
+```c
+/* 来源: arch/x86/kernel/apic/apic.c:494 — LAPIC timer clockevent 的基本形态 */
+static struct clock_event_device lapic_clockevent = {
+    .name           = "lapic",
+    .features       = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT |
+                      CLOCK_EVT_FEAT_C3STOP | CLOCK_EVT_FEAT_DUMMY,
+    .set_next_event = lapic_next_event,      /* one-shot: 写 APIC_TMICT */
+    ...
+};
+
+/* 来源: arch/x86/kernel/apic/apic.c:584 — setup_APIC_timer(): 若 CPU 支持
+ * TSC-deadline, 把同一个 clockevent 设备改造成 deadline 变体 */
+if (this_cpu_has(X86_FEATURE_TSC_DEADLINE_TIMER)) {
+    levt->name = "lapic-deadline";            /* 设备名都变了 */
+    levt->features &= ~(CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_DUMMY);
+    levt->set_next_event = lapic_next_deadline;   /* 换编程函数 */
+    clockevents_config_and_register(levt,
+        tsc_khz * (1000 / TSC_DIVISOR),       /* 频率 = TSC 频率/8 (:590) */
+        0xF, ~0UL);
+}
+
+/* 来源: arch/x86/kernel/apic/apic.c:419 — 编程方式: 读当前 TSC, 写 deadline MSR */
+static int lapic_next_deadline(unsigned long delta, struct clock_event_device *evt)
+{
+    tsc = rdtsc();
+    wrmsrl(MSR_IA32_TSC_DEADLINE, tsc + (((u64) delta) * TSC_DIVISOR));
+    return 0;
+}
+```
+
+所以 TSC 与 TSC-deadline 的关系是 **"时间基准" 与 "设备"**，不是并列的两个时钟源：
+
+```
+                       ┌── 读 ──▶ clocksource (tsc / kvm-clock)
+                       │            → timekeeping → CLOCK_REALTIME / MONOTONIC
+    TSC (64位计数器) ───┤            (提供 "现在的时间")
+                       │
+                       └── 与 deadline 比较 ──▶ clockevent (lapic-deadline)
+                                     → 本地定时器中断 → tick / hrtimer
+                                     (提供 "未来的事件")
+```
+
+对应到 KVM 语境：
+
+- **TSC 虚拟化**（TSC_OFFSET / TSC_MULTIPLIER）同时服务两条路径：guest 的
+  RDTSC（clocksource 读路径）与 deadline 比较（clockevent 编程路径）用的都是
+  同一个 "guest TSC = host TSC × multiplier + offset"。
+- **kvmclock** 是纯 clocksource（把 guest TSC 换算成纳秒，见 §4）。
+- **LAPIC timer 三种模式**（one-shot / periodic / tsc-deadline）全部是
+  clockevent，KVM 侧由 `lapic.c` 模拟，见 §2。
+- 因此 "TSC-deadline 为什么高效" 的答案要从 **clockevent 编程成本** 角度找
+  （一次 MSR 写 vs 写 TMICT + 除数），而不是从 "时钟源精度" 角度找。
 
 ---
 
@@ -26,11 +260,13 @@ x86 的历史包袱导致了多种时钟共存，每种都有自己的设计目�
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    x86 时钟源演进                                    │
+│              x86 时钟设备演进 (时间源 + 事件源)                       │
+│   注: 下面按年代混排, 每项属于 clocksource 还是 clockevent          │
+│       见上节归属表                                                   │
 │                                                                     │
 │  ① PIT (8254, 1976)                                                │
 │     用途: PC兼容性的基础 (BIOS、DOS时代的定时器)                     │
-│     频率: 1.193182 MHz (固定)                                       │
+│     频率: 1.193181 MHz (固定, KVM_PIT_FREQ=1193181)                │
 │     连接: Channel 0 → IRQ0 → PIC                                    │
 │     问题: 只有3个channel, 精度低, 只能产生周期性中断                │
 │     状态: 现代系统仍必须模拟 (Guest OS启动依赖)                     │
@@ -46,7 +282,10 @@ x86 的历史包袱导致了多种时钟共存，每种都有自己的设计目�
 │     频率: CPU主频 (每CPU独立, 可能不同步!)                          │
 │     优点: 最快 (单条指令, 无VM-Exit)                                │
 │     问题: 多CPU不同步, 频率可能变化 (变频CPU)                       │
-│     演进: Constant TSC → Invariant TSC → TSC-deadline              │
+│     演进: Constant TSC → Invariant TSC (nonstop_tsc /              │
+│           tsc_known_freq / tsc_adjust 等特性)                     │
+│     注意: TSC-deadline **不是 TSC 的演进**, 而是 LAPIC Timer 的    │
+│           一种模式 (只是拿 TSC 做时间基准), 见上节概念区分         │
 │                                                                     │
 │  ④ HPET (High Precision Event Timer, 2004)                         │
 │     用途: 替代PIT+RTC, 提供更高精度                                 │
@@ -65,16 +304,34 @@ x86 的历史包袱导致了多种时钟共存，每种都有自己的设计目�
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 各时钟源对比
+### 各时钟设备对比（按子系统分类）
 
-| 时钟源 | 精度 | 速度(读) | VM-Exit? | 迁移友好? | 适用场景 |
-|--------|------|---------|----------|----------|---------|
-| PIT | ~1μs | IO端口 | ★ 每次读写都Exit | ✓ | 兼容性(启动) |
-| APIC Timer | ~μs | MMIO | ★ 配置时Exit | ✓ | 调度tick |
-| TSC | ~ns | RDTSC指令 | ✗ 无Exit | ✗ 需同步 | 高精度时间戳 |
-| TSC-deadline | ~ns | MSR写 | ✗ 仅触发时 | ✗ | 最高效定时器 |
-| HPET | ~ns | MMIO | ★ 每次读写Exit | ✓ | 替代PIT |
-| kvmclock | ~ns | 内存读 | ✗ 无Exit | ✓✓ | ★★ 虚拟化首选 |
+> 先分清类别（见上节）：下表拆成 **clocksource（读时间）** 与
+> **clockevent（设定时器）** 两张，避免再拿两者直接比"速度"。
+
+**clocksource — 回答"现在几点"**
+
+| 设备 | 读取方式 | VM-Exit? | 迁移友好? | 适用场景 |
+|--------|---------|----------|----------|---------|
+| TSC | RDTSC 指令 (~ns 级) | ✗ 无 | ✗ 需 TSC 同步/缩放 | 高精度时间戳，TSC 可靠时的默认时钟源 |
+| kvmclock | 共享页内存读 + 乘加 | ✗ 无 | ✓✓ 经 KVM_SET_CLOCK | TSC 不可靠时的首选，见 §4 对比 |
+| HPET | MMIO | ★ 每次读 Exit | ✓ | 替代 PIT（慢） |
+| acpi_pm | IO 端口 | ★ 每次读 Exit | ✓ | 兜底 |
+| PIT | IO 端口 | ★ 每次读 Exit | ✓ | 仅校准/看门狗 |
+
+**clockevent — 回答"到点叫我"**
+
+| 设备/模式 | 编程方式 | VM-Exit? | 说明 |
+|--------|---------|----------|---------|
+| LAPIC timer (one-shot) | 写 TMICT (MMIO) | ★ 每次编程 Exit | NO_HZ tickless 默认 |
+| LAPIC timer (periodic) | 写 TMICT 一次，自动重装 | ★ 配置时 Exit | 传统周期 tick |
+| LAPIC timer (tsc-deadline) | 写 MSR_IA32_TSC_DEADLINE | ★ 每次编程 Exit，可用 preemption timer 硬件加速 | 最高效定时器（clockevent，不是时钟源！） |
+| HPET 比较器 | MMIO | ★ 每次编程 Exit | |
+| PIT channel 0 | IO 端口 | ★ 每次编程 Exit | 兼容启动 |
+
+> 注意比较口径：clocksource 比的是**读一次时间**的开销；
+> clockevent 比的是**编程一次事件 + 事件到期**的开销。
+> "TSC 比 TSC-deadline 快/慢" 这类说法没有意义——它们不在同一个子系统里。
 
 ---
 
@@ -109,16 +366,16 @@ PIT 虚拟化:
 ┌─────────────────────────────────────────────────────────────────┐│
 │  KVM PIT 模拟:                                                   ││
 │                                                                   ││
-│  Guest写 → kvm_pit_ioport_write()                                ││
+│  Guest写 → pit_ioport_write()  (i8254.c:438)                     ││
 │    → pit_load_count(): 设置计数值                                ││
 │    → 启动 hrtimer 模拟硬件计数                                   ││
 │                                                                   ││
 │  硬件计数到期 → KVM hrtimer 回调                                 ││
-│    → kvm_pit_timer_expired()                                     ││
+│    → pit_timer_fn()  (i8254.c:268)                               ││
 │    → kvm_set_irq(0) → 投递 IRQ0 到 PIC/IOAPIC                   ││
 │    → 注入到 vCPU                                                ││
 │                                                                   ││
-│  Guest读 → kvm_pit_ioport_read()                                 ││
+│  Guest读 → pit_ioport_read()  (i8254.c:513)                      ││
 │    → pit_get_count(): 根据hrtimer计算当前计数值                  ││
 │    → 返回模拟的计数值                                            ││
 └──────────────────────────────────────────────────────────────────┘│
@@ -127,30 +384,45 @@ PIT 虚拟化:
 **关键数据结构**:
 
 ```c
-/* arch/x86/kvm/i8254.h */
+/* 来源: arch/x86/kvm/i8254.h:9-49（行号随文标注） */
 
 /* PIT 单个通道的状态 */
 struct kvm_kpit_channel_state {
-    u32 count;                  /* 计数值 (初始装载值) */
+    u32 count;                  /* 初始装载值，可以是 65536 */
     u16 latched_count;          /* 锁存的计数值 */
     u8 count_latched;           /* 锁存状态 */
     u8 status_latched;          /* 状态锁存 */
-    u8 status_count;            /* 状态/计数 */
+    u8 status;                  /* 状态 (i8254.h:14) */
     u8 read_state;              /* 读状态 */
     u8 write_state;             /* 写状态 */
     u8 write_latch;             /* 写锁存 */
     u8 rw_mode;                 /* 读/写模式 (LSB/MSB) */
     u8 mode;                    /* 工作模式 (0-5) */
-    u8 bcd;                     /* BCD模式 */
-    u8 gate;                    /* 门控输入 */
-    s64 count_load_time;        /* 计数装载时间 (ns, host时间) */
+    u8 bcd;                     /* BCD模式 (not supported) */
+    u8 gate;                    /* 门控输入 (timer start) */
+    ktime_t count_load_time;    /* 计数装载时刻 (i8254.h:22, host时间) */
 };
 
-/* PIT 整体 */
+/* PIT 整体状态（hrtimer 在这里，不在 struct kvm_pit） */
+struct kvm_kpit_state {
+    struct kvm_kpit_channel_state channels[3];
+    u32 flags;
+    bool is_periodic;           /* i8254.h:29 */
+    s64 period;                 /* 周期, 单位 ns */
+    struct hrtimer timer;       /* i8254.h:31 Host高精度定时器 */
+    struct mutex lock;
+    atomic_t reinject;
+    atomic_t pending;           /* 累积已触发未注入的定时器 */
+    /* ... */
+};
+
 struct kvm_pit {
+    struct kvm_io_device dev;
     struct kvm *kvm;
     struct kvm_kpit_state pit_state;    /* PIT 状态 */
-    struct hrtimer pit_timer;           /* Host高精度定时器 */
+    int irq_source_id;
+    struct kthread_worker *worker;      /* 中断注入推迟到内核线程 */
+    struct kthread_work expired;
     /* ... */
 };
 ```
@@ -164,7 +436,7 @@ struct kvm_pit {
     │←────── period ────→│
 
 count = 初始装载值
-period = count / 1193182 (秒)
+period = count / 1193181 (秒)  (KVM_PIT_FREQ = 1193181)
 每次计数到0: OUT产生脉冲 → 触发IRQ0
 自动重新装载count, 周期性触发
 ```
@@ -223,18 +495,20 @@ KVM 模拟 APIC Timer:
 
 Guest写 APIC_TMICT (初始计数值)
   → apic_mmio_write() → VM-Exit
-  → kvm_apic_set_reg()
-  → start_apic_timer()
+  → 更新 apic->lapic_timer 寄存器
+  → restart_apic_timer()
     │
     ├── Periodic/One-shot:
-    │     计算超时 = now + count × divide / freq
+    │     计算超时 = now + count × divide_count × apic_bus_cycle_ns
     │     hrtimer_start(&apic->lapic_timer.timer, ...)
     │     → Host内核 hrtimer 到期时:
-    │       apic_timer_expired()
-    │       → kvm_apic_set_irq() → 注入中断到vCPU
+    │       apic_timer_fn() → apic_timer_expired()
+    │       → kvm_apic_local_deliver() → 注入中断到vCPU
     │
     └── TSC-deadline:
-          vmcs_write64(TSC_DEADLINE, deadline)  ← 交给硬件!
+          Guest 写 MSR_IA32_TSC_DEADLINE (MSR 0x6E0)
+          → KVM 存入 apic->lapic_timer.tscdeadline
+          → HW加速: vmcs_write32(VMX_PREEMPTION_TIMER_VALUE, delta)
           硬件自动比较 TSC vs deadline
           到期时自动触发VM-Exit → KVM注入中断
           ★ 几乎零软件开销!
@@ -247,23 +521,31 @@ Guest读 APIC_TMCCT (当前计数值)
 **TSC-deadline 的 VMCS 加速**:
 
 ```c
-/* arch/x86/kvm/vmx/vmx.c */
+/* arch/x86/kvm/vmx/vmx.c + lapic.c */
 
 /*
  * TSC-deadline 模式的硬件加速:
  *
- * VMCS 有一个 TSC_DEADLINE 字段 (实际上是通过MSR 0x6E0访问)
- * 当Guest写 IA32_TSC_DEADLINE MSR时:
- *   如果 VMCS 中 "use TSC scaling" 启用:
+ * Guest 写 MSR_IA32_TSC_DEADLINE (MSR 0x6E0) 触发 VM-Exit
+ * WRMSR exit → kvm_set_msr_common() (x86.c:3890) 处理:
+ *   → kvm_set_lapic_tscdeadline_msr() (lapic.c:2585):
+ *   1. hrtimer_cancel() 后存入 apic->lapic_timer.tscdeadline
+ *   2. start_apic_timer() → restart_apic_timer() → start_hv_timer()
+ *      → vmx_set_hv_timer()
+ *   3. 计算 delta = deadline - current_TSC (并扣除 timer_advance)
+ *   4. vmcs_write32(VMX_PREEMPTION_TIMER_VALUE, delta_cycles)
+ *      (使用 VMX preemption timer，不是虚构的 TSC_DEADLINE VMCS 字段)
+ *
+ *   如果 "use TSC scaling" secondary exec control 启用:
  *     硬件自动将Guest的deadline转换为Host的TSC值
  *     硬件直接比较Host TSC vs 转换后的deadline
- *     到期时自动VM-Exit
+ *     到期时自动VM-Exit (preemption timer fired)
  *   否则:
- *     KVM软件模拟: hrtimer
+ *     KVM软件回退: hrtimer (start_sw_tscdeadline)
  *
  * 这就是TSC-deadline高效的原因:
- *   写deadline → 直接写VMCS字段 → 硬件自动处理 → 到期VM-Exit
- *   整个过程只有"写MSR"触发一次VM-Exit, 不需要KVM计算定时器
+ *   写MSR → 一次VM-Exit → KVM设置preemption timer → 硬件自动处理
+ *   到期VM-Exit后注入中断，不需要KVM计算hrtimer
  */
 ```
 
@@ -300,7 +582,10 @@ VMCS TSC 相关字段:
 │    0.5 = 0x0000000080000000 (半速)                               │
 │                                                                   │
 │  硬件支持: CPUID.80000007H:EDX[8] = TSC invariant               │
-│           CPUID.06H:EAX[2] = TSC scaling support                 │
+│           VMX: IA32_VMX_PROCBASED_CTLS2 bit 25                  │
+│                ("enable TSC scaling" secondary exec control;    │
+│                 KVM: SECONDARY_EXEC_TSC_SCALING, vmx.h:79)      │
+│           SVM: CPUID.8000000AH:EDX + MSR_AMD64_TSC_RATIO        │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -319,8 +604,10 @@ VMCS TSC 相关字段:
     如果Guest用TSC做时间差计算, 结果就会出错
 
   KVM解决: 启动时检查TSC同步
-    kvm_arch_check_tsc_migration()
-    如果不同步: 标记为 "TSC unstable", 不使用TSC做时钟源
+    kvm_synchronize_tsc() 检查各pCPU的TSC偏移
+    如果不同步: kvm_check_tsc_unstable() 返回 true
+    → 标记为 "TSC unstable", 不使用TSC做时钟源
+    → kvmclock回退到system_time计算，不使用纯TSC
 
 
 问题2: 变频CPU (Turbo Boost, P-states)
@@ -394,13 +681,15 @@ kvmclock 原理:
 │  kvm_write_system_time(vcpu, system_time_msr)                  │
 │    → 在Guest物理地址 system_time_msr 处写入:                   │
 │                                                                 │
-│    struct pvclock_vcpu_time_info {                              │
+│    struct pvclock_vcpu_time_info {  /* asm/pvclock-abi.h:26 */  │
 │        u32 version;         ← 版本号 (奇数=更新中)             │
-│        u32 flags;           ← KVM_CLOCK_TSC_STABLE等           │
+│        u32 pad0;            ← 对齐填充                        │
 │        u64 tsc_timestamp;   ← 写结构时的Host TSC              │
 │        u64 system_time;     ← 写结构时的Host monotonic时间     │
 │        u32 tsc_to_system_mul; ← TSC→时间的缩放因子            │
 │        s8  tsc_shift;         ← TSC移位调整                    │
+│        u8  flags;             ← PVCLOCK_TSC_STABLE等 (u8!)    │
+│        u8  pad[2];          ← 填充 (总共32字节)               │
 │    };                                                           │
 │                                                                 │
 │  Host定期更新 (每秒或vCPU调度时):                               │
@@ -523,9 +812,77 @@ vDSO 的前提:
 │    - 返回绝对时间 (TSC只是tick数)                                │
 │    - 多CPU一致 (TSC可能不同步)                                   │
 │                                                                   │
-│  → 现代Linux Guest默认使用kvmclock作为clocksource               │
+│  → 但 "Guest 默认用哪个" 由 rating 决定, 见下节对比:             │
+│    TSC 可靠时反而是 tsc 胜出, kvmclock 主动让位                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+### TSC vs kvm-clock：两个 clocksource 的选型与取舍
+
+两者**同源**——最终都派生自 host 物理 TSC，差别在"读法"和"保证"：
+
+- `tsc` clocksource：guest 直接 RDTSC，拿到的是
+  `host TSC × multiplier + offset` 的原始 cycles（§3）。
+- `kvm-clock`：host 在 pvclock 页里给出锚点 `(tsc_timestamp, system_time)`，
+  guest 读页 + 一次乘加就得到纳秒。锚点本身也是 guest TSC
+  （`tsc_timestamp = kvm_read_l1_tsc()`, x86.c:3265）+ host 内核时间。
+
+| 维度 | `tsc` clocksource | `kvm-clock` |
+|------|-------------------|-------------|
+| 读取路径 | 单条 RDTSC（tsc.c `read_tsc`） | per-CPU 共享页读 + seqcount 重试（kvmclock.c:74/:84） |
+| 返回值 | 原始 cycles（timekeeping 自己乘加） | 已经是纳秒（换算在 pvclock 公式里） |
+| VM-Exit | 无 | 无 |
+| vDSO | `VDSO_CLOCKMODE_TSC`（tsc.c:1197） | `VDSO_CLOCKMODE_PVCLOCK`（kvmclock.c:256），前提 `PVCLOCK_TSC_STABLE_BIT`（kvmclock.c:253） |
+| 频率获取 | CPUID 0x15/0x16 或校准 | **从 pvclock 页直接拿**：`kvm_get_tsc_khz()` 置 `TSC_KNOWN_FREQ`（kvmclock.c:117-121），guest 跳过 PIT/HPET 校准 |
+| 迁移 | 靠 TSC_OFFSET/TSC_MULTIPLIER 补偿；跨频率迁移无 scaling 硬件则不可行 | VMM 用 `KVM_SET_CLOCK` 恢复 `kvmclock_offset`（x86.c:7047），语义更直接 |
+| 附带职责 | 无 | 即使 clocksource 选了 tsc，**sched_clock 仍是 kvmclock**（kvmclock.c:321）；还带 wallclock（kvmclock.c:61）与 `GUEST_STOPPED`（kvmclock.c:135） |
+| 失效模式 | TSC 被标不稳定 → 整个时钟源被注销（tsc.c:1414-1417） | masterclock 失效 → 掉到 per-vCPU 独立基准慢路径 |
+
+**选择逻辑（决定 guest 默认时钟源的关键代码）**：
+
+```c
+/* 来源: arch/x86/kernel/kvmclock.c:334-347 (kvmclock_init 尾部) */
+/*
+ * X86_FEATURE_NONSTOP_TSC is TSC runs at constant rate
+ * with P/T states and does not stop in deep C-states.
+ *
+ * Invariant TSC exposed by host means kvmclock is not necessary:
+ * can use TSC as clocksource.
+ */
+if (boot_cpu_has(X86_FEATURE_CONSTANT_TSC) &&
+    boot_cpu_has(X86_FEATURE_NONSTOP_TSC) &&
+    !check_tsc_unstable())
+        kvm_clock.rating = 299;          /* ★ 主动从 400 降到 299 */
+
+clocksource_register_hz(&kvm_clock, NSEC_PER_SEC);
+```
+
+```
+rating:  tsc = 300 (tsc.c:1189)
+         kvm-clock = 400 默认 (kvmclock.c:160)
+                   → guest TSC 是 constant + nonstop + 未标不稳定时降到 299
+
+结果:
+  · host TSC 可靠 (现代服务器 + -cpu host + vCPU TSC 对齐)
+      → kvm-clock 让位, guest 默认 clocksource = tsc
+  · TSC 不可靠 (老硬件 / 跨插槽漂移 / 无 scaling 的跨频迁移)
+      → init_tsc_clocksource() 拒绝注册 tsc (tsc.c:1414-1417)
+      → guest 默认 = kvm-clock (400)
+```
+
+**使用场景建议**：
+
+| 场景 | 推荐 | 原因 |
+|------|------|------|
+| 现代 host + 不迁移 | 顺其自然（默认即 tsc） | 单指令最快；kvmclock 仍兜底 sched_clock |
+| 需要热迁移 / 快照恢复 | 保留 kvmclock 可用 | `KVM_SET_CLOCK` 恢复时间基准；tsc 依赖 scaling 硬件 |
+| host TSC 不稳定 | 强制 `clocksource=kvm-clock` | tsc 会被内核标不稳定并注销 |
+| 对 `clock_gettime` 极端敏感 | 两者都有 vDSO 快速路径 | kvm-clock 的 vDSO 需要 `PVCLOCK_TSC_STABLE_BIT`（masterclock 开启） |
+
+> ⚠️ 勘误：本节旧版说"现代 Linux Guest 默认使用 kvmclock 作为 clocksource"，
+> 这只在 TSC 不可靠时成立。现代环境下内核**故意让位**（kvmclock.c:345
+> 注释 "Invariant TSC exposed by host means kvmclock is not necessary"）。
+> 可在 Guest 里实测：`cat /sys/devices/system/clocksource/clocksource0/current_clocksource`。
 
 **masterclock 优化** (事实核查补充):
 
@@ -641,7 +998,7 @@ ptp_kvm 名字有误导性 —— 它不跑任何 IEEE 1588 报文!
 │        从 guest 视角就是 "CPU 被抢了很久"                      │
 │                                                                  │
 │  解决:                                                         │
-│    · VMM 恢复 VM 后调用 KVM_KVMCLOCK_CTRL (x86.c:5100)        │
+│    · VMM 恢复 VM 后调用 KVM_KVMCLOCK_CTRL (x86.c:6195)        │
 │    · KVM 置一个 request                                        │
 │    · 下次刷 pvclock 页时打上 PVCLOCK_GUEST_STOPPED 标志       │
 │    · guest 读到这个 flag 会执行 pvclock_touch_watchdogs():     │
@@ -654,6 +1011,120 @@ ptp_kvm 名字有误导性 —— 它不跑任何 IEEE 1588 报文!
 │    · 不是伪造时间                                               │
 │    · 而是告知事实并让它宽恕这段空白                            │
 └──────────────────────────────────────────────────────────────────┘
+```
+
+### 4.5 kvmclock 的局限与 PTP KVM
+
+kvmclock 解决了**单调时钟**的问题（高精度、无 VM-Exit），但**墙上时间**（CLOCK_REALTIME）的同步仍然存在缺口：
+
+| 机制 | 精度 | 持续同步 | 用途 |
+|------|------|---------|------|
+| `wall_clock` (pvclock_wall_clock) | ~毫秒 | ❌ 启动时读一次 | Guest 初始化系统时间 |
+| `kvmclock` (pvclock_vcpu_time_info) | 纳秒级 | ✅ TSC 计算 | sched_clock / 单调时钟 |
+| **`ptp_kvm`** (KVM_HC_CLOCK_PAIRING) | **~亚微秒** | **✅ hypercall 持续同步** | **墙上时间精密同步** |
+
+#### PTP KVM 原理
+
+PTP KVM 通过 hypercall 让 Guest 每次都能获取 Host 的**精确墙上时间 + 对应 TSC**，
+由 PTP 子系统交给 chrony 做精密同步：
+
+```
+Guest (ptp_kvm driver)                    Host (KVM)
+─────────────────                        ────────────
+
+kvm_arch_ptp_get_crosststamp()
+    │
+    ├── 读 pvclock 页 (seqcount 版本)
+    │
+    ├── KVM_HC_CLOCK_PAIRING ──hypercall──▶ kvm_pv_clock_pairing()
+    │   (传 clock_pair GPA)                  │
+    │                                        ├── kvm_get_walltime_and_clockread()
+    │                                        │   原子读取:
+    │                                        │     ts    = CLOCK_REALTIME (墙上时间)
+    │                                        │     cycle = host TSC
+    │                                        │   ↑ 同一次调用, 原子性保证精度
+    │                                        │
+    │                                        ├── clock_pair.sec  = ts.tv_sec
+    │                                        ├── clock_pair.nsec = ts.tv_nsec
+    │                                        ├── clock_pair.tsc  = guest TSC
+    │                                        │
+    │                                        └── kvm_write_guest(gpa)
+    │
+    ◀── 读取 clock_pair ──────────────────┘
+    │
+    └── 精确的 (墙上时间, TSC) 对
+        → PTP 子系统 → chrony PHC refclock
+```
+
+**为什么 PTP KVM 精度高？**
+
+1. **原子性**：`kvm_get_walltime_and_clockread()` 同时读 `CLOCK_REALTIME` 和 TSC，
+   避免两次读取之间的时间差
+2. **无网络延迟**：hypercall 是同步的，延迟只有 ~1μs
+3. **交叉时间戳**：返回的 `(墙上时间, TSC)` 对精确对应，PTP 可计算精确时钟偏移
+
+#### 使用方式
+
+```bash
+# Guest 内加载 ptp_kvm 模块
+modprobe ptp_kvm
+ls /dev/ptp*    # → /dev/ptp0
+
+# chrony 配置
+# /etc/chrony/chrony.conf:
+refclock PHC /dev/ptp0 poll 3 dpoll -2 offset 0
+
+# 验证精度
+chronyc sources   # 偏移 < 1μs
+```
+
+#### 关键内核代码
+
+```c
+/* Host 侧: arch/x86/kvm/x86.c:9928 */
+static int kvm_pv_clock_pairing(struct kvm_vcpu *vcpu, gpa_t paddr,
+                                unsigned long clock_type)
+{
+    /* 原子读取墙上时间 + TSC */
+    kvm_get_walltime_and_clockread(&ts, &cycle);
+
+    clock_pairing.sec  = ts.tv_sec;
+    clock_pairing.nsec = ts.tv_nsec;
+    clock_pairing.tsc  = kvm_read_l1_tsc(vcpu, cycle);
+
+    kvm_write_guest(vcpu->kvm, paddr, &clock_pairing, sizeof(...));
+}
+
+/* Guest 侧: drivers/ptp/ptp_kvm_x86.c:95 */
+int kvm_arch_ptp_get_crosststamp(u64 *cycle, struct timespec64 *tspec, ...)
+{
+    /* hypercall 获取 host 的 (墙上时间, TSC) 对 */
+    kvm_hypercall2(KVM_HC_CLOCK_PAIRING, clock_pair_gpa,
+                   KVM_CLOCK_PAIRING_WALLCLOCK);
+
+    tspec->tv_sec  = clock_pair->sec;
+    tspec->tv_nsec = clock_pair->nsec;
+    *cycle = __pvclock_read_cycles(src, clock_pair->tsc);
+}
+```
+
+#### Guest 内的完整时间同步层次
+
+```
+Guest 内时间
+    │
+    ├── sched_clock() → kvmclock (TSC-based, 单调)
+    │                    └─ 不需要持续同步
+    │
+    ├── CLOCK_MONOTONIC → kvmclock
+    │                    └─ 纯 TSC 计算, 不受 NTP slew 影响 (见上节)
+    │
+    ├── CLOCK_REALTIME → ptp_kvm (hypercall, 亚微秒精度)
+    │                    └─ chrony 用 PTP 设备持续同步
+    │
+    └── date / gettimeofday
+         └─ 底层 = CLOCK_REALTIME
+         └─ 通过 ptp_kvm + chrony 保持与 host 墙上时间一致
 ```
 
 ### 冷启动：时间如何进入 Guest (事实核查补充)
@@ -707,7 +1178,127 @@ VM 冷启动时, Guest 的墙钟 (CLOCK_REALTIME) 从何而来?
 │    → 秒级精度, 且每次读都 VM-Exit                            │
 │    → 只在 boot 时读一次, 之后用 TSC 或其他 clocksource       │
 └────────────────────────────────────────────────────────────────┘
+
+┌─ 启动后各时钟在 Guest 中的对应关系 ─────────────────────────┐
+│                                                               │
+│  对照上节 "Linux 时钟系统基本概念":                          │
+│                                                               │
+│  Host CLOCK_REALTIME  ──→  wall_clock (启动快照)              │
+│                            + ptp_kvm (持续同步, 见 §4.5)      │
+│                                                               │
+│  Host CLOCK_MONOTONIC ──→  kvmclock (TSC-based)              │
+│                            = 纯 TSC 计算, 单调递增            │
+│                                                               │
+│  Host CLOCK_MONOTONIC_RAW →  (Guest 无直接等价物)            │
+│                            sched_clock() 最接近               │
+│                                                               │
+│  Host CLOCK_BOOTTIME  ──→  kvmclock + 挂起补偿               │
+│                            PVCLOCK_GUEST_STOPPED 通知 guest   │
+│                                                               │
+│  重要: kvmclock 不受 host NTP slew 影响 (纯 TSC)             │
+│       但 Guest 的 CLOCK_REALTIME 通过 ptp_kvm + chrony       │
+│       持续与 host 墙上时间同步                               │
+└───────────────────────────────────────────────────────────────┘
 ```
+
+### VM 启动：三个时间基准的首次同步 (事实核查补充)
+
+上一节讲的是 **guest 侧**怎么把时间读进来。这一节补齐 **host 侧**：
+VM 从无到有时，guest 的 TSC、kvmclock、masterclock 这三个基准分别
+在哪里被"第一次强制对齐"。
+
+```
+时间线:  KVM_CREATE_VM → KVM_CREATE_VCPU(×N) → 首次 KVM_RUN → guest boot
+             │                │                     │
+             ①                ②                     ③
+```
+
+**① kvmclock 纪元归零 — VM 创建时 (x86.c:12841)**
+
+```c
+/* 来源: arch/x86/kvm/x86.c:12841 (kvm_arch_init_vm) */
+kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
+```
+
+`get_kvmclock_base_ns()`（x86.c:2300-2310）是 host 的单调时间
+（TSC 时钟下 = `ktime_get_raw() + offs_boot`，否则 `ktime_get_boottime_ns()`）。
+offset 取它的负值 → **新 VM 的 kvmclock 从 0 开始**。之后
+`get_kvmclock_ns(kvm) = base + kvmclock_offset`（x86.c:3136）就是 guest 时间。
+
+QEMU 的暂停/恢复会搬运这个纪元：`hw/i386/kvm/clock.c:163`
+`kvmclock_vm_state_change()` 在 VM 暂停时 `KVM_GET_CLOCK`（:105）、
+恢复时 `KVM_SET_CLOCK`（:189），保证暂停期间的时间差由 VMM 决定怎么补。
+
+**② guest TSC 首次强制同步 — 每个 vCPU 创建时 (x86.c:12463-12470)**
+
+```c
+/* 来源: arch/x86/kvm/x86.c:12463 (kvm_arch_vcpu_postcreate) */
+void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+{
+    ...
+    vcpu_load(vcpu);
+    kvm_synchronize_tsc(vcpu, NULL);   /* ★ user_value = NULL → data = 0 */
+    vcpu_put(vcpu);
+    ...
+}
+```
+
+`kvm_synchronize_tsc()`（x86.c:2717）里 `data == 0` 是**强制同步**信号
+（:2732-2737 注释 "Force synchronization when creating a vCPU, or when
+userspace explicitly writes a zero value"），然后分两条路：
+
+```
+host TSC 稳定 (常见):
+  offset = kvm->arch.cur_tsc_offset        (x86.c:2774)
+    · 第一个 vCPU: cur_tsc_offset = 0
+        → guest TSC = host TSC × multiplier + 0   (起步即与 host 对齐)
+    · 后续 vCPU: 继承同一 offset
+        → 所有 vCPU 的 guest TSC 严格一致 (迁移到其他 pCPU 也不跳)
+
+host TSC 不稳定:
+  data += nsec_to_cycles(elapsed)          (x86.c:2777-2779)
+    · 用 "距上次同步流逝的墙钟时间" 推进基准再重算 offset
+    → guest TSC 对齐到 host 单调时间轴, 而不是裸的 host TSC
+```
+
+offset 最终经 `__kvm_synchronize_tsc()` → `kvm_vcpu_write_tsc_offset()`
+（x86.c:2613）写进 VMCS 的 `TSC_OFFSET`。同一条路径也被两个"手动"场景复用：
+迁移恢复写 `MSR_IA32_TSC`（host_initiated，x86.c:3939-3940）和
+`KVM_SET_TSC_OFFSET` ioctl（x86.c:5770-5785）。
+
+**③ masterclock 建立 — 首次 KVM_RUN 时 (x86.c:10809 / :3082 / :3015)**
+
+②的每次同步都会调 `kvm_track_tsc_matching()`（x86.c:2515-2544）：
+当**所有在线 vCPU 的 TSC 都匹配**（`nr_vcpus_matched_tsc + 1 == online_vcpus`）
+且 **host 自身用 TSC 做 clocksource** 时（:2526-2528），置
+`KVM_REQ_MASTERCLOCK_UPDATE` 请求（:2538）。该请求在 vCPU **下一次进入
+guest 前**处理（`vcpu_enter_guest()` x86.c:10809-10810）：
+
+```
+kvm_update_masterclock()                    x86.c:3082
+ └─ pvclock_update_vm_gtod_copy()           x86.c:3015
+      ├─ 快照 master_kernel_ns / master_cycle_now   (:3030-3032)
+      └─ use_master_clock = host_tsc_clocksource && vcpus_matched
+             && !backwards_tsc_observed && !boot_vcpu_runs_old_kvmclock
+                                            (:3034-3036)
+
+之后每次刷新 pvclock 页 (kvm_guest_time_update, x86.c:3215):
+  system_time = kernel_ns + kvmclock_offset          (:3302)
+  if (use_master_clock)
+      flags |= PVCLOCK_TSC_STABLE_BIT                (:3304-3310)
+      → guest 端据此决定: sched_clock 稳定 (kvmclock.c:321)
+                        + vDSO pvclock 快速路径 (kvmclock.c:253)
+```
+
+**推论（也是 practice/实验2 观察到的现象）**：在首次 `KVM_RUN` 之前，
+`use_master_clock` 还是初始值（false），所以此刻 `KVM_GET_CLOCK` 拿不到
+`host_tsc` / `KVM_CLOCK_HOST_TSC` 标志——`__get_kvmclock()` 只在
+`ka->use_master_clock` 为真时才填这些字段（x86.c:3116）。
+
+**三句话总结启动同步**：
+1. VM 创建 → kvmclock 纪元归零（`kvmclock_offset = -base`）。
+2. vCPU 创建 → guest TSC 强制对齐（稳定则共享 offset，不稳定则按墙钟推进）。
+3. 首次 KVM_RUN → masterclock 快照 + `PVCLOCK_TSC_STABLE_BIT` 下发给 guest。
 
 ### Snapshot / 热迁移 / 热升级的时间处理 (事实核查补充)
 
@@ -775,6 +1366,120 @@ VM 快照/迁移时, 必须一起处理的四件套:
 │            不要等业务跑起来了才跳墙钟                        │
 └────────────────────────────────────────────────────────────────┘
 
+┌─ 快照恢复后的立即墙上时间同步 (三种方案) ─────────────────┐
+│                                                                │
+│  方案 1: QEMU Guest Agent (QGA) — 立即同步                   │
+│  ┌────────────────────────────────────────────────────┐       │
+│  │  Host 侧:                                         │       │
+│  │    快照恢复后, QEMU 通过 QGA socket 调用:          │       │
+│  │    { "execute": "guest-set-time",                  │       │
+│  │      "arguments": { "time": <nanoseconds> } }      │       │
+│  │                                                    │       │
+│  │  Guest 内:                                        │       │
+│  │    qemu-ga 收到 → clock_settime(CLOCK_REALTIME)   │       │
+│  │    → 墙上时间立即校正                              │       │
+│  │                                                    │       │
+│  │  优点: 立即生效, 不依赖 NTP 周期                  │       │
+│  │  缺点: 需要 qemu-ga; 直接 step 跳变               │       │
+│  └────────────────────────────────────────────────────┘       │
+│                                                                │
+│  方案 2: KVM_KVMCLOCK_CTRL + PVCLOCK_GUEST_STOPPED            │
+│  ┌────────────────────────────────────────────────────┐       │
+│  │  Host 侧 (QEMU resume 流程):                      │       │
+│  │    1. KVM_SET_CLOCK       ← 恢复 kvmclock_offset  │       │
+│  │    2. KVM_KVMCLOCK_CTRL   ← 设置 GUEST_STOPPED    │       │
+│  │         │                                          │       │
+│  │         └─ kvm_set_guest_paused():                 │       │
+│  │              pvclock_set_guest_stopped_request=true │       │
+│  │                                                    │       │
+│  │  Guest 内核 (kvmclock.c:143):                     │       │
+│  │    读 pvclock 页时检测到 PVCLOCK_GUEST_STOPPED:   │       │
+│  │    → pvclock_touch_watchdogs()                    │       │
+│  │      (重置 softlockup / RCU stall / hung task)    │       │
+│  │                                                    │       │
+│  │  作用: 告知内核 "你被暂停过", 重置超时检测器      │       │
+│  │  局限: 不直接校正墙上时间, 需要用户态配合         │       │
+│  └────────────────────────────────────────────────────┘       │
+│                                                                │
+│  方案 3: chrony + ptp_kvm — 最高精度                          │
+│  ┌────────────────────────────────────────────────────┐       │
+│  │  Guest 内 chrony 配置:                            │       │
+│  │    refclock PHC /dev/ptp0 poll 0 dpoll -2         │       │
+│  │    makestep 0.1 3    ← 前 3 次允许 step           │       │
+│  │                                                    │       │
+│  │  快照恢复后:                                      │       │
+│  │    chrony 通过 ptp_kvm 检测偏差                   │       │
+│  │    → 偏差 > threshold → makestep 立即校正         │       │
+│  │    → 否则 slew 慢慢对齐                           │       │
+│  │                                                    │       │
+│  │  手动触发 (可选):                                 │       │
+│  │    chronyc makestep   ← 强制立即 step             │       │
+│  │                                                    │       │
+│  │  优点: 亚微秒精度, 可选择 step/slew               │       │
+│  │  缺点: 需要 ptp_kvm + chrony; poll 有延迟        │       │
+│  └────────────────────────────────────────────────────┘       │
+│                                                                │
+│  推荐组合方案:                                                │
+│  ┌────────────────────────────────────────────────────┐       │
+│  │  Host: QEMU resume → KVM_SET_CLOCK               │       │
+│  │                           → KVM_KVMCLOCK_CTRL     │       │
+│  │        (可选) QGA guest-set-time ← 立即粗校正     │       │
+│  │                                                    │       │
+│  │  Guest: 内核检测 GUEST_STOPPED → 重置 watchdog   │       │
+│  │         chrony + ptp_kvm → makestep 精确校正      │       │
+│  │                                                    │       │
+│  │  结果: 毫秒级立即校正 + 亚微秒后续精校            │       │
+│  └────────────────────────────────────────────────────┘       │
+│                                                                │
+│  Guest 内推荐配置:                                            │
+│  ┌────────────────────────────────────────────────────┐       │
+│  │  # 加载 ptp_kvm                                   │       │
+│  │  modprobe ptp_kvm                                 │       │
+│  │                                                    │       │
+│  │  # /etc/chrony/chrony.conf                        │       │
+│  │  refclock PHC /dev/ptp0 poll 0 dpoll -2 offset 0  │       │
+│  │  makestep 0.1 3                                   │       │
+│  │                                                    │       │
+│  │  # 快照恢复脚本 (可选):                           │       │
+│  │  # /usr/lib/systemd/system-sleep/kvm-clock-sync   │       │
+│  │  #!/bin/sh                                        │       │
+│  │  [ "$1" = "post" ] && chronyc makestep 2>/dev/null│       │
+│  └────────────────────────────────────────────────────┘       │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ 迁移后 NTP/PTP 同步行为 (对照 §0 时钟系统基本概念) ──────┐
+│                                                                │
+│  迁移后 Guest 时间与真实时间存在偏差:                         │
+│    偏差 ≈ 停机时间 (通常毫秒到秒级)                          │
+│                                                                │
+│  NTP 根据偏差大小选择不同的校正策略:                          │
+│                                                                │
+│  偏差 < 128ms (step threshold):                               │
+│    ┌────────────────────────────────────────────────────┐     │
+│    │  REALTIME   → NTP slew: 微调频率, 慢慢对齐          │     │
+│    │  MONOTONIC  → 也跟着 slew (共享 tkr_mono.mult)      │     │
+│    │             永不跳变, 只可能频率微调                 │     │
+│    └────────────────────────────────────────────────────┘     │
+│                                                                │
+│  偏差 ≥ 128ms:                                                │
+│    ┌────────────────────────────────────────────────────┐     │
+│    │  REALTIME   → NTP step: 直接跳到正确时间             │     │
+│    │  MONOTONIC  → 不受影响 (永不跳变)                   │     │
+│    │             只可能后续 slew 微调频率                 │     │
+│    └────────────────────────────────────────────────────┘     │
+│                                                                │
+│  用 PTP KVM + chrony 时:                                      │
+│    ┌────────────────────────────────────────────────────┐     │
+│    │  亚微秒精度 → 偏差极小 → 几乎总是 slew, 不跳       │     │
+│    │  chrony step threshold 可设为 0 → 永不 step         │     │
+│    └────────────────────────────────────────────────────┘     │
+│                                                                │
+│  所以 "MONOTONIC 慢慢对齐, REALTIME 会跳变" 不完全准确:      │
+│    · 偏差小时 REALTIME 也不跳 (slew)                          │
+│    · 偏差大时 REALTIME 才跳 (step)                            │
+│    · MONOTONIC 只可能 slew, 永不 step                         │
+└────────────────────────────────────────────────────────────────┘
+
 跨主机迁移的额外问题:
 
   · TSC 频率不同 → 必须有 TSC scaling 硬件支持
@@ -790,12 +1495,15 @@ VM 快照/迁移时, 必须一起处理的四件套:
 Guest Linux 内核的时钟层次:
 
 ┌─ clocksource (时间源, 读取当前时间) ──────────────────────────┐
-│  优先级从高到低:                                               │
-│    1. kvm-clock        ← 半虚拟化, 最快, Guest默认选择        │
-│    2. tsc              ← 如果CPU有Invariant TSC               │
-│    3. hpet             ← HPET                                 │
-│    4. acpi_pm          ← ACPI PM timer                        │
-│    5. pit              ← PIT (最后选择, 最慢)                 │
+│  按 rating 选优 (不是固定顺序):                                │
+│    · tsc        rating 300 (tsc.c:1189)                        │
+│    · kvm-clock  rating 400 (kvmclock.c:160); 但 guest TSC 可靠 │
+│                 (constant + nonstop + 未标不稳定) 时主动降到   │
+│                 299 (kvmclock.c:342-345), 让位给 tsc          │
+│    · hpet / acpi_pm / pit  低 rating 兜底                      │
+│                                                                │
+│  结果: 现代 host 上 guest 默认通常是 tsc;                      │
+│        TSC 不可靠时才是 kvm-clock (详见 §4 对比小节)           │
 │                                                                │
 │  查看: cat /sys/devices/system/clocksource/clocksource0/       │
 │         current_clocksource                                    │
@@ -803,17 +1511,17 @@ Guest Linux 内核的时钟层次:
 
 ┌─ clockevent (事件源, 设置定时器) ─────────────────────────────┐
 │  优先级从高到低:                                               │
-│    1. lapic            ← APIC Timer (TSC-deadline模式最优)    │
-│    2. hpet             ← HPET                                 │
-│    3. pit              ← PIT                                  │
+│    1. lapic-deadline ← APIC Timer TSC-deadline 模式 (apic.c:585)│
+│    2. lapic          ← APIC Timer one-shot/periodic (apic.c:494)│
+│    3. hpet / pit                                              │
 │                                                                │
 │  查看: cat /sys/devices/system/clockevents/clockevent0/        │
 │         current_device                                         │
 └────────────────────────────────────────────────────────────────┘
 
-KVM 建议:
-  clocksource = kvm-clock   (共享内存, 无VM-Exit)
-  clockevent  = lapic       (TSC-deadline, 硬件加速)
+KVM 典型组合:
+  clocksource = tsc 或 kvm-clock (rating 决定, 见 §4 对比)
+  clockevent  = lapic-deadline (TSC-deadline, preemption timer 加速)
 ```
 
 ---
@@ -840,14 +1548,15 @@ KVM 建议:
 
 第4步: 理解kvmclock
   arch/x86/kvm/x86.c
-    kvm_write_system_time()     ← 写pvclock_vcpu_time_info
-    kvm_write_wall_clock()      ← 写pvclock_wall_clock
-    kvm_guest_time_update()     ← 更新时间信息
+    kvm_write_system_time()     ← 注册pvclock页GPA (不写内容!)
+    kvm_write_wall_clock()      ← 注册wall clock GPA
+    kvm_guest_time_update()     ← 真正填充时间信息到pvclock页
 
 第5步: 理解Timer advance (高级优化)
   arch/x86/kvm/lapic.c
-    lapic_timer_advance_ns      ← 模块参数
-    adjust_timer_advance_ns()   ← 动态调整提前量
+    lapic_timer_advance         ← 模块参数 (bool, 开关)
+    timer_advance_ns            ← 内部自动调整值 (非模块参数)
+    adjust_lapic_timer_advance() ← 动态调整提前量 (步进式, 非EWMA)
 ```
 
 ---
@@ -859,16 +1568,17 @@ KVM 建议:
 ```bash
 # 在Guest内执行:
 cat /sys/devices/system/clocksource/clocksource0/current_clocksource
-# 预期: kvm-clock
+# 预期: tsc 或 kvm-clock
+# (guest TSC 可靠 → tsc; kvm-clock rating 让位机制见 §4 对比小节)
 
 cat /sys/devices/system/clocksource/clocksource0/available_clocksource
-# 预期: kvm-clock tsc hpet acpi_pm
+# 预期: 含 tsc 和 kvm-clock (其余视虚拟硬件而定)
 
 cat /sys/devices/system/clockevents/clockevent0/current_device
-# 预期: lapic
+# 预期: lapic-deadline (支持 TSC-deadline 时) 或 lapic
 
-# 查看TSC特征:
-grep -E "constant_tsc|tsc_deadline|tsc_reliable" /proc/cpuinfo
+# 查看TSC特征 (/proc/cpuinfo 里的名字, 见 cpufeatures.h):
+grep -oE "constant_tsc|nonstop_tsc|tsc_deadline_timer|tsc_known_freq|tsc_adjust" /proc/cpuinfo | sort -u
 ```
 
 ### 练习2: 观察 pvclock 共享页
@@ -976,9 +1686,18 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep -E "exit|timer"
 ## ✅ 验证清单
 
 完成后确认能回答：
-- [ ] 画出 PIT → APIC Timer → TSC-deadline → kvmclock 的演进关系
+- [ ] 区分 clocksource 与 clockevent，说出 TSC / kvm-clock / LAPIC timer /
+      PIT / HPET 各属于哪一类（含双重角色者）
+- [ ] 解释为什么 TSC-deadline 是 clockevent（`lapic-deadline`）而不是时钟源
+- [ ] 画出 clocksource 演进（PIT → HPET → TSC → kvm-clock）与
+      clockevent 演进（PIT → LAPIC timer one-shot/periodic → tsc-deadline）两条线
 - [ ] 解释 TSC_OFFSET 和 TSC_MULTIPLIER 在 VMCS 中的作用
 - [ ] 说明 TSC-deadline 为什么比 Periodic/One-shot 模式高效
+- [ ] 对比 `tsc` 与 `kvm-clock` 两个 clocksource 的读取路径、迁移语义与失效模式，
+      说出 rating 400→299 让位逻辑（kvmclock.c:342-345）
+- [ ] 说出 VM 启动三个时间基准的首次同步点：`kvm_arch_init_vm` 归零
+      `kvmclock_offset`、`kvm_arch_vcpu_postcreate` 强制同步 TSC、
+      首次 KVM_RUN 建立 masterclock
 - [ ] 解释 vm 迁移时 Guest 时间连续性的保证机制
 - [ ] 说明 kvmclock 的 pvclock 协议如何工作
 - [ ] 解释 vDSO 在时钟读取中的性能优势
@@ -986,8 +1705,8 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep -E "exit|timer"
 - [ ] 解释 ptp_kvm 的实现原理 (hypercall 三元组)
 - [ ] 说明 PVCLOCK_GUEST_STOPPED 机制的作用
 - [ ] 解释 Firecracker PR #5809 的问题和修复 (KVM_CLOCK_REALTIME)
-- [ ] 解释为什么现代 Linux Guest 默认使用 kvm-clock + lapic
-- [ ] 列出 Guest 中查看当前时钟源的命令
+- [ ] 解释为什么现代 Linux Guest 默认 clocksource 往往是 tsc 而非 kvm-clock
+- [ ] 列出 Guest 中查看当前时钟源/时钟事件设备的命令
 
 ---
 
@@ -1028,11 +1747,12 @@ KVM内核态:
 **解决**：使用TSC-deadline，硬件自动比较TSC和deadline
 
 ```c
-/* vmx.c 中配置 */
-/* Guest写IA32_TSC_DEADLINE MSR */
+/* vmx.c + lapic.c 中配置 */
+/* Guest写IA32_TSC_DEADLINE MSR → VM-Exit → KVM处理 */
 if (mode == TSC_DEADLINE) {
-    vmcs_write64(TSC_DEADLINE, deadline);
-    /* 硬件自动比较，到期时VM-Exit */
+    /* 1. 存入 apic->lapic_timer.tscdeadline */
+    /* 2. vmx_set_hv_timer() → vmcs_write32(VMX_PREEMPTION_TIMER_VALUE, delta) */
+    /* 硬件通过 preemption timer 自动比较，到期时 VM-Exit */
 }
 ```
 
@@ -1040,34 +1760,43 @@ if (mode == TSC_DEADLINE) {
 - 减少定时器相关VM-Exit 90%
 - 中断延迟降低到~20ns
 
-### 2. Timer Advance
+### 2. Timer Advance（仅 TSC-deadline）
 
-**问题**：定时器到期时vCPU可能不在运行状态
+**问题**：host 定时器到期到中断真正注入 guest 之间，存在
+hrtimer/preemption-timer 触发 → KVM 处理 → VM-Entry 注入的延迟（约数百 ns～μs）
 
-**解决**：提前通知vCPU，减少延迟
+**解决**：把到期时刻**提前** `timer_advance_ns`，抵消这段延迟。
+只服务 TSC-deadline 模式（`lapic.c:62-68` 注释 "tscdeadline mode only"），
+两条路径各自实现提前：
 
 ```c
-/* lapic.c 中实现 */
-/* 提前 lapic_timer_advance_ns 通知vCPU */
-if (timer_advance_ns > 0) {
-    advance_deadline = deadline - timer_advance_ns;
-    kvm_vcpu_kick(vcpu);
-}
+/* HW 路径: vmx_set_hv_timer() — vmx.c:8129（节选） */
+delta_tsc = max(guest_deadline_tsc, guest_tscl) - guest_tscl;
+lapic_timer_advance_cycles = nsec_to_cycles(vcpu, ktimer->timer_advance_ns);
+if (delta_tsc > lapic_timer_advance_cycles)
+    delta_tsc -= lapic_timer_advance_cycles;   /* ★ deadline 提前 */
+else
+    delta_tsc = 0;
+
+/* SW 回退路径: start_sw_tscdeadline() — lapic.c:1953（节选） */
+expire = ktime_add_ns(now, ns);
+expire = ktime_sub_ns(expire, ktimer->timer_advance_ns);  /* ★ 同上 */
 ```
 
-**配置**：
+**配置与观察**：
 ```bash
-# 查看当前值
-cat /sys/module/kvm/parameters/lapic_timer_advance_ns
-# 默认: 1000 (1μs)
+# 唯一的模块参数是 bool 开关（权限 0444，运行时只读，
+# 只能在模块加载时改: modprobe kvm lapic_timer_advance=0）
+cat /sys/module/kvm/parameters/lapic_timer_advance   # 默认 Y
 
-# 调优
-echo 2000 > /sys/module/kvm/parameters/lapic_timer_advance_ns
+# 提前量本身是每 vCPU 的内部自适应值，不是模块参数，只能只读观察:
+cat /sys/kernel/debug/kvm/<pid>-<fd>/vcpu0/lapic_timer_advance_ns
+# 初始 1000 (LAPIC_TIMER_ADVANCE_NS_INIT, lapic.c:75)，自适应调整
 ```
 
 **效果**：
-- 减少定时器延迟
-- 实时应用性能提升
+- 抵消定时器注入延迟，让中断尽量贴近 guest 编程的 deadline
+- 详见下文"陷阱4"对常见调优误区的澄清
 
 ### 3. TSC同步
 
@@ -1077,11 +1806,17 @@ echo 2000 > /sys/module/kvm/parameters/lapic_timer_advance_ns
 
 ```c
 /* x86.c 中实现 */
-kvm_arch_check_tsc_migration()
+
+/* kvm_synchronize_tsc() — x86.c:2717
+ * 检查各pCPU的TSC偏移，如果差异过大则标记为不稳定
+ */
+kvm_synchronize_tsc(vcpu, user_value)
 {
-    if (tsc_unstable) {
-        /* 不使用TSC作为时钟源 */
-        kvm->arch.no_tsc_offset = true;
+    /* ... 检查 TSC 偏移 ... */
+    if (kvm_check_tsc_unstable()) {
+        /* 不使用纯TSC作为时钟源 */
+        kvm->arch.use_master_clock = false;
+        /* kvmclock 回退到 system_time 计算 */
     }
 }
 ```
@@ -1144,32 +1879,44 @@ update-grub && reboot
 
 **症状**：Guest日志显示"time went backwards"
 
-**原因**：TSC offset未正确更新
+**原因**：迁移时 KVM_SET_CLOCK 未正确补偿停机时间
 
-**解决**：
+**实际代码** (x86.c:7006 `kvm_vm_ioctl_set_clock()`):
 ```c
-// kvm_arch_vcpu_load() 中更新
-if (vcpu->cpu != old_cpu) {
-    /* 重新计算TSC offset */
-    new_offset = guest_tsc - host_tsc;
-    vmcs_write64(TSC_OFFSET, new_offset);
-}
+// kvm_vm_ioctl_set_clock() 中
+// QEMU 在迁移后调用 KVM_SET_CLOCK 补偿停机时间
+// 如果补偿不准确，guest 时间会跳变
+//
+// kvmclock 使用 PVCLOCK_GUEST_STOPPED 标志通知 guest
+// pvclock_touch_watchdogs() 重置 watchdog 定时器
 ```
 
-### 陷阱4：Timer Advance设置不当
+**解决**：确保 QEMU 正确调用 KVM_SET_CLOCK 补偿迁移停机时间
+
+### 陷阱4：Timer Advance 理解错误
 
 **场景**：定时器延迟不稳定
 
 **症状**：`cyclictest`显示延迟抖动
 
-**原因**：`lapic_timer_advance_ns`设置不当
+**常见误解**：试图通过 `echo N > /sys/module/kvm/parameters/lapic_timer_advance_ns` 调优
 
-**解决**：
+**实际机制** (lapic.c:1840 `adjust_lapic_timer_advance()`):
+- 模块参数：`lapic_timer_advance` (bool, 默认 true) — 开关
+- `timer_advance_ns` 是**内部自动调整值**，不是用户可调参数
+- 算法：步进式增量调整（非 EWMA），每次调整 1/8
+  - 提前到期 → 减小 advance
+  - 延迟到期 → 增大 advance
+  - 超过 MAX(5000) → 重置为 INIT(1000)
+- **仅适用于 TSC-deadline 模式**（Periodic/One-shot 不使用 timer advance）
+
+**正确做法**：
 ```bash
-# 调优
-# 如果延迟高，增大advance
-echo 5000 > /sys/module/kvm/parameters/lapic_timer_advance_ns
+# 开关 timer advance（bool 模块参数，权限 0444 → 运行时只读，
+# 只能在模块加载时指定）
+modprobe -r kvm_intel kvm && modprobe kvm lapic_timer_advance=0
+# 或内核命令行: kvm.lapic_timer_advance=0
 
-# 如果CPU占用高，减小advance
-echo 500 > /sys/module/kvm/parameters/lapic_timer_advance_ns
+# 观察当前自动调整值（每 vCPU 的 debugfs，只读; debugfs.c:67）
+cat /sys/kernel/debug/kvm/<pid>-<fd>/vcpu0/lapic_timer_advance_ns
 ```

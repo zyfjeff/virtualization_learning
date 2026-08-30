@@ -23,6 +23,9 @@ phase2-mem-virt/practice/concurrent_test
 phase5-vfio/practice/vfio-claim-trace
 phase5-vfio/practice/vfio-dma-map
 phase5-vfio/practice/vfio-msix-probe
+phase6-timer-virt/practice/experiment1-tsc
+phase6-timer-virt/practice/experiment2-kvmclock
+phase6-timer-virt/practice/experiment3-lapic
 
 # 9p 共享暂存区（只放拷进 guest 的产物）
 scripts/shared/*
