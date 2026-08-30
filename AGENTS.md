@@ -48,6 +48,8 @@ examples/  notes/  scripts/  shared/
 | Intel VMX 规范 | `intel-vmx.pdf` | VMCS、VM-Exit/Entry、EPT/VPID、Posted Interrupt |
 | Intel VT-d 规范 | `intel-vtd.pdf` | IOMMU、中断重映射、IRTE/PI Descriptor |
 | Virtio 规范 | `virtio-v1.3-csd01.pdf` | virtqueue、设备类型、feature bits |
+| ARM SMMU v3 规范 | `arm-smmuv3.pdf` | ARM SMMUv3 架构、Stage-1/2 翻译、STE/CD 格式、CMDQ 命令 |
+| PCIe Base 规范 | `pcie-base-spec-r6.0.pdf` | PCIe 6.0、TLP/DLLP、ACS/ATS/AER、MSI/MSI-X、配置空间 |
 
 已有文档大多以 QEMU 10.1.0-rc2 为基线；phase4 的 `vhost-user-new-features-factcheck-v2.md` 与 `-usecases.md` 基于 11.1.0 + DPDK。**引用时必须写明版本**，两个版本行为不一致时说明差异。
 
@@ -122,6 +124,8 @@ grep -rn "KVM_SET_GSI_ROUTING" /root/code/qemu-10.1.0-rc2/accel/kvm/
 pdftotext intel-vmx.pdf /tmp/vmx-spec.txt && grep -n "Posted-Interrupt Processing" /tmp/vmx-spec.txt
 pdftotext intel-vtd.pdf /tmp/vtd-spec.txt
 pdftotext virtio-v1.3-csd01.pdf /tmp/virtio-spec.txt
+pdftotext arm-smmuv3.pdf /tmp/smmuv3-spec.txt && grep -n "Stage-2\|STE\|Context Descriptor" /tmp/smmuv3-spec.txt
+pdftotext pcie-base-spec-r6.0.pdf /tmp/pcie-spec.txt && grep -n "ACS\|ATS\|MSI-X\|AER" /tmp/pcie-spec.txt
 
 # 实验 VM 环境（详见 scripts/README.md）
 cd scripts/vm
@@ -141,7 +145,7 @@ ls scripts/trace/   # trace-vmexit.sh, kvm-overview.sh 等
 
 - [ ] 查过 Linux 内核源码
 - [ ] 涉及 VMM 侧时查过 QEMU 源码
-- [ ] 查过对应规范（VMX / VT-d / Virtio）
+- [ ] 查过对应规范（VMX / VT-d / Virtio / SMMUv3 / PCIe）
 - [ ] 字段命名与规范一致
 - [ ] 位范围准确
 - [ ] 术语符合规范
