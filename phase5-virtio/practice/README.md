@@ -42,6 +42,11 @@ ls /root/code/kvm-study/scripts/images/
 
 # 确认内核启用了 virtio-net
 grep -E "VIRTIO_NET|NETDEVICES" /root/code/linux-6.12.93/.config
+
+# Guest 内: 确认 feature 协商结果（sysfs 属性 features
+# 定义于 drivers/virtio/virtio.c:62；位含义对照
+# include/uapi/linux/virtio_net.h 的 VIRTIO_NET_F_*）
+cat /sys/bus/virtio/devices/virtio0/features
 ```
 
 ## 实际测试结果（2026-08-09）

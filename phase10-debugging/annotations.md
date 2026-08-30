@@ -216,6 +216,10 @@ kvm:kvm_msr
   来源: arch/x86/kvm/trace.h:428
   参数: vcpu_id, write (bool), ecx, data
   用途: MSR 读写跟踪
+  实用片段 — 按 MSR 号统计退出频率:
+    cat $TRACEFS/trace | grep kvm_msr | \
+        grep -oP 'msr=0x[0-9a-f]+' | sort | uniq -c | sort -rn | head
+    # 读/写方向: 分别统计 write=0 / write=1
 
 kvm:kvm_cr
   来源: arch/x86/kvm/trace.h:460
@@ -573,6 +577,58 @@ cat /sys/kernel/debug/tracing/trace_pipe > /tmp/trace.log &
 # ... 运行测试 ...
 kill %1
 ```
+
+### 4.6 案例：VM 生命周期跟踪（创建 → 运行 → 销毁）
+
+完整记录一个 VM 从创建到销毁的事件序列。以下事件/函数均经
+6.12.93 核实：
+
+```bash
+TRACEFS=/sys/kernel/debug/tracing
+echo > $TRACEFS/trace
+
+# 生命周期 tracepoints
+echo kvm:kvm_vcpu_wakeup > $TRACEFS/set_event      # include/trace/events/kvm.h:43
+echo kvm:kvm_entry >> $TRACEFS/set_event           # arch/x86/kvm/trace.h:17
+echo kvm:kvm_exit >> $TRACEFS/set_event
+echo kvm:kvm_userspace_exit >> $TRACEFS/set_event  # include/trace/events/kvm.h:22
+
+# 函数级：覆盖创建/运行/销毁三个阶段的 ioctl 入口
+echo function > $TRACEFS/current_tracer
+{
+  echo kvm_dev_ioctl                  # /dev/kvm 入口
+  echo kvm_create_vm                  # virt/kvm/kvm_main.c:1146
+  echo kvm_vm_ioctl
+  echo kvm_vcpu_ioctl                 # virt/kvm/kvm_main.c:115
+  echo kvm_arch_vcpu_ioctl_run        # arch/x86/kvm/x86.c:11579
+  echo kvm_vm_release                 # virt/kvm/kvm_main.c:1408
+} > $TRACEFS/set_ftrace_filter
+```
+
+预期序列（创建 → 运行 → 销毁）：
+
+```
+kvm_dev_ioctl / kvm_create_vm          ← KVM_CREATE_VM
+kvm_vcpu_ioctl                         ← KVM_CREATE_VCPU / KVM_RUN
+kvm_vcpu_wakeup / kvm_entry / kvm_exit ← 运行循环
+kvm_userspace_exit                     ← 退到用户态 (如 KVM_EXIT_IO)
+kvm_vm_release                         ← VM fd 关闭，销毁
+```
+
+分析片段 —— 计算相邻两次 `kvm_exit` 的时间间隔（观察退出节奏）：
+
+```bash
+# ftrace 文本格式: task-pid  [cpu]  flags  timestamp: event
+cat $TRACEFS/trace | grep kvm_exit | awk '{
+    split($4, t, ":");
+    ts = t[1]*3600 + t[2]*60 + t[3];
+    if (prev > 0) printf "%.3f us\n", (ts-prev)*1000000;
+    prev = ts
+}' | head -50
+```
+
+配合 `perf sched record -- sleep 10; perf sched latency` 可进一步看
+vCPU 线程在宿主上的调度延迟。
 
 ---
 

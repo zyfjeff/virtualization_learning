@@ -137,6 +137,28 @@ cat /sys/kernel/debug/kvm/*/stats | grep -i clock
 grep "constant_tsc\|tsc_reliable" /proc/cpuinfo
 ```
 
+### 场景 6: guest 时钟异常（跳变 / 降级）
+
+```bash
+# Step 1: 时间跳变检测（Guest 内持续采样）
+while true; do date +%s.%N; sleep 0.1; done | \
+    awk 'NR>1{d=$1-prev; if(d<0||d>0.2) print "JUMP:", d} {prev=$1}'
+
+# Step 2: clocksource 降级检测（从 kvm-clock 降到 tsc/hpet 即异常信号）
+dmesg | grep -i 'clocksource.*changed'
+
+# Step 3: TSC 不稳定警告
+dmesg | grep -i 'tsc.*unstable'
+
+# Step 4: 宿主侧查时钟相关 tracepoint（6.12.93 均存在）
+ls /sys/kernel/debug/tracing/events/kvm/ | grep -E 'clock|time|tsc'
+echo kvm:kvm_track_tsc > /sys/kernel/debug/tracing/set_event
+echo kvm:kvm_write_tsc_offset >> /sys/kernel/debug/tracing/set_event
+```
+
+方法学（读取延迟 / cyclictest / TSC 同步基准）见
+`../phase9-performance/practice/timer-bench.md`。
+
 ---
 
 ## 🌳 调试决策树
