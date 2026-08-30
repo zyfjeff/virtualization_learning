@@ -212,6 +212,53 @@ fi
 echo ""
 
 # ==========================================
+# Part 3.5: 组域类型可见性（phase11 实验 1）
+# ==========================================
+echo -e "${CYAN}${BOLD}3.5 组域类型可见性${NC}"
+echo -e "${CYAN}─────────────────────────────────────────${NC}"
+echo ""
+
+# 命令行诉求
+REQ_TYPE="translated(DMA)"
+if echo "$CMDLINE" | grep -qE "iommu=pt|iommu\.passthrough=1"; then
+    REQ_TYPE="identity(passthrough)"
+elif echo "$CMDLINE" | grep -q "iommu.strict=0"; then
+    REQ_TYPE="DMA-FQ(lazy)"
+fi
+echo "  命令行诉求: $REQ_TYPE"
+echo ""
+
+# 每组实际类型与诉求对照
+if [ -d /sys/kernel/iommu_groups ] && ls /sys/kernel/iommu_groups/*/type >/dev/null 2>&1; then
+    echo "  组实际类型 (sysfs):"
+    mismatch=0
+    for type_file in /sys/kernel/iommu_groups/*/type; do
+        grp_id=$(basename "$(dirname "$type_file")")
+        actual=$(cat "$type_file" 2>/dev/null || echo "?")
+        flag=""
+        case "$REQ_TYPE" in
+            identity*) [ "$actual" != "identity" ] && flag=" ← 与诉求不一致" ;;
+            DMA-FQ*)   [ "$actual" != "DMA-FQ" ] && flag=" ← 与诉求不一致" ;;
+        esac
+        if [ -n "$flag" ]; then
+            mismatch=$((mismatch + 1))
+            echo -e "    Group $grp_id: $actual${YELLOW}$flag${NC}"
+        else
+            echo "    Group $grp_id: $actual"
+        fi
+    done
+    echo ""
+    if [ "$mismatch" -gt 0 ]; then
+        echo -e "  ${YELLOW}有 $mismatch 个组的实际类型与命令行诉求不一致${NC}"
+        echo "  可能原因: FQ 初始化失败降级 (dma-iommu.c:721-724)"
+        echo "            或分配回落 (iommu.c:1637-1639)，查 dmesg 'Falling back'"
+    fi
+else
+    echo "  /sys/kernel/iommu_groups/*/type 不可用 (IOMMU 未启用?)"
+fi
+echo ""
+
+# ==========================================
 # Part 4: DMA 映射分析 (ftrace)
 # ==========================================
 echo -e "${CYAN}${BOLD}4. DMA 映射性能分析${NC}"
@@ -286,6 +333,37 @@ if [ -n "$TRACEFS" ]; then
     fi
 else
     echo -e "  ${YELLOW}tracefs 不可用，跳过 DMA 分析${NC}"
+fi
+echo ""
+
+# ==========================================
+# Part 4.5: strict/lazy 与失效延迟（phase11 实验 3）
+# ==========================================
+echo -e "${CYAN}${BOLD}4.5 strict/lazy 与失效延迟${NC}"
+echo -e "${CYAN}─────────────────────────────────────────${NC}"
+echo ""
+
+if echo "$CMDLINE" | grep -q "iommu.strict=0"; then
+    echo "  失效模式: ${YELLOW}lazy (iommu.strict=0, DMA_FQ 攒批全域失效)${NC}"
+elif echo "$CMDLINE" | grep -q "iommu.strict=1"; then
+    echo "  失效模式: strict (iommu.strict=1, 逐次同步失效)"
+else
+    echo "  失效模式: 未显式指定 (取各后端默认)"
+fi
+echo "  在线切换: echo DMA-FQ > /sys/kernel/iommu_groups/<N>/type"
+echo "            (DMA→DMA-FQ 唯一可不解绑驱动, iommu.c:3071-3074)"
+echo ""
+
+DMAR_LAT=/sys/kernel/debug/iommu/intel/dmar_perf_latency
+if [ -f "$DMAR_LAT" ]; then
+    enabled=$(cat "$DMAR_LAT" 2>/dev/null | head -1 || true)
+    echo "  dmar_perf_latency 直方图 (首行开关状态: ${enabled:-?}):"
+    cat "$DMAR_LAT" 2>/dev/null | while read -r line; do
+        echo "    $line"
+    done
+    echo "  开关: echo 1 > $DMAR_LAT  (需 CONFIG_INTEL_IOMMU_DEBUGFS)"
+else
+    echo "  dmar_perf_latency 不可用 (非 Intel 或未开 CONFIG_INTEL_IOMMU_DEBUGFS)"
 fi
 echo ""
 
