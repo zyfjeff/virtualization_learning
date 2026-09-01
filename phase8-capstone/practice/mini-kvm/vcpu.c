@@ -71,7 +71,7 @@ static int mini_vcpu_run_loop(struct mini_kvm_vcpu *vcpu)
 	/*
 	 * "上机"：一次性完成 VMXON 检查、VMCS 迁移、失效与 Host 修补。
 	 * 对照 KVM：这些全在 KVM_RUN 进主循环前的一次 vcpu_load() 里做完
-	 * （arch/x86/kvm/x86.c:11590 -> virt/kvm/kvm_main.c:205-214 ->
+	 * （arch/x86/kvm/x86.c:11590 -> virt/kvm/kvm_main.c:205-213 ->
 	 * kvm_arch_vcpu_load() x86.c:4982 -> kvm_x86_call(vcpu_load) x86.c:5002
 	 * -> vmx_vcpu_load_vmcs()），不是每次进入前重做。
 	 *
@@ -140,8 +140,9 @@ static int mini_vcpu_run_loop(struct mini_kvm_vcpu *vcpu)
 
 		/*
 		 * 注入窗口：把排队中的中断写入 VM_ENTRY_INTR_INFO_FIELD。
-		 * 外部中断注入要求 IF=1 且无 STI/MOV-SS 阻塞
-		 * （SDM 27.3.1.4），这里直接满足（见 interrupt.c 注释）。
+		 * 外部中断注入要求 IF=1（SDM 27.3.1.4）且无 STI/MOV-SS 阻塞
+		 * （SDM 27.3.1.5，NMI 注入同样要求），这里直接满足
+		 * （见 interrupt.c 注释）。
 		 */
 		intr = mini_vcpu_take_intr_info(vcpu);
 		if (intr) {

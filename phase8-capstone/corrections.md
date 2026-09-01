@@ -2,8 +2,10 @@
 
 > 依据 AGENTS.md：发现已有文档有错，在本目录写 corrections.md，说明错误、
 > 给出正确信息与引用，并同步修正原文。所有行号基于 Linux 6.12.93、
-> QEMU 10.1.0-rc2；"实测"均指本机（宿主即一台 KVM guest，96 线程）。
-> 本文档的结论都已在 `practice/minivmm.c` 里落地并跑通。
+> QEMU 10.1.0-rc2；"实测"均指本机（宿主是**裸金属**，96 线程 —— 见 H 节，
+> 本文件旧版此处写反了）。A–I 节的结论都已在 `practice/minivmm.c` 里落地并
+> 跑通；**J 节是纯静态勘误**（源码 / 规范比对），mini-kvm 的真机 `insmod`
+> 验收尚未执行。
 
 ---
 
@@ -392,3 +394,247 @@ guest 512 MB、单 vCPU。」
 **处置**：`bench-halt.sh` flood 限 800 字符（< 1024），并加"连续 3 次
 超时即中止"看门狗（见 `practice/README.md` 测量陷阱备忘）。minivmm.c
 未改动——串口模型无错，不引入调试代码。
+
+## J. `practice/mini-kvm/`：设计期 stage 文档的技术错误（已回改）
+
+mini-kvm 从单文件 `examples/mini-kvm/mini-kvm.c` 拆成多文件内核模块
+（`main.c`/`vmx.c`/`ept.c`/`interrupt.c`/`device.c`/`vcpu.c`/`vmx_entry.S`）后，
+`stages/stage1..5.md` 与 `README.md` 仍是拆分前写的**设计期草稿**：伪代码不是
+真实代码，几处描述与硬件规范不符。下列错误全部已回改到原文，实现侧
+（`.c`/`.S`）本来就是对的，本轮没有改行为，只改了 `interrupt.c`/`vcpu.c`/
+`main.c` 的注释引用 —— 而这件"只改注释"的事本身让所有 `vcpu.c:行号` 引用失效，
+见 J10。所有引用对 Linux 6.12.93 与 `intel-vmx.pdf` 逐条核对。
+
+### J1. EPT violation 的 GPA 取自 `EXIT_QUALIFICATION`（stage4 概念块）
+
+**原文**：「MMIO …… 内存读写触发 EPT_VIOLATION VM-Exit，
+`EXIT_QUALIFICATION` 包含访问的 GPA」。
+
+**正确**：GPA 在 **`GUEST_PHYSICAL_ADDRESS`**（编码 `0x00002400`，
+`arch/x86/include/asm/vmx.h:261`；SDM 25.9.1："This field is used by VM exits
+due to EPT violations and EPT misconfigurations."）。
+`EXIT_QUALIFICATION`（`0x00006400`，`asm/vmx.h:349`）在 EPT violation 下的
+格式是 **SDM Table 28-7**，只有权限/类型标志位（bit 0 read / bit 1 write /
+bit 2 fetch / bits 5:3 本次行走条目 R/W/X 的 logical-AND / bit 7 GLA 有效 /
+bit 8 翻译访问 / bits 9-11 advanced VM-exit info / bit 12 IRET 解除 NMI 阻塞 /
+bit 13 shadow-stack / bit 14 SSS / bit 15 guest-paging verification /
+bit 16 异步访问），**一个地址位都没有**。照原文写会拿权限位拼出来的假地址
+当 GPA 去映射。
+
+**KVM 佐证**：`handle_ept_violation()` 里
+`gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);`（`arch/x86/kvm/vmx/vmx.c:5798`）。
+mini-kvm 同位置见 `ept.c:235`。
+
+### J2. EPT 条目 bit 7 被写成"Large Page 标志"（stage2「EPT 权限位」）
+
+**原文**给了一张不分层级的「EPT 条目位」表，其中
+`[7] Large Page - 大页标志`、`[12:51] Address`。
+
+**正确**：EPT 里**没有** x86-64 页表那种 PS 位的统一说法，位段按条目角色分
+三种表：
+
+| 条目 | 规范表 | bit 7 |
+|---|---|---|
+| 非叶（PML4E / PDPTE→PD / PDE→PT） | Table 29-2 / 29-4 / 29-6 | 与 bits 6:3 一起 "Reserved (must be 0)" |
+| PDE 映射 2MB 页 | Table 29-5 | "Must be 1 (otherwise, this entry references an EPT page table)" |
+| PTE 映射 4KB 页 | Table 29-7 | **"Ignored."** |
+
+也就是说：4KB 叶的 bit 7 根本不参与判定；把它当"大页标志"清零，在 2MB 叶上
+会让这条 PDE 变成"指向下一级页表"，翻译直接走歪。另外 bit 8/9（A/D）只在
+EPTP bit 6 = 1 时有效，bit 10（user-X）只在 MBEC = 1 时有效，bit 63 只在
+"EPT-violation #VE" = 1 时有效（均在 Table 29-5/29-7 的原文里限定）。
+mini-kvm 两侧都不开这些能力，`ept.c:143-152` 的 EPTP 因此不带
+`VMX_EPTP_AD_ENABLE_BIT`。
+
+### J3. IO 退出的 `EXIT_QUALIFICATION` 布局缺字段（stage4）
+
+**原文**只列了 size / direction / string / port 四项，且把串口代码写成
+"先解码再判 string"。
+
+**正确**（SDM Table 28-5）：bits 2:0 size−1（合法编码只有 0/1/3，4 与 5 是
+保留）、bit 3 方向（0=OUT，1=IN）、bit 4 string、bit 5 REP prefixed、
+bit 6 操作数编码（0=DX，1=立即数端口）、bits 15:7 未定义、bits 31:16 端口号、
+bits 63:32 未定义。指令长度**不在**这个字段里，在
+`VM_EXIT_INSTRUCTION_LEN`（`0x440c`，SDM 28.2.4）。实现侧 `device.c:59-102`
+与 KVM `handle_io()`（`vmx.c:5401-5420`）公式一致：`string = qual & 16`
+（`:5408`）先判、`port = qual >> 16`（`:5415`）、`size = (qual & 7) + 1`
+（`:5416`）、`in = qual & 8`（`:5417`）。
+
+### J4. 五篇文档的「预期输出」是编造的
+
+原文到处是 `=== Stage 1: VMX 初始化 ===`、`✓ CPU 支持 VMX`、
+`!!! VM-Exit 发生 !!!`、`Exit reason: 30 (IO)`、`Guest says: H` 这类横幅，
+模块里**一条都不存在**。stage1/2/4/5 与 README 的验收段已换成真实
+`pr_info` 字符串（`VMX_BASIC=… revision=… true_ctls=…`、`VMXON 完成…`、
+`memslot 注册 GPA=0x0 大小=512 页`、`VMCS 初始化完成 (vcpu=0 rev=…)`、
+`mini-kvm guest: <字符>`）。
+
+顺带两个数值错误（本轮新写文本时也犯了）：
+
+- `KVM_EXIT_HLT` = **5**（`include/uapi/linux/kvm.h:151`），不是 1。
+- `EXIT_REASON_EXCEPTION_NMI` = 0、`EXIT_REASON_EXTERNAL_INTERRUPT` = **1**
+  （`arch/x86/include/uapi/asm/vmx.h:32-33`），stage5 的分发表一度把后者
+  写成 0。这两个号挨着，最容易记反。
+- `RUN 结束 …` 统计行是 `pr_debug`（`vcpu.c:319-322`），不开 dynamic debug
+  根本看不到，文档必须写清 `echo -n 'module mini_kvm +p' | tee
+  /sys/kernel/debug/dynamic_debug/control` 这一步。
+
+### J5. 引用了 KVM 里不存在的函数
+
+**原文**：README 的 `interrupt.c` 一行对照源码写 `vmx_reinject_nmi()`；
+`interrupt.c` 头注释写「NMI 应当重新注入给 guest（对照 vmx.c
+`handle_exception_nmi` 的 NMI 再注入路径）」。
+
+**正确**：6.12.93 里 `vmx_reinject_nmi()` 不存在（全树 grep 无此符号）。
+KVM 对"guest 执行期间到达的 NMI"的处理恰好**相反**：在 root 模式直接跳宿主
+IDT 的 NMI 门消费掉（`vmx_vcpu_enter_exit()` → `vmx_do_nmi_irqoff()`，
+`vmx/vmx.c:7330-7338`；声明 `:6978`），`handle_exception_nmi()` 见到
+`is_nmi()` 直接 `return 1`，注释写明"NMIs are handled by
+vmx_vcpu_enter_exit()"（`vmx/vmx.c:5225-5231`）。KVM 注入给 guest 的 NMI
+来自用户态 `KVM_NMI` ioctl（`x86.c:5193-5197` → `kvm_inject_nmi()` →
+`KVM_REQ_NMI` → `process_nmi()`）与"已注入未被消费"的重投
+（`x86.c:10381-10388`）。
+
+**处置**：README 换成真实锚点；`interrupt.c` 注释改写为「mini-kvm 与 KVM 在
+这里是**分歧**而不是照抄」，并把代价（宿主自己的 NMI 被抢走，MCE 打印 /
+NMI watchdog 场景下不可用）写进注释与 stage3。
+
+同类：`CPU_BASED_IO_EXITING` 这个宏在 6.12.93 不存在，只有
+`CPU_BASED_UNCOND_IO_EXITING` 与 `CPU_BASED_USE_IO_BITMAPS`
+（`arch/x86/include/asm/vmx.h:43-44`）；`vmxon_1` 也不存在，
+`kvm_cpu_vmxon()`（`vmx.c:2833-2851`）用的是
+`asm goto("1: vmxon %[vmxon_pointer]") + _ASM_EXTABLE(1b, %l[fault])`。
+
+### J6. 「unconditional I/O exiting 与 IO bitmap 不能同时置」说反了
+
+stage1 原文：「IO 用 `CPU_BASED_UNCOND_IO_EXITING`，不是 `IO_EXITING` + IO
+bitmap，**两者不能同时置**」。
+
+**正确**：SDM Table 25-6 对 bit 25（use I/O bitmaps）写的是 "If the I/O
+bitmaps are used, the setting of the 'unconditional I/O exiting' control is
+**ignored**"；§26.1.3 给出完整真值表：两个都 0 → 指令正常执行；uncond=1 且
+bitmap=0 → 一律退出；bitmap=1 → 按 bitmap 判定（端口空间回绕访问时强制退出）。
+也就是**没有互斥检查**，只有优先级。mini-kvm 没有 bitmap 页，所以只留
+bit 24（本模块 `vmx.c:256-261`）。
+
+### J7. 事件注入约束的章节归属错了（`interrupt.c` 头注释 + stage3）
+
+**原文**把「IF=1 且 interruptibility bit0/bit1=0」两条都记在 SDM 27.3.1.4。
+
+**正确**：两条分属两处，且第二条对 NMI 同样生效：
+
+- RFLAGS 检查在 **27.3.1.4**（Checks on Guest RIP, RFLAGS, and SSP）：
+  "The IF flag (RFLAGS[bit 9]) must be 1 if the valid bit (bit 31) in the
+  VM-entry interruption-information field is 1 and the interruption type
+  (bits 10:8) is external interrupt."
+- interruptibility 检查在 **27.3.1.5**（Checks on Guest Non-Register State）：
+  "Bit 0 (blocking by STI) and bit 1 (blocking by MOV-SS) must both be 0 if
+  the valid bit … is 1 and the interruption type … has value 0, indicating
+  external interrupt, **or value 2, indicating non-maskable interrupt (NMI)**."
+  同节还规定：只有 "virtual NMIs" = 1 时才要求 bit3（NMI 阻塞）为 0
+  （NOTE 明说该控制为 0 时不作要求）——所以 `interrupt.c:96-99` 放弃转注
+  纯属策略，不是硬件逼的。
+- 字段自洽性另在 **27.2.1.3**：type=NMI ⇒ vector 必须为 2；type=硬件异常 ⇒
+  vector ≤ 31；bits 30:12 保留必须为 0。违反任一条都是 VM-Entry failure。
+- 另两条容易漏的：VM-Entry interruption-information 的 valid 位**每次
+  VM-Exit 都会被清**（25.8.3），以及 HLT activity state 下允许注入外部中断
+  与 NMI（27.3.1.5 的枚举）——这解释了 KVM `vmx_clear_hlt()`
+  （`vmx.c:1817-1828`）为什么改 activity state 而不是改 RFLAGS。
+
+### J8. 本轮重写时自己犯的错（记为流程教训）
+
+- README 第 7 节一度**凭记忆"引用"规范原文**：写了 "Any of the following
+  operations… must be executed on the logical processor that the VMCS is
+  active on" —— 这句话在 §25.11.1 里不存在。已换成逐字核对过的原文，并补上
+  真正的理由：§25.11.1 "a logical processor may maintain some VMCS data of an
+  active VMCS on the processor and not in the VMCS region"。
+- README 第 9 节一度写"完全没有投机执行侧的缓解"——过度概括。
+  `vmx_entry.S` 在弹出寄存器前清零全部 GPR，正是 KVM 的 L1F 卫生
+  （`vmenter.S:231-240`，理由原文含 "an L1 cache miss when restoring
+  registers could lead to speculative execution with the guest's values"）。
+  已改成"有 GPR 清零，缺 IBPB（`vmx.c:1486`）、L1D flush
+  （`vmx.c:234/:249/:251`）、`VMX_RUN_SAVE_SPEC_CTRL`（`vmx.c:960-961`）、
+  MDS/GDS 缓解"。
+- README 与 stage4 一度写"memslot 外的 GPA 会一直 EPT violation"——与实现
+  不符：`ept.c:238-243` 只报一次 `-EFAULT`，运行循环随即回
+  `KVM_EXIT_INTERNAL_ERROR`，不会循环退出。
+- "PIRL" 是我生造的词，规范里没有；写 PIR / VIRR（SDM 30.6）。
+- stage2 的 Table 28-7 位段第一版里我自己编了 "bit 14 = GDT/IDT 使用、
+  bit 15 = SN 页"，对照规范后改成 J1 里那份真实列表。
+
+**教训**：新增引用与"引用既有代码的行为概括"必须同一次动作里核对，不能先写
+后补；引号里的规范原文必须来自 `pdftotext` 的实际输出。
+
+### J9. 本文件自相矛盾：文档头说宿主是 KVM guest
+
+第 5 行原写「"实测"均指本机（宿主即一台 KVM guest，96 线程）」，与 H 节的
+复核结论（裸金属）冲突。已改为裸金属并注明见 H 节，同时声明 A–I 与 J 的
+验证强度不同：J 是静态勘误，**mini-kvm 的真机 `insmod` 与 `test-mini-kvm`
+验收尚未执行**。
+
+### J10. 本轮自己在引用上犯的三类错
+
+**(a) "只改注释"让全部 `vcpu.c:行号` 引用偏移一行。**
+本轮为 `interrupt.c`/`vcpu.c` 补注释时，`mini_vcpu_run_loop()` 内部的注入窗口
+注释多了一行，于是引用运行循环的三处 stage 文档集体偏一。逐个按当前文件重新
+推导后改成：
+
+| 引用点 | 错 | 对 |
+|---|---|---|
+| 注入窗口代码（stage3） | `vcpu.c:146-156` | `147-157` |
+| 循环头 + 刷新 Host（stage5） | `vcpu.c:138-156` | `138-157` |
+| bit31 entry-failure 拦截（stage5） | `vcpu.c:210-219` | `211-220` |
+| gs_shadow + 关中断窗口（stage5） | `vcpu.c:187-192` | `188-193` |
+| 进入失败分支（stage5） | `vcpu.c:194-202` | `195-203` |
+| `launched` 置位（stage5） | `vcpu.c:203-204` | `204-205` |
+| NMI 转注分支（stage3） | `vcpu.c:229-236` | `230-237` |
+| 收尾 `pr_debug`（stage3/stage5/本文件） | `318-321` / `316-322` | `319-322` / `318-322` |
+
+教训：改完被引用的源文件，必须**重新 grep 定位**而不是在旧行号上加减；同一轮里
+`interrupt.c:59-63`、`interrupt.c:91-105`、`interrupt.c:96-99`、
+`guest/guest.S:39-62`、本模块 `vmx.c:600-601`、`test-mini-kvm.c:9-19` 都按此
+重推过一遍。
+
+**(a′) 内核侧引用同样有偏差 —— 用脚本全量扫了一遍。**
+逐条读文档抓不到这类错，所以写了个小脚本：把 README、五篇 stage 与本节里所有
+`` `file.c:NNNN[-MMMM]` `` 抽出来，逐个在 `/root/code/linux-6.12.93/` 里解析
+路径（含 `vmx.c` 这种两处同名的歧义），打印被引用的那行原文，人工判是否对得上
+上下文。扫出的问题：
+
+| 引用点 | 错 | 对 |
+|---|---|---|
+| `kvm_online_cpu()`（本文件、`main.c`、README 第 9 节） | `kvm_main.c:5619-5626`（5619 是左花括号；上一轮"修正"改过头） | `5618-5626` |
+| `handle_ept_violation()` 读 GPA（stage4、J1） | `vmx.c:5799`（那是 `trace_kvm_page_fault`） | `5798` |
+| `__KVM_REQUIRED_VMX_VM_EXIT_CONTROLS`（stage3） | `vmx.h:514-516`（514 是空行） | `515-517` |
+| `vcpu_load()`（README、stage5、`vcpu.c` 注释） | `kvm_main.c:205-214`（214 是 `EXPORT_SYMBOL_GPL`） | `205-213` |
+| L1F 寄存器清零注释（README 第 9 节、J8） | `vmenter.S:231-239`（`*/` 在 240） | `231-240` |
+| "已注入未被消费"重投（stage3、`interrupt.c`、J5） | `x86.c:10382-10389`（首末各偏一） | `10381-10388` |
+| `handle_external_interrupt_irqoff()` 里的变量（stage3） | `host_idt` | `host_idt_base` |
+
+同一趟扫描顺带修掉一个**可读性缺陷**：裸 `vmx.c:NNNN` 在本项目里同时可能指
+`arch/x86/kvm/vmx/vmx.c` 和本模块自己的 `vmx.c`（`vmx.c:249`、`:256-261`、
+`:287-292`、`:574`、`:600-601` 全是后者）。凡是模块侧的都改写成
+「本模块 `vmx.c:…`」，内核侧写全路径。
+
+**教训**：文档里 `file:line` 的数量上千，靠肉眼必然漏；这类引用要么写符号名，
+要么用脚本机械核对。本节 A–I 是真机数据，J 的这些行号已按 6.12.93 与本机
+`make` 产物逐条校过。
+
+**(b) `mini-kvm.ko` 与 `mini_kvm` 混用。**
+`Makefile` 写的是 `obj-m := mini-kvm.o`，产物文件名带连字符；kbuild 把
+`-` 换成 `_` 才做成模块名（`scripts/Makefile.lib:108` 的
+`name-fix-token = $(subst $(comma),_,$(subst -,_,$1))`，经 `modname_flags`
+`:111` 变成 `-DKBUILD_MODNAME=`），modpost 生成的 `__this_module` 直接用它当
+`.name`（`scripts/mod/modpost.c:1765` `MODULE_INFO(name, KBUILD_MODNAME)`、
+`:1769` `.name = KBUILD_MODNAME`）。所以：
+
+- `insmod` 用**文件路径** → `sudo insmod mini-kvm.ko`（stage5 一度写
+  `mini_kvm.ko`，那个文件不存在）；
+- `rmmod` / dyndbg / `/sys/module/` 用**模块名** → `rmmod mini_kvm`、
+  `echo -n 'module mini_kvm +p' | tee /sys/kernel/debug/dynamic_debug/control`；
+- `dmesg | grep mini-kvm` 匹配的是 `pr_fmt` 前缀 `"mini-kvm: "`，与前两者无关。
+
+这条不止是读 kbuild 源码：本轮 `make` 实际产出的就是 `mini-kvm.ko`，而
+`strings mini-kvm.ko | grep '^name='` 给出 `name=mini_kvm`，与上面的推导一致。
+仍未验证的是模块的**运行行为**——真机 `insmod` + `test-mini-kvm` 九步验收
+（见本文件开头对 J 节的说明）。

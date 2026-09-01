@@ -8,21 +8,38 @@
  *   [11]    error-code 有效位（外部中断不置）
  *   [31]    valid
  *
- * 注入门槛（SDM 27.3.1.4）：注入外部中断要求 RFLAGS.IF=1 且
- * interruptibility 的 bit0（STI 阻塞）/bit1（MOV SS 阻塞）为 0，
- * 否则 VM-Entry 检查失败。
+ * 注入门槛分两处：RFLAGS.IF 的检查在 SDM 27.3.1.4（"The IF flag
+ * (RFLAGS[bit 9]) must be 1 if the valid bit ... is 1 and the
+ * interruption type ... is external interrupt"）；interruptibility 的
+ * bit0（STI 阻塞）/bit1（MOV SS 阻塞）的检查在 SDM 27.3.1.5，对
+ * type 0（外部中断）与 type 2（NMI）**同样**要求两位都为 0。
+ * 任一不满足都是 VM-Entry 检查失败。
+ *
+ * 另有一条在字段本身：type 为 NMI 时 vector 必须是 2（SDM 27.2.1.3）。
  *
  * 与真实 KVM 的差异（教学简化，见 stages/stage3-interrupt.md）：
  *   - KVM 用 RVI/中断窗口退出（interrupt-window exiting）排队等窗口，
- *     不改 guest 的 RFLAGS（vmx.c 的 handle_interrupt_window /
- *     vmx_set_rvi）。
+ *     不改 guest 的 RFLAGS：能不能注入由 __vmx_interrupt_blocked()
+ *     判定（vmx.c:5076-5081，测的就是 IF 与 interruptibility 的
+ *     STI/MOV-SS 两位），等不到就 enable_irq_window 让硬件在
+ *     guest 开中断的那一刻退出（handle_interrupt_window()，
+ *     vmx.c:5658；APICv 走 RVI：vmx_set_rvi()，vmx.c:6881）。
  *   - mini-kvm 在 RUN 循环应用注入时直接强制 IF=1 并清阻塞位。
  *     对我们的 64 位教学 guest 语义等价（guest 本来就要开中断等注入）。
  *
- * NMI 再注入：宿主收到的 NMI 会在 PIN_BASED_NMI_EXITING 下退出到
- * mini-kvm（退出原因 0 + vector 2）。NMI 属于 guest 的执行上下文，
- * 应当重新注入给 guest（对照 vmx.c handle_exception_nmi 的
- * NMI 再注入路径）。
+ * NMI：宿主收到的 NMI 会在 PIN_BASED_NMI_EXITING 下退出到 mini-kvm
+ * （退出原因 0，VM_EXIT_INTR_INFO 的 type=2 / vector=2，SDM 28.2.2）。
+ *
+ * 这里 mini-kvm 与 KVM 是**分歧**而不是照抄：KVM 认为这种 NMI 属于宿主，
+ * 在 root 模式直接跳进宿主 IDT 的 NMI 门把它消费掉
+ * （vmx.c:7330-7338 调 vmx_do_nmi_irqoff()），所以 handle_exception_nmi()
+ * 见到 is_nmi() 直接 return 1（vmx.c:5225-5231）。KVM 注入给 guest 的 NMI
+ * 另有来源：用户态 KVM_NMI ioctl（x86.c:5193-5197 → kvm_inject_nmi()）
+ * 以及"已注入但 guest 还没消费"的重投（x86.c:10381-10388）。
+ *
+ * mini-kvm 把这类 NMI 转注给 guest：教学 guest 是本模块唯一的执行体，
+ * 而且这样能让 guest 的 NMI 处理路径可观测。代价是宿主自己的 NMI 被抢走，
+ * 真需要宿主 NMI（比如 MCE 打印、perf nmi watchdog）时这是错的。
  */
 
 #include <linux/kernel.h>
