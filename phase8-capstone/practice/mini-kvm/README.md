@@ -6,8 +6,25 @@
 > **构建目标**：正在运行的内核（`KDIR = /lib/modules/$(uname -r)/build`，
 > vermagic 一致才能 `insmod`）。
 > **参考实现**：Linux 6.12.93 —— `/root/code/linux-6.12.93/`，只用于阅读与
-> 引用，不是构建目标。文中所有 `文件:行号` 都指这棵树，`SDM x.y` 指
-> `intel-vmx.pdf`（Vol.3C）。
+> 引用，不是构建目标。文中所有不带路径的 `文件:行号` 都指本目录。
+>
+> **同名歧义**：本模块与内核树的 `arch/x86/kvm/vmx/` 都有 `vmx.c`。约定是——
+> 指本模块时一定带"本模块"或把 "`文件:行号`" 写在代码块的 `来源:` 行里；指 KVM
+> 时要么带函数名（如"`vmx_set_cr4()` 在 `vmx.c:3470`"），要么写
+> `arch/x86/kvm/...` 全路径。**行号只要落在本目录同名文件的长度之内（`vmx.c`
+> 800 余行、`main.c` 500 余行）就必须写全路径**，光靠"4xxx 一看就是内核树"这种
+> 量级提示，只在明显超出本地文件长度时才成立。
+>
+> **规范引用**：`intel-vmx.pdf` = Intel 文档号 **326019-083US**（2024 年 3
+> 月），本仓库这份只含 **Volume 3C**，正文止于该卷第 33 章的 33-84 页。所以
+> 两件事必须说清：(1) `§22.x` / `§23.x` 这类编号在这份 PDF 里**根本没有对应
+> 章节** —— Vol.3C 从第 24 章开始，那些数字是 KVM 源码里化石级注释的遗留
+> （`vmx_set_constant_host_state()` 里的 `/* 22.2.3 */`，
+> `arch/x86/kvm/vmx/vmx.c:4328` 等，说明见本模块 `vmx.c` 写 host CR0/CR3/CR4
+> 那段注释）；(2) Vol.3C 里以 "see Appendix
+> A.x" / "see Table 12-7" 形式转引的内容（附录 A 的 VMX capability MSR、
+> PAT/MTRR 的组合表、IDT 门描述符格式等）**都不在本仓库这份 PDF 里，本地无
+> 法复核**。引用它们时只写"由 Vol.3C §x.y 转述"，不假装查过原文。
 
 ---
 
@@ -49,7 +66,7 @@ KVM_RUN                ──────────────→   guest 的
 | 文件 | Stage | 内容 | 对照的 KVM 实现 |
 |---|---|---|---|
 | `mini-kvm.h` | — | 数据结构、常量、私有 ioctl、`mini_rdmsr()/mini_wrmsr()` | `include/linux/kvm_host.h`、`arch/x86/kvm/vmx/vmx.h` |
-| `main.c` | 1 | 能力 MSR 采集、per-CPU CR4.VMXE + VMXON/VMXOFF、模块生命周期 | `vmx_hardware_setup()`、`kvm_cpu_vmxon()`（`vmx.c:2833-2851`）、`kvm_cpu_vmxoff()`（`vmx.c:743-755`） |
+| `main.c` | 1 | 能力 MSR 采集、per-CPU CR4.VMXE + VMXON/VMXOFF、模块生命周期 | `vmx_hardware_setup()`、`kvm_cpu_vmxon()`（`vmx.c:2833-2851`）、`kvm_cpu_vmxoff()`（`arch/x86/kvm/vmx/vmx.c:743-755`） |
 | `vmx.c` | 1 | VMX 指令包装、控制域协商、VMCS guest/host 状态初始化、VMCS 迁移与 VMCLEAR | `init_vmcs()`、`vmx_set_constant_host_state()`（`vmx.c:4320-4385`）、`vmx_vcpu_load_vmcs()`（`vmx.c:1449-1514`） |
 | `vmx_entry.S` | 1 | 手写世界切换：VMLAUNCH/VMRESUME 进入、VM-Exit 着陆点、寄存器换入换出与收栈 | `arch/x86/kvm/vmx/vmenter.S`（`__vmx_vcpu_run`） |
 | `ept.c` | 2 | 4 级 EPT 手工建表、EPT violation 按需映射、INVEPT | TDP MMU（`arch/x86/kvm/mmu/tdp_mmu.c`）、`construct_eptp()`（`vmx.c:3411-3423`） |
@@ -58,7 +75,8 @@ KVM_RUN                ──────────────→   guest 的
 | `vcpu.c` | 5 | 三层 fd 的 ioctl/mmap、运行循环与退出分发 | `kvm_dev_ioctl()`/`kvm_vm_ioctl()`/`kvm_vcpu_ioctl()`、`vcpu_run()`（`x86.c:11343`）、`vcpu_enter_guest()`（`x86.c:10777`） |
 | `test-mini-kvm.c` | — | 用户态验收程序 | QEMU/crosvm 的 KVM 调用序列 |
 | `guest/guest.S`、`guest/guest.ld` | 3-5 | guest 裸机镜像：自建 IDT、串口输出、sti+hlt | — |
-| `stages/stage1..5.md` | — | 每个 Stage 的原理笔记（已按实现重写，引用逐条核对） | — |
+| `stages/stage1..5.md` | — | 每个 Stage 的原理笔记（已按实现重写，`file:line` 由 `check-refs.py` 机械核对） | — |
+| `check-refs.py` | — | 把文档里所有 `file:line` 解析成原文打印，报越界/找不到 | — |
 
 ## 3. 构建
 
@@ -103,8 +121,14 @@ sudo modprobe kvm_intel
 `make load` / `make unload` / `make restore` 是这几步的简写（`load` 会先做
 第 1、2 步检查，不通过就拒绝）。
 
-为什么不能和 `kvm_intel` 并存：一台逻辑处理器同一时刻只能有一个 VMXON
-区域生效（SDM 23.7），而 `kvm_intel` 已经把 `CR4.VMXE` 置上了。
+为什么不能和 `kvm_intel` 并存：一台逻辑处理器同一时刻只有一份 VMXON 区域
+在生效 —— SDM Vol.3C §31.3 的 VMXON 伪码只有 `ELSIF not in VMX operation`
+这一支会真正进入，已经在 VMX root operation 时执行 VMXON 得到的是
+`VMfail("VMXON executed in VMX root operation")`（§31.4 Table 31-1 错误号
+15），不是成功换一份区域；而 `kvm_intel` 已经把 `CR4.VMXE` 置上了。这一条
+指令自己**不会**替我们报错（VMfail 只置标志），所以模块在 VMXON 之前显式查
+`cr4_read_shadow() & X86_CR4_VMXE` 并回 `-EBUSY`，对照 KVM 的
+`vmx_enable_virtualization_cpu()`（`vmx.c:2859-2860`）。
 
 ## 5. 用户态 API
 
@@ -182,7 +206,7 @@ sudo modprobe kvm_intel
 | 架构 | 只 x86 VMX/EPT | x86 SVM/VMX/ARM |
 | VM/vCPU | 单 vCPU、单 memslot、memslot 只能设一次 | 多 vCPU、多 slot、热变更 |
 | 内存 | 4 级 EPT、叶一律 4KB、按需映射 | TDP MMU + 影子页表、2M/1G 大页、PML 脏页跟踪 |
-| 地址类型 | MMIO 不实现：落在 memslot 外的 GPA 直接 `-EFAULT`（`ept.c:238-243`）→ `KVM_EXIT_INTERNAL_ERROR` | `handle_ept_misconfig`/`kvm_io_bus` 派发 MMIO |
+| 地址类型 | MMIO 不实现：落在 memslot 外的 GPA 直接 `-EFAULT`（`ept.c:243-248`）→ `KVM_EXIT_INTERNAL_ERROR` | `handle_ept_misconfig`/`kvm_io_bus` 派发 MMIO |
 | IO | `CPU_BASED_UNCOND_IO_EXITING`（无 IO bitmap）；`IN` 一律返回 0；串 IO 拒绝 | IO bitmap + 指令模拟（`handle_io()` 走 emulator） |
 | 中断 | 用户态显式请求注入单个 vector；无虚拟 LAPIC、无 Posted Interrupt、无 PIR/VIRR | in-kernel LAPIC + `kvm_pic`/`kvm_ioapic` + VT-d Posted Interrupts（SDM 30.6） |
 | 异常 | 位图捕获 #DB/#UD/#GP/#PF 后报错退出 | 注入回 guest + emulator |
@@ -202,7 +226,7 @@ sudo modprobe kvm_intel
   都没有**：vCPU 换 pCPU 时不发 IBPB（KVM 有
   `indirect_branch_prediction_barrier()`，`vmx.c:1486`）、进入 guest 前不做
   L1D 缓冲冲洗（KVM 的 `vmentry_l1d_flush_param`/`vmx_l1d_flush_pages`，
-  `vmx.c:234`、`:249`，由 `vmx_setup_l1d_flush()` `:251` 建立）、不保存/恢复
+  `arch/x86/kvm/vmx/vmx.c:234`、`:249`，由 `vmx_setup_l1d_flush()` `:251` 建立）、不保存/恢复
   `IA32_SPEC_CTRL`（KVM 在 MSR 未被拦截时置 `VMX_RUN_SAVE_SPEC_CTRL`，
   `vmx.c:960-961`）、也没有 MDS/GDS 缓冲冲洗。等于把宿主与同机其他 VM 暴露给
   Spectre v2 / L1TF / MDS 类的跨世界推断。

@@ -25,7 +25,7 @@ PIO 走独立端口空间，`IN`/`OUT` 触发 `IO_INSTRUCTION` 退出；MMIO 是
 
 ### PIO 退出的解码字段
 
-SDM Vol.3 Table 28-5（Exit Qualification for I/O Instructions）：
+SDM Vol.3C §28.2.1 里的 Table 28-5（Exit Qualification for I/O Instructions）：
 
 ```
 [2:0]   访问大小：0 = 1 字节，1 = 2 字节，3 = 4 字节（其他值不使用）
@@ -39,19 +39,22 @@ SDM Vol.3 Table 28-5（Exit Qualification for I/O Instructions）：
 ```
 
 指令长度**不在**这个字段里，它是独立的 VMCS 字段
-`VM_EXIT_INSTRUCTION_LEN`（编码 `0x440c`）—— IO 退出后 guest RIP 仍停在原
-指令上，必须自己加上这个长度才能前进（SDM 28.2.4）。
+`VM_EXIT_INSTRUCTION_LEN`（编码 `0x440c`）—— IO 退出是 fault-like 的，guest
+RIP 仍停在原指令上，必须自己加上这个长度才能前进。字段定义在 SDM Vol.3C
+§25.9.4，"哪些退出会填充它"的清单在 §28.2.5，`IN`/`OUT`/`INS`/`OUTS` 明确在列；
+同一节最后一句是 **"All VM exits other than those listed in the above items
+leave this field undefined"** —— 所以不能无条件拿它去推进 RIP。
 
 ### MMIO
 
 MMIO 类退出（EPT violation）的 GPA 来自 `GUEST_PHYSICAL_ADDRESS`（`0x2400`），
-不是 `EXIT_QUALIFICATION`（那里只有访问性质与权限位，SDM 25.9.1 / Table
-28-7）。KVM 自己也是这么取的：`handle_ept_violation()` 里
+不是 `EXIT_QUALIFICATION`（那里只有访问性质与权限位，格式见 §28.2.1 的
+Table 28-7）。KVM 自己也是这么取的：`handle_ept_violation()` 里
 `gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);`（`vmx.c:5798`）。详见
 `stage2-ept.md` 第 3 节。
 
 mini-kvm **没有任何 MMIO 设备**：落在 memslot 外的 GPA 不会被建映射，
-`mini_ept_handle_violation()` 直接返回 `-EFAULT`（`ept.c:238-243`），运行循环
+`mini_ept_handle_violation()` 直接返回 `-EFAULT`（`ept.c:243-248`），运行循环
 报 `KVM_EXIT_INTERNAL_ERROR`。
 
 ### 串口模拟
@@ -74,7 +77,7 @@ TX-empty / RX-ready）是跑不通的 —— 完整的 16550A 模型是用户态
 ### 代码
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/device.c:59-102（注释略） */
+/* 来源: phase8-capstone/practice/mini-kvm/device.c:61-104（注释略） */
 int mini_handle_io_exit(struct mini_kvm_vcpu *vcpu)
 {
 	u64 qual, rip, len;
@@ -140,7 +143,7 @@ sudo dmesg | grep 'mini-kvm guest'
 # mini-kvm guest: [IRQ 0x21 handled]
 ```
 
-串口是**按行**打点的：`mini_serial_out()`（`device.c:31-54`）逐字节记进环形
+串口是**按行**打点的：`mini_serial_out()`（`device.c:33-56`）逐字节记进环形
 缓冲，遇到 `'\n'` 才把最近一行 `pr_info` 出去。用户态另有
 `MINI_KVM_VM_GET_SERIAL` 可以把整段缓冲取回去做断言，`test-mini-kvm` 用的
 就是这条路。写了别的端口会看到

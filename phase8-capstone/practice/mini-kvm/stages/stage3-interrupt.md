@@ -192,7 +192,7 @@ present + DPL0 + 64 位中断门），全部指向 `irq_stub`（直接 `iretq`�
 
 `PIN_BASED_NMI_EXITING` = 1 时，宿主的 NMI 会以 **退出原因 0（EXCEPTION_NMI）
 + `VM_EXIT_INTR_INFO` type=2 / vector=2** 出现（SDM 28.2.2）。运行循环
-（`vcpu.c:230-237`）认出这个组合后调 `mini_vcpu_reinject_nmi()`，把 NMI
+（`vcpu.c:277-284`）认出这个组合后调 `mini_vcpu_reinject_nmi()`，把 NMI
 转注给 guest：
 
 ```c
@@ -240,7 +240,7 @@ guest 的 NMI 路径可观测；代价是**宿主自己的 NMI 被抢走**，需
 | 宿主 NMI | 转注给 guest（分歧点，见上） | 宿主自己消费（`vmx_do_nmi_irqoff()`） |
 | NMI 阻塞 | 只看 bit3，放弃即丢 | virtual NMIs（`enable_vnmi`）或软件 `soft_vnmi_blocked` |
 | Posted Interrupts | 无 | `posted_intr.c`：PIR→VIRR、RVI 由硬件评估，正常路径 0 次 VM-Exit（SDM 30.6） |
-| 异常捕获 | `EXCEPTION_BITMAP` = #DB/#UD/#GP/#PF（本模块 `vmx.c:600-601`） | 按需 + 软件模拟（`handle_exception_nmi()`） |
+| 异常捕获 | `EXCEPTION_BITMAP` = #DB/#UD/#GP/#PF（本模块 `vmx.c:718-719`） | 按需 + 软件模拟（`handle_exception_nmi()`） |
 
 ## 🧪 实验验证
 
@@ -256,7 +256,7 @@ sudo ./test-mini-kvm
 （`KVM_EXIT_HLT = 5`，`include/uapi/linux/kvm.h:151`）。串口缓冲是
 `MINI_KVM_VM_GET_SERIAL` 一次性读出的**累计**内容，所以第二次读到的是两行。
 
-内核侧的统计行走 `pr_debug`（`vcpu.c:319-322`），要先打开 dynamic debug：
+内核侧的统计行走 `pr_debug`（`vcpu.c:366-369`），要先打开 dynamic debug：
 
 ```bash
 echo -n 'module mini_kvm +p' | sudo tee /sys/kernel/debug/dynamic_debug/control

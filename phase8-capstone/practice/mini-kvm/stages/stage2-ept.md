@@ -77,7 +77,7 @@ accessed 位（`ept.c` 的 `mini_ept_init()`，对照 `construct_eptp()`
 ### 1. EPT 初始化（`mini_ept_init()`）
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/ept.c:136-152（注释略） */
+/* 来源: phase8-capstone/practice/mini-kvm/ept.c:137-159（注释略） */
 pml4 = alloc_page(GFP_KERNEL | __GFP_ZERO);
 kvm->ept.pml4 = pml4;
 /* construct_eptp() 对照: arch/x86/kvm/vmx/vmx.c:3411-3423 */
@@ -90,7 +90,7 @@ EPTP（SDM 25.6.11，Table 25-9）：`[2:0]` 页表访问的内存类型 = WB(6)
 ### 2. 4 级行走与中间层分配（`mini_ept_walk()`）
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/ept.c:187-222（注释略） */
+/* 来源: phase8-capstone/practice/mini-kvm/ept.c:192-227（注释略） */
 static u64 *mini_ept_walk(struct mini_kvm_ept *ept, u64 gpa, bool alloc)
 {
 	static const int shifts[4] = {39, 30, 21, 12};
@@ -118,15 +118,15 @@ static u64 *mini_ept_walk(struct mini_kvm_ept *ept, u64 gpa, bool alloc)
 ```
 
 两个实现要点：
-- 中间层只写 RWX，不写内存类型位（`EPT_ENTRY_RWX`，`ept.c:59`），叶条目才
-  追加 `EPT_MEMTYPE_WB = 6ULL << 3`（`ept.c:61`）。
+- 中间层只写 RWX，不写内存类型位（`EPT_ENTRY_RWX`，`ept.c:64`），叶条目才
+  追加 `EPT_MEMTYPE_WB = 6ULL << 3`（`ept.c:66`）。
 - 分配标志是 `GFP_ATOMIC`：本函数在 EPT-violation 路径上被调用，那时运行循环
   处于 `preempt_disable()` + 关中断。
 
 ### 3. EPT Violation 处理（`mini_ept_handle_violation()`）
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/ept.c:228-255（错误分支略） */
+/* 来源: phase8-capstone/practice/mini-kvm/ept.c:233-261（错误分支略） */
 int mini_ept_handle_violation(struct mini_kvm_vcpu *vcpu)
 {
 	struct mini_kvm_memslot *slot = &vcpu->kvm->slot;
@@ -135,7 +135,7 @@ int mini_ept_handle_violation(struct mini_kvm_vcpu *vcpu)
 
 	mini_vmread(GUEST_PHYSICAL_ADDRESS, &gpa);
 	gpa &= PAGE_MASK;
-	/* GPA 不在 slot 内 → -EFAULT（ept.c:238-243） */
+	/* GPA 不在 slot 内 → -EFAULT（ept.c:243-248） */
 
 	idx = (gpa - slot->base_gpa) >> PAGE_SHIFT;
 	entry = mini_ept_walk(&vcpu->kvm->ept, gpa, true);

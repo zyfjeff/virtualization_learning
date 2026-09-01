@@ -423,7 +423,7 @@ bit 16 异步访问），**一个地址位都没有**。照原文写会拿权限
 
 **KVM 佐证**：`handle_ept_violation()` 里
 `gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);`（`arch/x86/kvm/vmx/vmx.c:5798`）。
-mini-kvm 同位置见 `ept.c:235`。
+mini-kvm 同位置见 `ept.c:240`。
 
 ### J2. EPT 条目 bit 7 被写成"Large Page 标志"（stage2「EPT 权限位」）
 
@@ -443,7 +443,7 @@ mini-kvm 同位置见 `ept.c:235`。
 会让这条 PDE 变成"指向下一级页表"，翻译直接走歪。另外 bit 8/9（A/D）只在
 EPTP bit 6 = 1 时有效，bit 10（user-X）只在 MBEC = 1 时有效，bit 63 只在
 "EPT-violation #VE" = 1 时有效（均在 Table 29-5/29-7 的原文里限定）。
-mini-kvm 两侧都不开这些能力，`ept.c:143-152` 的 EPTP 因此不带
+mini-kvm 两侧都不开这些能力，`ept.c:147-157` 的 EPTP 因此不带
 `VMX_EPTP_AD_ENABLE_BIT`。
 
 ### J3. IO 退出的 `EXIT_QUALIFICATION` 布局缺字段（stage4）
@@ -455,7 +455,7 @@ mini-kvm 两侧都不开这些能力，`ept.c:143-152` 的 EPTP 因此不带
 保留）、bit 3 方向（0=OUT，1=IN）、bit 4 string、bit 5 REP prefixed、
 bit 6 操作数编码（0=DX，1=立即数端口）、bits 15:7 未定义、bits 31:16 端口号、
 bits 63:32 未定义。指令长度**不在**这个字段里，在
-`VM_EXIT_INSTRUCTION_LEN`（`0x440c`，SDM 28.2.4）。实现侧 `device.c:59-102`
+`VM_EXIT_INSTRUCTION_LEN`（`0x440c`，SDM 28.2.4）。实现侧 `device.c:61-104`
 与 KVM `handle_io()`（`vmx.c:5401-5420`）公式一致：`string = qual & 16`
 （`:5408`）先判、`port = qual >> 16`（`:5415`）、`size = (qual & 7) + 1`
 （`:5416`）、`in = qual & 8`（`:5417`）。
@@ -475,7 +475,7 @@ bits 63:32 未定义。指令长度**不在**这个字段里，在
 - `EXIT_REASON_EXCEPTION_NMI` = 0、`EXIT_REASON_EXTERNAL_INTERRUPT` = **1**
   （`arch/x86/include/uapi/asm/vmx.h:32-33`），stage5 的分发表一度把后者
   写成 0。这两个号挨着，最容易记反。
-- `RUN 结束 …` 统计行是 `pr_debug`（`vcpu.c:319-322`），不开 dynamic debug
+- `RUN 结束 …` 统计行是 `pr_debug`（`vcpu.c:366-369`），不开 dynamic debug
   根本看不到，文档必须写清 `echo -n 'module mini_kvm +p' | tee
   /sys/kernel/debug/dynamic_debug/control` 这一步。
 
@@ -515,7 +515,7 @@ bitmaps are used, the setting of the 'unconditional I/O exiting' control is
 **ignored**"；§26.1.3 给出完整真值表：两个都 0 → 指令正常执行；uncond=1 且
 bitmap=0 → 一律退出；bitmap=1 → 按 bitmap 判定（端口空间回绕访问时强制退出）。
 也就是**没有互斥检查**，只有优先级。mini-kvm 没有 bitmap 页，所以只留
-bit 24（本模块 `vmx.c:256-261`）。
+bit 24（本模块 `vmx.c:282`）。
 
 ### J7. 事件注入约束的章节归属错了（`interrupt.c` 头注释 + stage3）
 
@@ -592,7 +592,7 @@ bit 24（本模块 `vmx.c:256-261`）。
 
 教训：改完被引用的源文件，必须**重新 grep 定位**而不是在旧行号上加减；同一轮里
 `interrupt.c:59-63`、`interrupt.c:91-105`、`interrupt.c:96-99`、
-`guest/guest.S:39-62`、本模块 `vmx.c:600-601`、`test-mini-kvm.c:9-19` 都按此
+`guest/guest.S:39-62`、本模块 `vmx.c:718-719`、`test-mini-kvm.c:9-19` 都按此
 重推过一遍。
 
 **(a′) 内核侧引用同样有偏差 —— 用脚本全量扫了一遍。**
@@ -614,7 +614,8 @@ bit 24（本模块 `vmx.c:256-261`）。
 同一趟扫描顺带修掉一个**可读性缺陷**：裸 `vmx.c:NNNN` 在本项目里同时可能指
 `arch/x86/kvm/vmx/vmx.c` 和本模块自己的 `vmx.c`（`vmx.c:249`、`:256-261`、
 `:287-292`、`:574`、`:600-601` 全是后者）。凡是模块侧的都改写成
-「本模块 `vmx.c:…`」，内核侧写全路径。
+「本模块 `vmx.c:…`」，内核侧写全路径。这一串数字只是当时的快照，`vmx.c` 之后
+又被改过，现值一律以 J11(6) 的表为准。
 
 **教训**：文档里 `file:line` 的数量上千，靠肉眼必然漏；这类引用要么写符号名，
 要么用脚本机械核对。本节 A–I 是真机数据，J 的这些行号已按 6.12.93 与本机
@@ -638,3 +639,238 @@ bit 24（本模块 `vmx.c:256-261`）。
 `strings mini-kvm.ko | grep '^name='` 给出 `name=mini_kvm`，与上面的推导一致。
 仍未验证的是模块的**运行行为**——真机 `insmod` + `test-mini-kvm` 九步验收
 （见本文件开头对 J 节的说明）。
+
+### J11. 静态审计轮：CR4 的"第二份副本"、guest CR4.VMXE，以及 §27.3.1.2 的两处过度概括
+
+本轮仍然不能上机（卸载 `kvm_intel` 会打断宿主所有 VM；本机 `/dev/cpu/*/msr` 一律
+EIO，能力 MSR 读不到），所以做的是"把只有真机会炸的东西挖出来"的静态审计。**结论
+按危险程度排序。**
+
+#### (1) 裸写 CR4 绕过内核的 CR4 影子 —— 会在进程切换里 #GP(0) 打崩宿主
+
+`main.c` 的 `mini_vmx_enable_one()` / `mini_vmx_disable_one()` 原来这样开/关
+VMX 能力：
+
+```c
+asm volatile("mov %%cr4, %0" : "=r"(cr4));
+cr4 |= X86_CR4_VMXE;
+asm volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+```
+
+这在功能上"看起来对"，但它绕过了内核维护的第二份副本 —— per-CPU 影子
+`cpu_tlbstate.cr4`：
+
+```c
+/* 来源: arch/x86/kernel/cpu/common.c:453-464（Linux 6.12.93） */
+void cr4_update_irqsoff(unsigned long set, unsigned long clear)
+{
+	unsigned long newval, cr4 = this_cpu_read(cpu_tlbstate.cr4);
+
+	lockdep_assert_irqs_disabled();
+
+	newval = (cr4 & ~clear) | set;
+	if (newval != cr4) {
+		this_cpu_write(cpu_tlbstate.cr4, newval);
+		__write_cr4(newval);
+	}
+}
+```
+
+**新值是从影子里算出来的**，不是从真实 CR4。而 `switch_mm_irqs_off()`
+（`arch/x86/mm/tlb.c:499`）每换一次 mm 都会走
+`cr4_update_pce_mm(next)`（`:658`，函数体 `:469-482`），里面是
+`cr4_set_bits_irqsoff(X86_CR4_PCE)` / `cr4_clear_bits_irqsoff(X86_CR4_PCE)`
+（`CONFIG_PERF_EVENTS` 下，RDPMC 权限随进程切换变化时）。于是：VMXE 只在真实
+CR4 里、不在影子里 → 下一次 PCE 变化就会用"没有 VMXE 的影子值"执行 `MOV to
+CR4`。
+
+这一条 `MOV CR4` 在 VMX root operation 里是硬件禁止的 —— SDM Vol.3C §24.8
+第一条：*"Any attempt to set one of these bits to an unsupported value while in
+VMX operation (including VMX root operation) using any of the CLTS, LMSW, or MOV
+CR instructions causes a general-protection exception"*，紧跟的 NOTE 列出
+*"the following bits be 1 in VMX operation: CR0.PE, CR0.NE, CR0.PG, and
+CR4.VMXE"*；§24.7 也有一句 *"Once in VMX operation, it is not possible to clear
+CR4.VMXE (see Section 24.8)"*。所以症状是**宿主在进程切换路径上吃 #GP(0)**，
+比"guest 起不来"严重一个量级。
+
+第二个后果更隐蔽：`mini_vmx_enable_one()` 用来拦"已有 VMX 用户"的那句
+`if (cr4_read_shadow() & X86_CR4_VMXE)`（对照 KVM
+`arch/x86/kvm/vmx/vmx.c:2859-2860`）读的正是这个影子（`common.c:467-472` 导出）。
+裸写 → 自己的 VMXE 在影子里不可见 → 第二次 `insmod` 拦不住；随后
+`modprobe kvm_intel` 也拦不住（它查的同样是影子）→ 两个 VMXON 用户叠在同一台
+CPU 上。
+
+**修法**：改用 `cr4_set_bits()` / `cr4_clear_bits()`（`arch/x86/include/asm/
+tlbflush.h:41` / `:51`），与 KVM 完全一致（`arch/x86/kvm/vmx/vmx.c:2837`、`:2848`，
+`kvm_cpu_vmxoff()` 里 `:749`、`:753`）。调用点都在 `on_each_cpu()` 的 IPI 回调
+（中断关闭），满足 `lockdep_assert_irqs_disabled()`。
+
+#### (2) 上面这个错误的根因是一条假前提："cr4_set_bits() 没有导出给模块"
+
+`main.c` 与 `vmx.c` 的注释都写着 *"`cr4_set_bits()`/`cr4_clear_bits()` 没有导出
+给模块（见 6.8 的 Module.symvers，只有 `cr4_read_shadow` 导出），所以只能裸写
+CR4"*。**假的**：这两个是 `asm/tlbflush.h` 里的 `static inline`，它们唯一的内核
+调用 `cr4_update_irqsoff()` 在 `arch/x86/kernel/cpu/common.c:465` 有
+`EXPORT_SYMBOL`。两条可复现的证据：
+
+```
+$ nm -u mini-kvm.ko | grep cr4
+                 U cr4_read_shadow
+                 U cr4_update_irqsoff
+$ grep cr4_update_irqsoff /lib/modules/$(uname -r)/build/Module.symvers
+0x0b637410	cr4_update_irqsoff	vmlinux	EXPORT_SYMBOL
+```
+
+对照：同一张表里 `vmcs_read*` / `vmcs_write*` 一个都没有 —— 那才是模块真的用
+不了、必须自己包装 VMREAD/VMWRITE 的情形（`vmx.c:89` 那条注释是对的）。
+教训：**"内核没导出所以只能裸来"这种前提，必须用 `Module.symvers` /
+`nm -u` 验一次再写进注释**，它直接决定了要不要写一段危险代码。
+
+#### (3) guest CR4 缺 VMXE（上一轮改对，本轮补全链条）
+
+`MINI_GUEST_CR4` 原来只有 `X86_CR4_PAE`，注释还理由是"非根模式下 VMXE 该是
+0"——架构上错的那句。VMX operation 含 root 与非 root 两种状态，§24.8 NOTE 要求
+CR4.VMXE 在两种状态下都为 1；§27.3.1.1 对 guest CR4 字段直接做这条检查
+（*"The CR4 field must not set any bit to a value not supported in VMX operation
+(see Section 24.8)"* —— 该节起于 Vol.3C 27-8 页，CR4 这条 bullet 落在 27-9 页），
+且同节只给 CR0.PE/CR0.PG 开了
+unrestricted-guest 例外（*"Bit 0 … and bit 31 (PG) are not checked if the
+'unrestricted guest' VM-execution control is 1"*），**CR4.VMXE 没有例外**。
+漏掉的结果是 VM entry 直接失败，退出原因 33（§27.8）。KVM 侧同样强制：三个
+`KVM_*_VM_CR4_ALWAYS_ON*` 常量都含 `X86_CR4_VMXE`
+（`arch/x86/kvm/vmx/vmx.c:156-158`），`vmx_set_cr4()` 三条分支都会或上它
+（`:3481-3487`），最后 `vmcs_writel(GUEST_CR4, hw_cr4)`（`:3528`）。
+副作用（已写进注释）：本模块没开 "use CR4 shadows"，guest 读 CR4 会看到
+VMXE=1；KVM 用 `CR4_READ_SHADOW` 字段（`:3527`）把它藏掉。
+
+#### (4) §27.3.1.2 的两处过度概括（stage1 正文）
+
+| 原文 | 规范实际怎么说（Vol.3C §27.3.1.2） |
+|---|---|
+| "要求 CS 可用且 `L=1, D=0`" | **没有任何一条要求 CS.L=1**。唯一的 L 相关检查是 *"For CS, D/B must be 0 if the guest will be IA-32e mode and the L bit (bit 13) in the access-rights field is 1"* —— 是"若 L=1 则 D 必须 0"。`IA-32e mode guest=1` 而 `CS.L=0` 合法，guest 以兼容模式开始执行；L=1 是本项目自己的选择 |
+| "TR 可用且类型是 9 或 0xB" | IA-32e 下只允许一个值：*"If the guest will be IA-32e mode, the Type must be 11 (64-bit busy TSS)"*。3/11 之分属于**非** IA-32e 分支（3 = 16 位忙 TSS，11 = 32 位）；9 根本不是 TSS 类型（那是 32 位可用代码段） |
+
+顺带补两条会真实咬人、原文没写的检查：**Type 为 9/11 时 CS.DPL 必须等于 SS 访问
+权字段的 DPL**；**G 位与 limit 双向绑定**（*"If any bit in the limit field in
+the range 11:0 is 0, G must be 0"* / *"If any bit in the range 31:20 is 1, G must
+be 1"*）—— 本项目 CS limit=0xFFFFFFFF → 必须 G=1（`0xA09B` 的 bit15=1 ✓），
+TR limit=0x67 → 必须 G=0（`0x8B` 的 bit15=0 ✓）。
+
+#### (5) "entry 失败（CF=1）"这个判据只覆盖三档里的一档
+
+`vmx_entry.S` 的注释与 stage1 都把失败写成 CF=1。按 §27.1/§27.2/§27.8，失败其实
+分三档，**前两档都不装载宿主状态、都不产生 VM-Exit**，只是把控制交给下一条指令：
+
+| 档 | 观测 | 错误号 |
+|---|---|---|
+| §27.1 基本检查第 3/4 条（无 current VMCS；当前是 shadow VMCS） | CF | 不写 |
+| §27.1 第 5 条 a/b/c（MOV-SS 阻塞；launch state 与指令不匹配） | ZF | 写 |
+| §27.2 控制域 / 宿主状态检查 | ZF | 写 |
+| §27.3.1 guest 状态非法 / §27.4 MSR 装载失败 | **产生 VM-Exit**，exit reason 带 bit31 | — |
+
+所以 `vmx_entry.S` 的正确判据是"**那条 VM 指令居然返回了**"（三条 fallthrough 到
+同一个 `.Lvmfail`），CF/ZF 在这里分不开前两档，能分开的只有
+`VM_INSTRUCTION_ERROR`。本轮据此把解码补上：`mini_vmx_report_error()` 按 §31.4
+Table 31-1 解码 0/4/5/6/7/8/12/13/15/16/26，并新增被 `main.c` 的 VMXON
+`vmfail` 分支复用（VMXON 在 root operation 里再执行 → 错误号 15，§31.3 伪码
+*"ELSE VMfail("VMXON executed in VMX root operation")"*）；`vcpu.c` 的 bit31
+分支按 §27.8 解码 basic 33/34/41 与 qualification 2/3/4。
+Table 31-1 在 Vol.3C 31-31 页，本机 `pdftotext -layout` 抽取结果的 10897-10923
+行是它的完整错误号列表，其中 15 号确认为 *"VMXON executed in VMX root operation"*。
+
+一个顺带的事实对照：KVM 的 `kvm_cpu_vmxon()`（`arch/x86/kvm/vmx/vmx.c:2839-2843`）
+只挂 `_ASM_EXTABLE` 的 fault 分支，**CF/ZF 根本不判**，VMfail 会被静默放过 —— 它
+靠独占 VMX + 前置 CPUID/FEAT_CTL 检查兜底。mini-kvm 的定位是"和 `kvm_intel` 抢
+同一台机器"，这两档必须收。
+
+#### (6) 行号漂移：本轮两次全量重测
+
+`main.c` 多了一行 `#include <asm/tlbflush.h>`、enable/disable 两个函数体改写；
+`vmx.c` 的 host-CR4 与 §22.x 注释各加一行；`vcpu.c` 的 §27.8 解码块加了十几行。
+结果是本节第一次写下的"对"列**自己又过期了** —— J10(a) 的教训第三次生效：
+**改过被引用的源文件，必须重新 grep 定位，不能对旧行号做加减**。
+
+下表是本轮最后一次全量重测的结果（`make` 之后逐条 grep；文件长度 `main.c` 504、
+`vmx.c` 822、`vcpu.c` 793、`ept.c` 261、`device.c` 104 行）。凡 README、五篇
+stage 与 J1–J11 里出现的本地行号，都已按这一列刷新过。
+
+| 引用点 | 曾写 | 现为 |
+|---|---|---|
+| `mini_cpu_vmx_supported()` | `main.c:76` | `main.c:77` |
+| `mini_cpu_vmxon()` | `main.c:129-155` | `main.c:130-157` |
+| CR0/CR4 FIXED 打印 | `main.c:215-219` | `main.c:221-225` |
+| `mini_vmx_enable_one()` | `main.c:236-278` | `main.c:264-300` |
+| `mini_vmx_disable_one()` | （本轮新增） | `main.c:342-361` |
+| VMXON 区域首页写 revision | `392` → `419` | `main.c:420` |
+| "内核未导出 vmcs_read/write" 注释 | — | `vmx.c:89` |
+| `mini_vmx_adjust_control()` | `vmx.c:249` | `vmx.c:251-260` |
+| unconditional I/O exiting（J6） | `vmx.c:256-261` | `vmx.c:282` |
+| `mini_compute_controls()` | `vmx.c:247-295` | `vmx.c:271-325` |
+| `true_ctls` 选 MSR 那一行 | `vmx.c:249` | `vmx.c:273` |
+| "次级控制只有一个 MSR" 注释 | `vmx.c:287-292` | 未变（同一区间） |
+| EPT 协商回读校验 | `vmx.c:287-292` | `vmx.c:317-321` |
+| `MINI_GUEST_CR4` 定义 / 使用 | `vmx.c:553` | `vmx.c:554` / `:570` |
+| `mini_vmx_set_guest_state()` | `460-521` → `560-637` | `vmx.c:561-638` |
+| FS/GS base 清零 | `508-509` → `617-618` | `vmx.c:618-619` |
+| VMCS 首页写 revision | `667` → `691` | `vmx.c:692` |
+| `EXCEPTION_BITMAP` 写入（stage3/J10） | `vmx.c:600-601` | `vmx.c:718-719` |
+| `mini_vcpu_run_loop()` / `for (;;)` | `vcpu.c:62` / `132` | 未变 |
+| 循环头 + 刷新 Host（stage5） | `138-156` → `138-157` | 未变（`138-157`） |
+| 注入窗口代码（stage3） | `146-156` → `147-157` | 未变（`147-157`） |
+| gs_shadow + 关中断窗口（stage5） | `187-192` → `188-193` | 未变（`188-193`） |
+| 进入失败分支（stage5） | `194-202` → `195-203` | `vcpu.c:202-210` |
+| `launched` 置位（stage5） | `203-204` → `204-205` | `vcpu.c:211-212` |
+| bit31 entry-failure 拦截（stage5） | `210-219` → `211-220` | `vcpu.c:229-267` |
+| NMI 转注分支（stage3） | `229-236` → `230-237` | `vcpu.c:277-284` |
+| 收尾 `pr_debug`（stage3/stage5/J4） | `318-322` / `319-322` | `vcpu.c:366-369` |
+| `EPT_ENTRY_RWX` / `EPT_MEMTYPE_WB` | `ept.c:59` / `61` | `ept.c:64` / `:66` |
+| `mini_ept_init()`（stage2 来源块） | `ept.c:136-152` | `ept.c:137-159` |
+| EPTP 构造（J2） | `ept.c:143-152` | `ept.c:147-157` |
+| `mini_ept_walk()`（stage2 来源块） | `ept.c:187-222` | `ept.c:192-227` |
+| `mini_ept_handle_violation()`（stage2） | `ept.c:228-255` | `ept.c:233-261` |
+| GPA 取自 `GUEST_PHYSICAL_ADDRESS`（J1） | `ept.c:235` | `ept.c:240` |
+| GPA 越界 `-EFAULT`（stage2/stage4/README/J4） | `ept.c:238-243` | `ept.c:243-248` |
+| `mini_serial_out()`（stage4） | `device.c:31-54` | `device.c:33-56` |
+| `mini_handle_io_exit()`（stage4/J3） | `device.c:59-102` | `device.c:61-104` |
+
+`interrupt.c` 的四处（`55-71`、`59-63`、`91-105`、`96-99`）、`guest/guest.S:39-62`、
+`test-mini-kvm.c:9-19`、`vmx_entry.S:78` 本轮没有改动，重测仍然对得上。
+
+另外两处引用纪律的修正：`main.c:215-219` 那句原来写"打印**实测**的 CR0/CR4
+FIXED0/1"，本机 MSR 一个都读不到，措辞改成"运行时读到"；`vmx.c:287` 附近原来把
+"次级控制只有一个 MSR" 的出处写成 *SDM Appendix A.3.3*，附录不在本仓库这份 PDF
+（只含 Vol.3C）里，改以内核头文件 `arch/x86/include/asm/msr-index.h:1182-1200`
+的编号清单为据（`TRUE_*` 只有 0x48d-0x490 四个）。同理，`stage1` 里"能力 MSR
+高低 32 位"的说法补成"正文只在 §24.8/§25.x 转引，逐位定义在未收录的 Appendix
+A.3-A.5"。
+
+#### (7) 引用核对工具化 + 这一趟又抓出的五处
+
+J10(a′) 说"这类引用要么写符号名，要么用脚本机械核对"，但脚本当时是 `/tmp` 里的
+一次性产物 —— 于是漂移第三次发生。本轮把它落成仓库里的
+`practice/mini-kvm/check-refs.py`：扫 README 与五篇 stage 共 125 条、
+`corrections.md` 共 163 条 `file:line`，逐条解析成本目录或 6.12.93 里的真实文件，
+**行号越界或文件找不到就非零退出**，再把被引用的那几行原文打出来供人工判上下文。
+现在两处都是 0 问题。stage1 的"不加载模块也能做的静态自检"加了这第 4 条。
+
+全量重测顺带暴露 README 的歧义判据不够用：本目录 `vmx.c` 已经 822 行，
+"行号 4xxx 必然是内核树"这种量级提示只在超出本地文件长度时成立。README 第 1 节
+的规则据此收紧成"**行号落在本目录同名文件长度之内就必须写全路径**"，并照这一条
+把五处裸 KVM 锚点改写成 `arch/x86/kvm/vmx/vmx.c:…`：`main.c` 头注释里的
+`:743-755`、`mini_vmx_disable_one()` 上方的 `:743-755`/`:735-741`、本模块 `vmx.c`
+里的 `:788-789` 与 `:809`、README 第 2 节表格与第 9 节的 `vmx.c:234`。
+
+四处引用本身写错或写过头，都已改：
+
+| 位置 | 错 | 依据 |
+|---|---|---|
+| 本模块 `vmx.c` §22.x 注释 | 只列 `vmx.c:4328`、`:4335`、`:4340` 就说覆盖 `"22.2.3"/"22.2.4"` | `:4340` 是 `/* 22.2.3, 22.2.5 */`，**22.2.4 在 `arch/x86/kvm/vmx/vmx.c:4343`**（`HOST_CS_SELECTOR`） |
+| `mini_host_cr4()` 注释 | 说 KVM 只在 `:4338-4341` 写一次 HOST_CR4 | KVM 每次 VM entry 前还会 `cr4 = cr4_read_shadow(); vmcs_writel(HOST_CR4, cr4)`（`:7410-7413`）；且 KVM 的 HOST_CR4 **不含**额外的 `\| X86_CR4_VMXE`，它靠 `cr4_set_bits()` 已把这一位写进影子（`:2837`）—— 本模块那次 `\|` 只是保险，不是 KVM 的对等物 |
+| 本模块 `vmx.c` 迁移注释 | "KVM 紧跟 `vmcs_clear()` 写 `launched = 0`" | VMCLEAR 在 `arch/x86/kvm/vmx/vmx.c:793`，`loaded_vmcs->launched = 0` 在 `:809`，中间隔着 `smp_wmb()`；两者都在 `__loaded_vmcs_clear()` 里，不是 `vmcs_clear()` 干的 |
+| README 第 1 节 | 把 §22.x 的出处指向"corrections.md J10/J11" | J10/J11 从没讨论过这个编号；真实依据是 KVM 源码注释本身（`arch/x86/kvm/vmx/vmx.c:4328` 等）与本模块 `vmx.c` 的那段说明，指针已改对 |
+
+两处规范页码的写法收紧（避免把抽取文本的行号当成 PDF 的东西）：§27.3.1.1 起于
+Vol.3C 27-8 页、guest CR4 那条 bullet 落在 27-9 页；Table 31-1 在 31-31 页，
+"10897-10923"是**本机 `pdftotext -layout` 抽取结果**的行区间，不是卷内行号。
+本模块 `vmx.c` 里 msr-index.h 的范围写漏一行：`IA32_VMX_BASIC` 在 1182（不是
+1183），与上文 J11(6) 的 `1182-1200` 对齐。

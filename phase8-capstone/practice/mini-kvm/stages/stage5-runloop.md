@@ -71,7 +71,7 @@ mini-kvm 的分界更直白：**`continue` = 留在内核重进；`goto out` = �
 `EXTERNAL_INTERRUPT` = 1 挨着，是最容易记反的一对。
 
 `VM_EXIT_REASON` 的 bit31 是 "entry failure"，在进入 switch 之前就单独拦掉了
-（`vcpu.c:211-220`）—— 混进 switch 会看到一个"reason 号但字段全不可信"的
+（`vcpu.c:229-267`）—— 混进 switch 会看到一个"reason 号但字段全不可信"的
 假退出。
 
 ## 🔧 实现（`vcpu.c::mini_vcpu_run_loop()`）
@@ -149,10 +149,10 @@ mini_wrmsr(MSR_KERNEL_GS_BASE, gs_shadow);
 
 `mini_vmx_enter()` 是 `vmx_entry.S` 里那套手写世界切换，返回值 0 = 真的进过
 guest，非 0 = VM-Entry 检查失败。失败后立即 `mini_vmx_report_error()` 解
-`VM_INSTRUCTION_ERROR` + `mini_dump_vmcs()`（`vcpu.c:195-203`），别指望
+`VM_INSTRUCTION_ERROR` + `mini_dump_vmcs()`（`vcpu.c:202-210`），别指望
 switch 还能救它。
 
-`launched` 标志只在第一次成功后置位（`vcpu.c:204-205`）：VMCS 的 launch state
+`launched` 标志只在第一次成功后置位（`vcpu.c:211-212`）：VMCS 的 launch state
 是 "clear" 时执行 VMRESUME 会得到 VM-instruction error 5（SDM 31.4
 Table 31-1），而每次迁移里的 `VMCLEAR` 都会把它打回 "clear"
 （SDM 25.11.3），所以 `mini_vmcs_clear()` 必须同时清掉 `vcpu->launched`。
@@ -160,7 +160,7 @@ Table 31-1），而每次迁移里的 `VMCLEAR` 都会把它打回 "clear"
 ### 3. 收尾
 
 `goto out` / `break` 之后只有一句 `preempt_enable()` 和一行 `pr_debug` 统计
-（`vcpu.c:318-322`）：
+（`vcpu.c:366-369`）：
 
 ```
 mini-kvm: RUN 结束 exits=%llu io=%llu ept=%llu hlt=%llu extint=%llu nmi=%llu inj=%llu
