@@ -28,6 +28,11 @@ phase7-timer-virt/practice/experiment2-kvmclock
 phase7-timer-virt/practice/experiment3-lapic
 phase8-capstone/practice/minivmm
 phase8-capstone/practice/msixdump
+phase8-capstone/practice/mini-kvm/test-mini-kvm
+
+# mini-kvm guest 裸机镜像（make guest 重建）
+phase8-capstone/practice/mini-kvm/guest/guest.elf
+phase8-capstone/practice/mini-kvm/guest/guest.bin
 
 # phase8 自制 virtio-blk 后端测试盘（运行时自建 64MB）
 phase8-capstone/practice/blk.img
