@@ -73,6 +73,17 @@ CONFIG_SERIAL_8250_DETECT_IRQ=y
 CONFIG_SERIAL_8250_RSA=y
 
 # ===========================================================================
+# Guest 侧半虚拟化（phase8 毕业项目必需）
+# ===========================================================================
+
+# 不开 HYPERVISOR_GUEST 时 guest 里没有 kvmclock 驱动，dmesg 只会看到
+# "clocksource: Switched to clocksource tsc"。KVM_GUEST 依赖 PARAVIRT，
+# 并 select PARAVIRT_CLOCK（arch/x86/Kconfig:783, :795, :832）
+CONFIG_HYPERVISOR_GUEST=y
+CONFIG_PARAVIRT=y
+CONFIG_KVM_GUEST=y
+
+# ===========================================================================
 # Virtio 设备（QEMU 使用）
 # ===========================================================================
 
@@ -84,6 +95,13 @@ CONFIG_VIRTIO_NET=y
 CONFIG_VIRTIO_CONSOLE=y
 CONFIG_VIRTIO_BALLOON=y
 CONFIG_VIRTIO_INPUT=y
+
+# virtio-mmio（phase8 项目 2 自研 VMM 的设备通道）。
+# x86 上没有 ACPI/DTS 描述 mmio 设备，只能靠 guest 命令行
+# virtio_mmio.device=<size>@<base>:<irq> 注册，该解析代码由
+# VIRTIO_MMIO_CMDLINE_DEVICES 门控（drivers/virtio/Kconfig:153-172）
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
 
 # ===========================================================================
 # 文件系统支持
@@ -209,7 +227,9 @@ CONFIG_MODVERSIONS=y
 # CONFIG_WIFI is not set
 
 # 禁用不必要的文件系统
-# CONFIG_EXT4_FS is not set
+# 注意：ext4 不能写在这里。第 132 行已 CONFIG_EXT4_FS=y，而 kconfig 是
+# 后写覆盖前写，这里再写一行 "# CONFIG_EXT4_FS is not set" 会把它静默关掉，
+# guest 里就 mount 不了 virtio-blk 上的 ext4 镜像（phase8 项目 2 验收需要）。
 # CONFIG_XFS_FS is not set
 # CONFIG_BTRFS_FS is not set
 
