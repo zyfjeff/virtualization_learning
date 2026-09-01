@@ -1,0 +1,13 @@
+
+
+Analyze events for all VMs, all VCPUs:
+
+                                 VM-EXIT    Samples  Samples%     Time%    Min Time    Max Time         Avg time 
+
+                               MSR_WRITE       3752    49.39%     0.04%      1.43us      2.55us      1.48us ( +-   0.05% )
+                                     HLT       3751    49.38%    99.96%   3961.20us   3998.37us   3992.13us ( +-   0.00% )
+                      EXTERNAL_INTERRUPT         78     1.03%     0.00%      3.28us     15.85us      4.40us ( +-   4.48% )
+                                MSR_READ         15     0.20%     0.00%      1.59us      3.10us      1.94us ( +-   5.89% )
+
+Total Samples:7596, Total events handled time:14980392.64us.
+

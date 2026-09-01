@@ -26,6 +26,11 @@ phase6-vfio/practice/vfio-msix-probe
 phase7-timer-virt/practice/experiment1-tsc
 phase7-timer-virt/practice/experiment2-kvmclock
 phase7-timer-virt/practice/experiment3-lapic
+phase8-capstone/practice/minivmm
+phase8-capstone/practice/msixdump
+
+# phase8 自制 virtio-blk 后端测试盘（运行时自建 64MB）
+phase8-capstone/practice/blk.img
 
 # 9p 共享暂存区（只放拷进 guest 的产物）
 scripts/shared/*

@@ -1,0 +1,2 @@
+qemu-system-x86_64: -serial pipe:bench/exits-20260901-100406/qp-idle: Could not open 'bench/exits-20260901-100406/qp-idle': No such file or directory
+qemu-system-x86_64: -serial pipe:bench/exits-20260901-100406/qp-idle: could not connect serial device to character backend 'pipe:bench/exits-20260901-100406/qp-idle'

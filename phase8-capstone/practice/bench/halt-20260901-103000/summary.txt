@@ -1,0 +1,4 @@
+poll-on cpu%=0.6
+n=20 timeout=0 med=174.6us min=150.2us p90=180.4us max=346.8us
+poll-off cpu%=0.2
+n=20 timeout=0 med=173.8us min=171.4us p90=346.9us max=647.7us

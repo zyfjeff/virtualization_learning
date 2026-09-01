@@ -1,0 +1,9 @@
+
+
+Analyze events for all VMs, all VCPUs:
+
+                                 VM-EXIT    Samples  Samples%     Time%    Min Time    Max Time         Avg time 
+
+
+Total Samples:0, Total events handled time:0.00us.
+

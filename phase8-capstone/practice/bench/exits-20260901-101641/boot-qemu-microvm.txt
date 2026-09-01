@@ -1,0 +1,26 @@
+
+
+Analyze events for all VMs, all VCPUs:
+
+                                 VM-EXIT    Samples  Samples%     Time%    Min Time    Max Time         Avg time 
+
+                          IO_INSTRUCTION      35277    90.16%    89.05%      2.08us   2246.04us      6.07us ( +-   1.08% )
+                               CR_ACCESS        985     2.52%     0.42%      0.95us      5.76us      1.03us ( +-   0.90% )
+                                   CPUID        825     2.11%     0.34%      0.87us      2.68us      0.99us ( +-   0.81% )
+                           EPT_MISCONFIG        638     1.63%     2.71%      5.51us     70.60us     10.21us ( +-   3.63% )
+                           EPT_VIOLATION        519     1.33%     5.91%      1.36us    486.35us     27.38us ( +-  17.16% )
+                      EXTERNAL_INTERRUPT        346     0.88%     0.70%      1.89us     24.86us      4.87us ( +-   2.26% )
+                                MSR_READ        291     0.74%     0.19%      1.40us      3.60us      1.56us ( +-   1.03% )
+                               MSR_WRITE        150     0.38%     0.12%      1.42us      7.22us      1.90us ( +-   3.49% )
+                        PREEMPTION_TIMER         47     0.12%     0.02%      0.81us      2.00us      1.18us ( +-   2.80% )
+                              APIC_WRITE         43     0.11%     0.02%      0.69us      7.77us      1.25us ( +-  16.68% )
+                                  XSETBV          2     0.01%     0.00%      1.16us      3.48us      2.32us ( +-  49.92% )
+                               DR_ACCESS          1     0.00%     0.00%      1.77us      1.77us      1.77us ( +-   0.00% )
+                               GDTR_IDTR          1     0.00%     0.00%      8.65us      8.65us      8.65us ( +-   0.00% )
+                                     HLT          1     0.00%     0.50%   1198.00us   1198.00us   1198.00us ( +-   0.00% )
+                        INTERRUPT_WINDOW          1     0.00%     0.00%      6.43us      6.43us      6.43us ( +-   0.00% )
+                                   VMOFF          1     0.00%     0.00%      4.80us      4.80us      4.80us ( +-   0.00% )
+                                    VMON          1     0.00%     0.00%      9.40us      9.40us      9.40us ( +-   0.00% )
+
+Total Samples:39129, Total events handled time:240357.98us.
+

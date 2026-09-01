@@ -1,0 +1,6 @@
+w50000 n=800 timeout=0 med=167.0us min=93.9us p90=169.6us max=193.2us
+w50000 flood cpu%=74.8 耗时=0.2s
+w100000 n=800 timeout=0 med=165.8us min=92.9us p90=167.9us max=272.9us
+w100000 flood cpu%=74.6 耗时=0.2s
+w200000 n=800 timeout=0 med=165.6us min=91.8us p90=167.4us max=193.4us
+w200000 flood cpu%=74.9 耗时=0.2s

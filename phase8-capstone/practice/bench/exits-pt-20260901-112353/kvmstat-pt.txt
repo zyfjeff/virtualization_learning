@@ -1,0 +1,15 @@
+
+
+Analyze events for all VMs, all VCPUs:
+
+                                 VM-EXIT    Samples  Samples%     Time%    Min Time    Max Time         Avg time 
+
+                           EPT_VIOLATION      68694    65.73%     0.91%      1.41us     11.67us      1.48us ( +-   0.07% )
+                                     HLT      16549    15.83%    97.32%      1.19us   3999.95us    653.76us ( +-   0.97% )
+                           EPT_MISCONFIG      14541    13.91%     1.46%      6.42us     55.28us     11.13us ( +-   0.19% )
+                      EXTERNAL_INTERRUPT       4712     4.51%     0.31%      1.78us   9186.64us      7.27us ( +-  26.81% )
+                                MSR_READ         15     0.01%     0.00%      3.10us      4.34us      3.59us ( +-   2.45% )
+                           EXCEPTION_NMI          1     0.00%     0.00%      1.67us      1.67us      1.67us ( +-   0.00% )
+
+Total Samples:104512, Total events handled time:11116722.49us.
+
