@@ -190,7 +190,14 @@ static int mini_vcpu_run_loop(struct mini_kvm_vcpu *vcpu)
 		local_irq_disable();
 		r = mini_vmx_enter(vcpu, vcpu->launched);
 		mini_wrmsr(MSR_KERNEL_GS_BASE, gs_shadow);
-		/* 退出时中断仍关闭（硬件按 HOST 状态恢复，默认 IF=0） */
+		/*
+		 * 退出后中断一定是关的，但原因不是"沿用了进入前的 IF"：
+		 * §25.5 的宿主状态字段清单里没有 RFLAGS，§28.5.3 写的是
+		 * "RFLAGS is cleared, except bit 1, which is always set" ——
+		 * 硬件把整个 RFLAGS 清零（含 IF），VIREG/ACK 那一位我们也没开，
+		 * 所以退出点不需要任何中断状态的初始化，也不用担心 guest 的
+		 * IF 泄漏到宿主。
+		 */
 
 		if (r) {
 			mini_vmx_report_error(vcpu->launched ?
@@ -208,10 +215,50 @@ static int mini_vcpu_run_loop(struct mini_kvm_vcpu *vcpu)
 		mini_vmread(VM_EXIT_REASON, &reason64);
 		reason = (u32)reason64 & 0xffff;
 
-		/* bit31 = VM-Entry 失败（SDM 25.9.1） */
+		/*
+		 * exit_reason 的位格式见 §25.9.1 Table 25-18：bits 15:0 是基本
+		 * 退出原因（上面 & 0xffff 就取自此），bit 31 = "VM-entry failure
+		 * (0 = true VM exit; 1 = VM-entry failure)"。
+		 *
+		 * bit 31 = 1 只可能是 §27.8 那一档：guest 状态检查（§27.3.1）或
+		 * 进入时装载 MSR（§27.4）失败。这一档**会按 VM exit 装载宿主状态**
+		 * （§27.8 第 2 步 "Processor state is loaded as would be done on a
+		 * VM exit"），所以我们能回到这里；§27.1/§27.2 那两档只让
+		 * VMRESUME/VMLAUNCH 返回，走上面 mini_vmx_enter() 的返回值分支。
+		 */
 		if (reason64 & 0x80000000ULL) {
-			pr_err("mini-kvm: VM-Entry 失败, exit_reason=0x%llx\n",
-			       reason64);
+			u64 qual = 0;
+			const char *cause = "未知基本退出原因";
+
+			switch (reason) {
+			case 33: cause = "guest 状态非法（§27.3.1 的检查没过）"; break;
+			case 34: cause = "进入时 MSR 装载失败（§27.4）"; break;
+			case 41: cause = "VM entry 期间发生 machine-check（§27.9）"; break;
+			}
+
+			mini_vmread(EXIT_QUALIFICATION, &qual);
+			switch (qual) {
+			case 2:
+				pr_err("mini-kvm: 具体原因=加载 PDPTE 失败（§27.3.1.6）\n");
+				break;
+			case 3:
+				pr_err("mini-kvm: 具体原因=向 STI 阻塞中的 guest 注入 NMI\n");
+				break;
+			case 4:
+				pr_err("mini-kvm: 具体原因=VMCS link pointer 非法（§27.3.1.5）\n");
+				break;
+			default:
+				/*
+				 * §27.8："In most cases, the exit qualification is
+				 * cleared to 0" —— 规范没有给出"哪个字段错了"的
+				 * 编码，只能靠 dump + §27.3.1 清单逐条对照。
+				 * 而且检查顺序不固定，一个 qual 值不代表只有这一
+				 * 处错误。
+				 */
+				break;
+			}
+			pr_err("mini-kvm: VM-Entry 失败, exit_reason=0x%llx (basic=%u: %s), qual=0x%llx\n",
+			       reason64, reason, cause, qual);
 			mini_dump_vmcs("failed vmentry");
 			run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
 			local_irq_enable();

@@ -2,14 +2,16 @@
 /*
  * device.c —— IO 退出解码与 COM1 串口模拟（Stage 4）
  *
- * IO 退出的 EXIT_QUALIFICATION 解码（SDM Vol.3 Table 28-5 / 28.2.2）：
+ * IO 退出的 EXIT_QUALIFICATION 解码（SDM Vol.3C §28.2.1
+ * "Basic VM-Exit Information" 里的 Table 28-5）：
  *   bits 2:0   访问大小：0/1/3 → 1/2/4 字节
  *   bit 3      方向：0 = OUT（guest 写），1 = IN（guest 读）
  *   bits 31:16 端口号
  * （注意方向位在 bit 3；骨架版曾误写成 bit 6。）
  *
  * RIP 推进：IO 指令退出后 RIP 停在原指令，必须加上
- * VM_EXIT_INSTRUCTION_LEN (0x440c) 再进入（SDM 28.2.4）。
+ * VM_EXIT_INSTRUCTION_LEN (0x440c) 再进入（字段定义见 SDM §25.9.4，
+ * 适用场景清单见 §28.2.5，其中 IN/OUT 明确在列）。
  *
  * 串口模拟：只做最简的"字节捕获"——OUT 到 0x3f8 的字节记入环形文本
  * 缓冲，供 MINI_KVM_VM_GET_SERIAL 读取，并把每个完整行打到 dmesg。

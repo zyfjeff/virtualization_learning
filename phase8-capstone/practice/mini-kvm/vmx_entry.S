@@ -61,10 +61,16 @@
  *   [rsp+56] 保存的 rbp
  *   [rsp+64] 返回地址
  *
- * VM-Entry 失败（VMLAUNCH/VMRESUME 本身返回，CF=1）落在同一个 RSP 上，
+ * VM-Entry 失败（VMLAUNCH/VMRESUME 本身返回）落在同一个 RSP 上，
  * 而且此时寄存器里装的是刚才为 guest 加载的值 —— 所以失败路径必须和退出
  * 路径走同一段收栈代码。KVM 正是这么做的：vmenter.S 的 .Lvmfail 只把返回值
  * 设成 1 就 jmp .Lclear_regs（arch/x86/kvm/vmx/vmenter.S:300-303 → :227）。
+ *
+ * 判据是"指令居然返回了"，不是"CF=1"：SDM Vol.3C §27.1 里"无 current VMCS /
+ * 当前是 shadow VMCS"置 CF，被 MOV-SS 阻塞与 launch state 不匹配置 ZF，
+ * §27.2 的控制域/宿主状态检查也置 ZF。三档都不产生 VM-Exit、都不装载宿主
+ * 状态，一律 "control passes to the next instruction"，所以紧跟在
+ * VMRESUME/VMLAUNCH 后面的 jmp .Lvmfail 能把它们全收到。
  */
 
 	.section .noinstr.text, "ax"
@@ -208,8 +214,10 @@ SYM_INNER_LABEL_ALIGN(mini_vmx_vmexit, SYM_L_GLOBAL)
 
 .Lvmfail:
 	/*
-	 * VMLAUNCH/VMRESUME 失败（CF=1）：没进 guest，但寄存器刚才已经装载成
-	 * guest 的值，不可信也不回写 regs[]；RSP 就是 HOST_RSP。
+	 * VMLAUNCH/VMRESUME 失败（§27.1/§27.2 三档之任一，见上面栈布局注释）：
+	 * 没进 guest，但寄存器刚才已经装载成 guest 的值，不可信也不回写
+	 * regs[]；RSP 就是 HOST_RSP。是 §27.1 还是 §27.2 造成的，由 C 侧解码
+	 * VM_INSTRUCTION_ERROR 区分（vmx.c 的 mini_vmx_report_error()）。
 	 * 和 KVM 一样只改返回值，然后并入上面那段收栈（vmenter.S:300-303）。
 	 */
 	mov  $1, %ebx

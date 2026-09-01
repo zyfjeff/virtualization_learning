@@ -64,10 +64,14 @@ _start:
 /*
  * fill_idt_entries：向 %rdi 连续写 %ecx 个 64 位中断门，目标 = %rsi。
  *
- * IDT 门描述符 16 字节（SDM Vol.3 7.14.2）：
+ * IDT 门描述符 16 字节。这个格式的权威规范章节不在本仓库这份
+ * intel-vmx.pdf 里（该 PDF 只含 Vol.3C，第 24-33 章），本地无法复核，所以
+ * 这里改用可直接读到的 Linux 结构体对表：`struct gate_struct`
+ * （arch/x86/include/asm/desc_defs.h:134-143）与 `struct idt_bits`（同文件
+ * :119-125）。两者拼出的字节布局与下面写的偏移一一对应：
  *   [15:0]   offset 15:0
  *   [31:16]  selector（guest CS = 0x8）
- *   [39:32]  IST = 0
+ *   [39:32]  IST = 0（idt_bits 的 ist:3 + zero:5 低字节）
  *   [47:40]  type/attr = 0x8E（present, DPL0, 64 位中断门）
  *   [63:48]  offset 31:16
  *   [95:64]  offset 63:32
@@ -94,9 +98,12 @@ fill_idt_entries:
 /*
  * 逐字节 OUT 到 COM1（mini-kvm 捕获为串口输出）。
  *
- * 端口必须经 %dx 传递：OUT/IN 的立即数端口字段只有 8 位（E6 ib / E7 ib），
- * 写 `out %al, $0x3f8` 会被汇编器静默截断成端口 0xf8（实测警告
- * "0x3f8 shortened to 0xf8"），guest 输出的根本不是 COM1，串口捕获恒为空。
+ * 端口必须经 %dx 传递：OUT 的立即数形式端口字段只有 8 位（`out %al,imm8` =
+ * E6 ib，实测编码 `e6 f8`；`out %al,%dx` = EE，实测）。写
+ * `out %al, $0x3f8` 时 GNU as 会报 `Warning: 0x3f8 shortened to 0xf8` 但
+ * **照样生成指令**，objdump 复核得到 `e6 f8   out %al,$0xf8` —— 警告容易被
+ * 忽略，而 guest 输出的端口根本不是 COM1，串口捕获恒为空，症状看起来像
+ * "guest 没跑起来"。
  */
 print:
 	push	%rdx

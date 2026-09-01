@@ -11,10 +11,16 @@
  *        CR4.VMXE 预检返回 -EBUSY       → vmx_enable_virtualization_cpu() (vmx.c:2859-2860)
  *     3. 注册 /dev/mini-kvm (misc 设备)  → KVM 注册 /dev/kvm（kvm_main.c kvm_dev_init）
  *   模块卸载 = 相反顺序：
- *     VMXOFF + 清 CR4.VMXE              → kvm_cpu_vmxoff()         (vmx.c:743-755)
+ *     VMXOFF + 清 CR4.VMXE              → kvm_cpu_vmxoff()         (arch/x86/kvm/vmx/vmx.c:743-755)
  *
- * SDM：Vol.3 23.7 (VMXON)、23.8 (VMXOFF)、
- *      23.6 (VMXON region 首页写 VMCS revision identifier)
+ * SDM（Vol.3C，Order Number 326019-083US）：
+ *   §24.7 Enabling and Entering VMX Operation —— VMXON/VMXOFF 的职责与
+ *         IA32_FEATURE_CONTROL 的 lock/bit1/bit2 三门
+ *   §24.8 Restrictions on VMX Operation —— 进入 VMX 后 CR4.VMXE 不可清等
+ *   §25.11.5 VMXON Region —— 首页 bits 30:0 必须写 VMCS revision identifier
+ *         （字段格式本身在 §25.2 "Format of the VMCS Region"）
+ *   §31.3 VMX Instructions —— VMXON 的完整 Operation 伪码，含 #UD/#GP(0)/
+ *         VMfailInvalid 三档失败条件，是本文件 mini_cpu_vmxon() 的依据
  */
 
 #include <linux/module.h>
@@ -24,6 +30,8 @@
 #include <linux/gfp.h>
 #include <linux/mm.h>
 #include <asm/io.h>
+#include <asm/tlbflush.h>	/* cr4_set_bits()/cr4_clear_bits()（tlbflush.h:41/:51） */
+#include <asm/asm.h>		/* _ASM_EXTABLE（asm.h:226-227） */
 #include <asm/msr-index.h>
 #include <asm/cpufeature.h>
 #include <asm/vmx.h>
@@ -50,30 +58,119 @@ static inline bool mini_cpu_has_vmx(void)
 }
 
 /*
+ * **当前 CPU** 能否安全执行 VMXON —— 必须逐 CPU 问，不能只问一次。
+ *
+ * CPUID 与 IA32_FEATURE_CONTROL(MSR 0x3A) 都是每个逻辑处理器独立的
+ * 状态，SDM §31.3 "VMXON—Enter VMX Operation" 的 Operation 伪码把
+ *   "bit 0 (lock bit) of IA32_FEATURE_CONTROL MSR is clear" 和
+ *   "outside SMX operation and bit 2 of IA32_FEATURE_CONTROL MSR is clear"
+ * 直接列为 #GP(0) 条件（同一条伪码里还有 CPL>0、A20M 模式、CR0/CR4 不是
+ * VMX 支持的组合）。在别的 CPU 上读到的值不能替本机作保。
+ *
+ * 对照 KVM 的两层结构：模块加载时对每个在线 CPU 下发一次
+ * smp_call_function_single(cpu, kvm_x86_check_cpu_compat)（x86.c:9828，回调
+ * 见 x86.c:9736-9739 → :9733 → __kvm_is_vmx_supported()，
+ * vmx.c:2782-2798），而
+ * kvm_arch_hardware_enable() 在真正要 VMXON 的那台 CPU 上、执行 VMXON
+ * 之前又跑一遍同样的检查（x86.c:12694）。
+ */
+static bool mini_cpu_vmx_supported(void)
+{
+	u64 feat;
+
+	if (!mini_cpu_has_vmx()) {
+		pr_err("mini-kvm: CPU%d 不支持 VMX (CPUID.1:ECX[5]=0)\n",
+		       raw_smp_processor_id());
+		return false;
+	}
+
+	feat = mini_rdmsr(MSR_IA32_FEAT_CTL);
+	if ((feat & (FEAT_CTL_LOCKED | FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX)) !=
+	    (FEAT_CTL_LOCKED | FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX)) {
+		pr_err("mini-kvm: CPU%d BIOS 未开放 VMX, MSR_IA32_FEAT_CTL=0x%llx\n",
+		       raw_smp_processor_id(), feat);
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * 在当前 CPU 上执行 VMXON，把**所有**失败都收敛成返回值。
+ *
+ * 关键是那条 _ASM_EXTABLE。SDM §31.3 "VMXON—Enter VMX Operation" 的
+ * Operation 伪码 + Protected Mode Exceptions 清单列出了这些失败：
+ *   #UD    —— 伪码开头共五条：操作数是寄存器、CR0.PE=0、CR4.VMXE=0、
+ *             RFLAGS.VM=1、(IA32_EFER.LMA=1 且 CS.L=0)。内核 64 位上下文里
+ *             PE=1 / VM=0 / CS.L=1，本函数又用内存操作数、调用者先置好
+ *             VMXE，所以这条路理论上走不到。
+ *   #GP(0) —— CPL>0、A20M 模式、CR0/CR4 的 fixed 位不符（§24.8）、
+ *             IA32_FEATURE_CONTROL 不支持当前模式进入 VMX；
+ *             **还包括访问那个内存操作数本身**：有效地址越出 CS/DS/ES/FS/GS
+ *             段界限、DS/ES/FS/GS 是不可用段、源操作数落在只执行代码段。
+ *   #PF / #SS —— 读操作数时页错误 / 越出 SS 界限。
+ * 也就是说 VMXON 的 fault 面比"BIOS 没开 VMX"宽得多，光靠预检收不住。
+ * 本回调跑在 IPI 的硬中断上下文里，任何一次 fault 都是宿主当场 die()，
+ * 其余 CPU 还会卡在 smp_call_function_single 的等待里 —— 那是整机下线，
+ * 不是"模块加载失败"。对照 KVM：kvm_cpu_vmxon()（vmx.c:2833-2851）同样给
+ * VMXON 挂了 _ASM_EXTABLE，失败时清掉 CR4.VMXE 再返回 -EFAULT。
+ *
+ * 顺带纠正一个常见误解：**已经在 VMX root operation 时再执行 VMXON 不
+ * #UD**，伪码最后一条是 VMfail("VMXON executed in VMX root operation") =
+ * §31.4 Table 31-1 错误号 15。
+ * 所以拦"和别的 VMM 互踩"不能指望指令自己报错，必须像下面调用者那样先查
+ * CR4.VMXE（对照 vmx_enable_virtualization_cpu()，vmx.c:2859-2860）。
+ *
+ * 失败标志两档都要收（SDM §31.2）：VMfailInvalid = CF=1/ZF=0；
+ * VMfailValid = ZF=1/CF=0 并写 VM_INSTRUCTION_ERROR。§31.2 的 VMfail 伪函数
+ * 是"current VMCS 指针有效 ⇒ VMfailValid，否则 VMfailInvalid"，而
+ * "已 VMXON 且已 VMPTRLD 过之后再 VMXON"正好落在前者 —— ZF 这一档是真实
+ * 存在的，不是防御性冗余。
+ */
+static int mini_cpu_vmxon(u64 phys)
+{
+	asm goto("1: vmxon %[ptr]\n\t"
+		 "jz  %l[vmfail]\n\t"
+		 "jc  %l[vmfail]\n\t"
+		 _ASM_EXTABLE(1b, %l[fault])
+		 :
+		 : [ptr] "m"(phys)
+		 : "cc", "memory"
+		 : vmfail, fault);
+
+	return 0;
+
+vmfail:
+	pr_err("mini-kvm: CPU%d VMXON VMfail（ZF 或 CF 置位）——指针未 4KB 对齐/超出物理地址宽度，或首页 revision 不匹配（SDM §31.3）\n",
+	       raw_smp_processor_id());
+	/*
+	 * VMfailValid 才有错误号可读；没有 current VMCS 时这条 VMREAD 自己也会
+	 * VMfailInvalid，mini_vmx_report_error() 会打印 "err=0" 并说明原因。
+	 */
+	mini_vmx_report_error("VMXON");
+	return -EIO;
+
+fault:
+	pr_err("mini-kvm: CPU%d VMXON 同步触发 #UD/#GP，已由 exception table 收口（SDM §31.3 的 fault 条件）\n",
+	       raw_smp_processor_id());
+	return -EIO;
+}
+
+/*
  * 读取 VMX 能力 MSR。对照 KVM vmx_hardware_setup() 对 vmcs_config 的
  * 采集（vmx.c），这里只保留 mini-kvm 用到的部分。
  */
 int mini_vmx_read_capabilities(void)
 {
-	u64 basic, feat;
-
-	if (!mini_cpu_has_vmx()) {
-		pr_err("mini-kvm: CPU 不支持 VMX (CPUID.1:ECX[5]=0)\n");
-		return -ENODEV;
-	}
+	u64 basic;
 
 	/*
-	 * MSR_IA32_FEAT_CTL 预检，对照 __kvm_is_vmx_supported()
-	 * (vmx.c:2782-2795)：必须已锁定且允许 SMX 外使用 VMX，
-	 * 否则 VMXON 会 #GP（BIOS 未开放）。
+	 * 这一处只是加载期的早退：跑在 insmod 线程的当前 CPU 上（可能
+	 * 迁移），只保证"这台"能问准。权威判定在 mini_vmx_enable_one()
+	 * 里 —— 那里是 IPI 回调，跑在真正要执行 VMXON 的那台 CPU 上。
 	 */
-	feat = mini_rdmsr(MSR_IA32_FEAT_CTL);
-	if ((feat & (FEAT_CTL_LOCKED | FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX)) !=
-	    (FEAT_CTL_LOCKED | FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX)) {
-		pr_err("mini-kvm: BIOS 未开放 VMX, MSR_IA32_FEAT_CTL=0x%llx\n",
-		       feat);
+	if (!mini_cpu_vmx_supported())
 		return -ENODEV;
-	}
 
 	basic = mini_rdmsr(MSR_IA32_VMX_BASIC);
 	mk_global.vmcs_revision_id = (u32)(basic & 0x7fffffffULL);
@@ -112,8 +209,12 @@ int mini_vmx_read_capabilities(void)
 		!!(mk_global.ept_vpid_cap & VMX_EPT_EXTENT_CONTEXT_BIT));
 
 	/*
-	 * CR0/CR4 的 fixed 位（SDM Appendix A.8）决定 VMX 下哪些位必须为 1、
-	 * 哪些位不能为 1，写进 VMCS 的 guest 与 host CR0/CR4 都受它约束。
+	 * CR0 的 fixed 位在 Appendix A.7、CR4 的在 Appendix A.8（§24.8 里
+	 * 这两句是分开的："...consult the VMX capability MSRs
+	 * IA32_VMX_CR0_FIXED0 and IA32_VMX_CR0_FIXED1 (see Appendix A.7).
+	 * For CR4, ...(see Appendix A.8)"）。它们决定 VMX 下哪些位必须为 1、
+	 * 哪些位不能为 1，写进 VMCS 的 host CR0/CR4 由 §27.2.2 的进入检查
+	 * 把关、guest 的由 §27.3.1.1 把关。
 	 * 打出来作为 vmx.c 里 MINI_GUEST_CR0/CR4 与 mini_host_cr4() 取值的
 	 * 实证依据。
 	 */
@@ -128,24 +229,51 @@ int mini_vmx_read_capabilities(void)
 /*
  * 在单个 CPU 上进入 VMX 操作模式（on_each_cpu 回调，IRQ 关闭）。
  *
- * 对照 kvm_cpu_vmxon()（vmx.c:2833-2851）+ vmx_enable_virtualization_cpu()
- * 的 CR4.VMXE 预检（vmx.c:2859-2860）：
+ * 对照 kvm_cpu_vmxon()（arch/x86/kvm/vmx/vmx.c:2833-2851）+
+ * vmx_enable_virtualization_cpu() 的 CR4.VMXE 预检（同文件 :2859-2860）：
+ *   - 先在本 CPU 上问一遍 CPUID/IA32_FEATURE_CONTROL（mini_cpu_vmx_supported()），
+ *     这是 KVM 在 x86.c:12694 里的顺序：判定和 VMXON 在同一台 CPU 上背靠背；
  *   - CR4.VMXE 已置位说明已有 VMX 用户（典型是忘了卸载的 kvm_intel），
  *     报 -EBUSY 并拒绝，避免与真实 KVM 互踩。
  *
- * 注意：cr4_set_bits()/cr4_clear_bits() 没有导出给模块，这里直接读写
- * CR4；IPI 上下文关中断，本 CPU 上的读-改-写是安全的。
+ * CR4.VMXE 必须用 cr4_set_bits()/cr4_clear_bits()（asm/tlbflush.h:41/:51，
+ * 底层 cr4_update_irqsoff() 已导出，arch/x86/kernel/cpu/common.c:453-465），
+ * **不能裸写 CR4**，理由有两层，都只在真机上才炸：
+ *
+ * 1. 内核把 CR4 的权威副本记在 per-CPU 影子 cpu_tlbstate.cr4 里，
+ *    cr4_update_irqsoff() 是"从影子算新值 → 写回影子 → MOV 到 CR4"
+ *    （common.c:455-462）。switch_mm_irqs_off() 每换一次 mm 都会经
+ *    cr4_update_pce_mm()（arch/x86/mm/tlb.c:658 → :469-482）动
+ *    X86_CR4_PCE。VMXE 只写进真实 CR4 而没进影子的话，下一次 PCE 变化就会
+ *    用"没有 VMXE 的影子值"去 MOV CR4 —— 而 §24.8 第一条：
+ *    "Any attempt to set one of these bits to an unsupported value while in
+ *    VMX operation (including VMX root operation) using any of the CLTS,
+ *    LMSW, or MOV CR instructions causes a general-protection exception"
+ *    （NOTE 里列出 VMX operation 下必须为 1 的位含 CR4.VMXE）。也就是在进程
+ *    切换里当场 #GP(0)，宿主 die()；就算硬件放行，VMX 也被偷偷关掉了。
+ * 2. 上面那句 cr4_read_shadow() 预检读的就是这个影子（KVM 同样依赖它，
+ *    common.c:467-472 导出 cr4_read_shadow）。裸写会让自己的 VMXE 在影子里
+ *    不可见：第二次 insmod 拦不住，kvm_intel 随后加载也拦不住（它查的也是
+ *    影子，vmx.c:2859-2860），于是两个 VMXON 用户叠在同一台 CPU 上。
+ *
+ * KVM 走的正是这条路：cr4_set_bits(X86_CR4_VMXE)（vmx.c:2837）、
+ * cr4_clear_bits(X86_CR4_VMXE)（vmx.c:2848、kvm_cpu_vmxoff 里 :749/:753）。
+ * 这两个 inline 只在关中断时写 CR4，我们的调用点在 IPI 回调里，满足
+ * cr4_update_irqsoff() 的 lockdep_assert_irqs_disabled()。
  */
 static void mini_vmx_enable_one(void *info)
 {
 	int cpu = raw_smp_processor_id();
 	struct page *page = per_cpu(mini_vmxon_page, cpu);
 	u64 phys = page_to_phys(page);
-	u64 cr4;
-	u8 err;
 
 	if (atomic_read(&mk_global.enable_err))
 		return;
+
+	if (!mini_cpu_vmx_supported()) {
+		atomic_set(&mk_global.enable_err, -ENODEV);
+		return;
+	}
 
 	if (cr4_read_shadow() & X86_CR4_VMXE) {
 		pr_err("mini-kvm: CPU%d CR4.VMXE 已置位（忘了卸载 kvm 模块?）\n",
@@ -154,16 +282,15 @@ static void mini_vmx_enable_one(void *info)
 		return;
 	}
 
-	asm volatile("mov %%cr4, %0" : "=r"(cr4));
-	cr4 |= X86_CR4_VMXE;
-	asm volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+	cr4_set_bits(X86_CR4_VMXE);
 
-	/* VMXON：操作数是 VMXON 区域的物理地址（内存操作数），见 SDM 23.7 */
-	asm volatile("vmxon %1; setna %0" : "=qm"(err) : "m"(phys) : "cc");
-	if (err) {
-		pr_err("mini-kvm: CPU%d VMXON 失败 (ZF/CF 置位)\n", cpu);
-		cr4 &= ~X86_CR4_VMXE;
-		asm volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+	/*
+	 * VMXON 的操作数是 VMXON 区域的物理地址（内存操作数，SDM §24.7；
+	 * 4KB 对齐与地址宽度约束见 §25.11.5）。mini_cpu_vmxon() 把 VMfail
+	 * 和 #UD/#GP 都收敛成返回值 —— 在这个上下文里绝不能让 fault 逃出去。
+	 */
+	if (mini_cpu_vmxon(phys)) {
+		cr4_clear_bits(X86_CR4_VMXE);
 		atomic_set(&mk_global.enable_err, -EIO);
 		return;
 	}
@@ -173,28 +300,61 @@ static void mini_vmx_enable_one(void *info)
 }
 
 /*
- * 在单个 CPU 上退出 VMX 操作模式。对照 kvm_cpu_vmxoff()（vmx.c:743-755）：
- * 无论 VMXOFF 成功与否都清 CR4.VMXE。
+ * 在单个 CPU 上退出 VMX 操作模式。对照 kvm_cpu_vmxoff()
+ * （arch/x86/kvm/vmx/vmx.c:743-755，理由写在它上面的注释 :735-741）：
+ * VMXOFF 在 !post-VMXON 时 #UD，而
+ * "impossible to atomically track post-VMXON state"，所以 KVM 用
+ * _ASM_EXTABLE 吞掉所有 fault，并且无论成败都清 CR4.VMXE。
  *
- * 我们按 per-CPU 标志精确追踪"已 VMXON"，不会在非 VMX 模式执行 VMXOFF
- * （那会 #UD；KVM 用 _ASM_EXTABLE 吞异常是因为它可能在 NMI 上下文盲调）。
+ * 我们虽然按 per-CPU 标志精确追踪"已 VMXON"，正常路径不会撞 #UD，但这一条
+ * 指令没有回头路：真 #UD 就是 rmmod 当场 oops，而 CR4.VMXE 还挂着、VMXON
+ * 区域还被占用，模块再也退不干净。收进 exception table 才配得上"卸载一定
+ * 要能干净"这个承诺，代价是一行宏。
  */
+static void mini_cpu_vmxoff(void)
+{
+	asm goto("1: vmxoff\n\t"
+		 "jz  %l[vmfail]\n\t"
+		 _ASM_EXTABLE(1b, %l[fault])
+		 :
+		 :
+		 : "cc", "memory"
+		 : vmfail, fault);
+	return;
+
+vmfail:
+	/*
+	 * SDM §31.3 VMXOFF 的 Operation 伪码里，ZF=1 只有一种来源：
+	 * "dual-monitor treatment of SMIs and SMM is active" →
+	 * VMfail(23)（§31.4 Table 31-1 第 23 项）。这种情况下处理器仍在
+	 * VMX 操作模式里，而下面照样会清 CR4.VMXE —— 那是 §24.8 明令禁止的
+	 * 状态，只能靠日志发现，所以这里不能静默。
+	 */
+	pr_warn("mini-kvm: CPU%d VMXOFF VMfail(23)：dual-monitor treatment of SMIs and SMM 生效中\n",
+		raw_smp_processor_id());
+	return;
+
+fault:
+	pr_warn("mini-kvm: CPU%d VMXOFF #UD：本 CPU 其实不在 VMX 操作模式（§31.3）\n",
+		raw_smp_processor_id());
+}
+
 static void mini_vmx_disable_one(void *info)
 {
 	int cpu = raw_smp_processor_id();
-	u64 cr4;
-	u8 err;
 
 	if (!per_cpu(mini_vmxon_done, cpu))
 		return;
 
-	asm volatile("vmxoff; setna %0" : "=qm"(err) :: "cc", "memory");
-	if (err)
-		pr_warn("mini-kvm: CPU%d VMXOFF 失败 (ZF/CF 置位)\n", cpu);
+	mini_cpu_vmxoff();
 
-	asm volatile("mov %%cr4, %0" : "=r"(cr4));
-	cr4 &= ~X86_CR4_VMXE;
-	asm volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+	/*
+	 * 必须走 cr4_clear_bits()：真实 CR4 与 per-CPU 影子要一起清，否则影子里
+	 * 残留的 VMXE 会让下一次 insmod 误报 -EBUSY。理由与 mini_vmx_enable_one()
+	 * 上面那段同源；KVM 的 kvm_cpu_vmxoff() 也是 cr4_clear_bits()
+	 * （arch/x86/kvm/vmx/vmx.c:749/:753）。
+	 */
+	cr4_clear_bits(X86_CR4_VMXE);
 
 	per_cpu(mini_vmxon_done, cpu) = false;
 	atomic_dec(&vmx_enable_count);
@@ -236,7 +396,9 @@ int mini_vmx_hardware_enable_all(void)
 
 	/*
 	 * 为每个可能 CPU 分配 VMXON 区域（一个 4KB 页），并在首页写入
-	 * VMCS revision identifier（SDM 23.6）。对照 KVM 的 per-CPU
+	 * VMCS revision identifier —— §25.11.5 要求 bits 30:0 是 revision id
+	 * 且 bit 31 清 0，格式定义在 §25.2；不匹配则 VMXON 直接 VMfailInvalid
+	 * （SDM §31.3 VMXON 的 Operation 伪码）。对照 KVM 的 per-CPU
 	 * vmxarea（vmx.c 的 alloc_kvm_area()）。
 	 */
 	for_each_possible_cpu(cpu) {

@@ -9,7 +9,7 @@
  *   vmx_set_constant_host_state()  arch/x86/kvm/vmx/vmx.c:4320-4385  Host 状态写入配方
  *   init_vmcs()                    arch/x86/kvm/vmx/vmx.c:4728-      控制域/杂项字段
  *   vmx_vcpu_load_vmcs()           arch/x86/kvm/vmx/vmx.c:1449-1514  迁移 CPU 时的 Host 字段修补
- *   VMX 指令的 asm 包装风格        arch/x86/kvm/vmx/ops.h
+ *   VMX 指令的 asm 包装风格        arch/x86/kvm/vmx/vmx_ops.h
  *
  * 控制域 MSR 语义：
  *   低 32 位 = 必须为 1 的位；高 32 位 = 允许为 1 的位
@@ -60,8 +60,31 @@
  * VMX 指令包装
  * ============================================================================
  *
- * 所有 VMX 指令失败时置 ZF/CF（SDM Vol.3 31.2）；setna = ZF|CF。
- * 具体错误码需另读 VM_INSTRUCTION_ERROR（0x4400）。
+ * 失败分两档（SDM Vol.3C §31.2 "Conventions"）：VMfailInvalid 置 CF=1/ZF=0，
+ * VMfailValid 置 ZF=1/CF=0 并写 VM_INSTRUCTION_ERROR（0x4400）。两档互斥，
+ * 所以包装统一用 setna（= ZF|CF）才能同时收到，只看 CF 会漏掉 VMfailValid。
+ *
+ * 这些包装只处理"VMfail"那一档。§31.3 每条指令的 Operation 伪码开头还有
+ * 会**同步 fault** 的前置条件（not in VMX operation / CR0.PE = 0 /
+ * RFLAGS.VM = 1 → #UD；CPL > 0 → #GP(0)），setna 收不到它们。那部分靠
+ * 结构保证：调用点要么在 mini_cpu_in_vmx_operation() 之后（vcpu.c 运行
+ * 循环、mini_vmclear_ipi()），要么在刚 VMXON 成功的同一段临界区里；
+ * VMXON/VMXOFF 自己则用 exception table 收口，见 main.c 的
+ * mini_cpu_vmxon() / mini_cpu_vmxoff()。
+ *
+ * 只有一个 mini_vmwrite()，16/32/64 位字段都用它，这是规范允许的：SDM 31.3
+ * 的 VMWRITE 写着 "The effective size of the primary source operand ... is
+ * always ... 64 bits in 64-bit mode. If the VMCS field specified by the
+ * secondary source operand is shorter than this effective operand size, the
+ * high bits of the primary source operand are ignored."（反过来说，字段比操作数
+ * 长时高位清 0。）字段编码这个第二源操作数也可以是寄存器（Op/En = RM，
+ * ModRM:r/m）。
+ *
+ * KVM 的做法完全一样：vmx_asm2() 展开成 vmwrite %1, %0，操作数搭配是
+ * "r"(field) + "rm"(value)（arch/x86/kvm/vmx/vmx_ops.h:205-226），而
+ * vmcs_write16()/vmcs_write32() 只是多了 vmcs_check16()/vmcs_check32() 这一层
+ * **编译期字段宽度断言**，最后都调同一个 __vmcs_writel() 发 64 位 VMWRITE
+ * （:223-243）。也就是说"16 位字段要用 16 位操作数"是想当然，规范没有这条。
  *
  * 注意：6.8 未导出 KVM 的 vmcs_read/vmcs_write（它们在模块里也依赖
  * 当前 CPU 已 VMPTRLD 的 VMCS），mini-kvm 用自己的包装，语义相同。
@@ -86,7 +109,8 @@ int mini_vmwrite(u32 field, u64 value)
 {
 	u8 err;
 
-	/* AT&T 语序：vmwrite <值>, <字段编码>（对照 ops.h 的 vmwrite()） */
+	/* AT&T 语序：vmwrite <值>, <字段编码>（对照 vmx_ops.h:223-226 的
+	 * __vmcs_writel()：vmx_asm2 展开成 vmwrite %1, %0，同样是值在前） */
 	asm volatile("vmwrite %2, %1\n\t"
 		     "setna %0"
 		     : "=qm"(err)
@@ -164,7 +188,7 @@ static void mini_vmclear_ipi(void *info)
  * 旧 CPU 已经离线时，generic_exec_single() 根本不执行回调、直接返回 -ENXIO
  * （kernel/smp.c:439-441）。KVM 对这个返回值也是忽略的，因为它在
  * __loaded_vmcs_clear() 开头就写明了同一个竞争 ——
- * "vcpu migration can race with cpu offline"（vmx.c:788-789）。
+ * "vcpu migration can race with cpu offline"（arch/x86/kvm/vmx/vmx.c:788-789）。
  * 我们照做，只补一条 pr_warn。
  *
  * 另一半修的是 VMRESUME/VMLAUNCH 选择：VMCLEAR 会把 launch state 置为
@@ -174,8 +198,8 @@ static void mini_vmclear_ipi(void *info)
  * VMCS to 'clear', such migration requires the next VM entry to be performed
  * using VMLAUNCH"；忘了清 launched 标志就会用 VMRESUME 进一个 clear 状态的
  * VMCS，得到 VM-instruction error 5 "VMRESUME with non-launched VMCS"
- * （SDM 31.4 Table 31-1）。KVM 同样在 __loaded_vmcs_clear() 里紧跟
- * vmcs_clear() 写 loaded_vmcs->launched = 0（vmx.c:809）。
+ * （SDM 31.4 Table 31-1）。KVM 也在 __loaded_vmcs_clear() 里清这个标志：
+ * VMCLEAR 在 arch/x86/kvm/vmx/vmx.c:793，loaded_vmcs->launched = 0 在 :809。
  */
 void mini_vmcs_clear(struct mini_kvm_vcpu *vcpu)
 {
@@ -260,7 +284,13 @@ static int mini_compute_controls(struct mini_vmcs_controls *c)
 		t ? MSR_IA32_VMX_TRUE_PROCBASED_CTLS
 		  : MSR_IA32_VMX_PROCBASED_CTLS);
 
-	/* 次级控制只有一个 MSR，没有 TRUE_* 变体（SDM Appendix A.3.3） */
+	/*
+	 * 次级控制只有一个 MSR，没有 TRUE_* 变体。判据用可直接读到的内核
+	 * MSR 编号清单（arch/x86/include/asm/msr-index.h:1182-1200）：TRUE_*
+	 * 只有 0x48d-0x490 四个，对应 pin/proc/exit/entry；0x48b 的
+	 * PROCBASED_CTLS2 与 0x492 的 CTLS3 都是单一编号。（规范里这一段
+	 * 属 Vol.3C 转引的 Appendix A.3，附录不在本仓库这份 PDF 内。）
+	 */
 	c->secondary = mini_vmx_adjust_control(
 		SECONDARY_EXEC_ENABLE_EPT,
 		MSR_IA32_VMX_PROCBASED_CTLS2);
@@ -312,20 +342,23 @@ static u64 host_idt_base;
 /*
  * 写入 VMCS 的 host CR4。
  *
- * 为什么一定要或上 CR4.VMXE：规范只在"离开 VMX 操作"时才允许清它
- * —— SDM 1.5 "Once in VMX operation, it is not possible to clear CR4.VMXE"
- * （§23.7 把 CR4.VMXE 列为 VMX 操作期间被固定的位）。而 §27.2.2 对 host-state
+ * 为什么一定要保证 CR4.VMXE 为 1：规范只在"离开 VMX 操作"时才允许清它
+ * —— §24.7 "Once in VMX operation, it is not possible to clear CR4.VMXE"
+ * （§24.8 第一条 NOTE 把这些位列为 VMX 操作期间必须为 1 的位："The first
+ * processors to support VMX operation require that the following bits be 1 in
+ * VMX operation: CR0.PE, CR0.NE, CR0.PG, and CR4.VMXE"）。
+ * 而 §27.2.2 对 host-state
  * 的 CR4 只做一件事："The CR4 field must not set any bit to a value not
  * supported in VMX operation" —— 也就是说 VMXE=0 **不会**被进入检查拦下来，
  * 硬件会带着一个"root 模式下 VMXE 为 0"的状态继续跑，那是规范没有定义的领域。
  * 直接把这一位钉住，就不去踩这条边界。
  *
- * 差异点：KVM 用 cr4_set_bits(X86_CR4_VMXE) 开启 VMX 能力
- * （vmx.c:2837），cr4 shadow 里已含该位，因此可直接
- * cr4 = cr4_read_shadow(); vmcs_writel(HOST_CR4, cr4)（vmx.c:4339-4341）。
- * mini-kvm 只能裸写 CR4 —— cr4_set_bits()/cr4_clear_bits() 都没有
- * 导出给模块（见 6.8 的 Module.symvers，只有 cr4_read_shadow 导出）
- * —— shadow 里拿不到 VMXE，必须自己补上。
+ * 与 KVM 同构：KVM 用 cr4_set_bits(X86_CR4_VMXE) 开启 VMX 能力
+ * （arch/x86/kvm/vmx/vmx.c:2837），影子 cpu_tlbstate.cr4 里已含该位，因此直接
+ * `cr4 = cr4_read_shadow(); vmcs_writel(HOST_CR4, cr4)`（初始化 :4338-4341，
+ * 每次 VM entry 前再刷一次 :7410-7413）。本模块进入 VMX 的路径现在也走
+ * cr4_set_bits()（main.c::mini_vmx_enable_one），影子同样带 VMXE，下面这一次
+ * `|` 只是保险：万一将来有调用点忘了开，HOST_CR4 仍然是自洽的。
  */
 static u64 mini_host_cr4(void)
 {
@@ -341,8 +374,11 @@ void mini_vmx_refresh_host_state(void)
 	int cpu = raw_smp_processor_id();
 
 	/*
-	 * 22.2.3：CR3/CR4 可能随线程与上下文变化，每次进入前刷新。KVM 把这件事
-	 * 放在 vmx_vcpu_run() 的末尾、紧贴 VM-Entry（vmx.c:7396-7412），理由原文：
+	 * §25.5 把 CR0/CR3/CR4 列为 host-state 字段并明说 "processor state is
+	 * loaded from these fields on every VM exit"（装载细节见 §28.5.1），
+	 * 而"当前进程的 CR3/CR4 会变"是软件事实 —— 所以每次进入前都要刷新。
+	 * KVM 把这件事
+	 * 放在 vmx_vcpu_run() 的末尾、紧贴 VM-Entry（vmx.c:7397-7413），理由原文：
 	 *   "This must be done immediately prior to VM-Enter, as the kernel may
 	 *    load a new ASID (PCID) any time it switches back to the current->mm,
 	 *    which can occur in KVM context when switching to a temporary mm to
@@ -387,17 +423,55 @@ static void mini_vmx_set_constant_host_state(void)
 	struct desc_ptr idt;
 	u32 lo;
 
-	/* 22.2.3：CR0/CR3/CR4（CR3/CR4 每次进入再刷新） */
+	/*
+	 * §25.5 的 CR0/CR3/CR4（CR3/CR4 每次进入再刷新，见上面
+	 * mini_vmx_refresh_host_state()）。
+	 *
+	 * 顺带说明这里曾出现过的 "22.2.3"/"22.2.4" 是哪来的：那是
+	 * vmx_set_constant_host_state() 自己的注释（22.2.3 在 vmx.c:4328、
+	 * :4335、:4340，22.2.4 在 :4343），引的是二十多年前初代 VMX 规范的
+	 * 第 22 章，在 326019-083US 里 Vol.3C 从第 24 章开始，根本没有
+	 * §22.x。抄 KVM 的行文可以，抄它的历史编号不行。
+	 */
 	mini_vmwrite(HOST_CR0, read_cr0());
 	mini_vmwrite(HOST_CR3, __read_cr3());
 	mini_vmwrite(HOST_CR4, mini_host_cr4());
 
-	/* 22.2.4：段选择子。x86_64：DS/ES 置空选择子（vmx.c:4350-4351） */
+	/*
+	 * §25.5 的段选择子（装载见 §28.5.2，进入检查见 §27.2.3）。
+	 * x86_64：DS/ES 置空选择子（对照 vmx.c:4350-4351）
+	 */
 	mini_vmwrite(HOST_CS_SELECTOR, __KERNEL_CS);
 	mini_vmwrite(HOST_DS_SELECTOR, 0);
 	mini_vmwrite(HOST_ES_SELECTOR, 0);
 	mini_vmwrite(HOST_SS_SELECTOR, __KERNEL_DS);
 	mini_vmwrite(HOST_TR_SELECTOR, GDT_ENTRY_TSS * 8);
+	/*
+	 * FS/GS 选择子必须显式写，即使我们只用基址寻址。
+	 *
+	 * §25.5 把 "Selector fields (16 bits each) for the segment registers
+	 * CS, SS, DS, ES, FS, GS, and TR" 全列进宿主状态区，§28.5.2 也确实在
+	 * 每次 VM-Exit 逐个装载选择子；而 §27.2.3 在进入时就检查
+	 * "In the selector field for each of CS, SS, DS, ES, FS, GS, and TR,
+	 * the RPL (bits 1:0) and the TI flag (bit 2) must be 0"，不满足就是
+	 * VM-Entry 检查失败（Table 31-1 错误码 8 "VM entry with invalid
+	 * host-state field(s)"）。VMCS 字段在被软件写过之前内容不可依赖，
+	 * 所以"这里没写、大概是 0 吧"不能作为正确性依据 —— 唯一的例外是
+	 * 我们恰好用了 __GFP_ZERO 的页，但那是实现巧合，不是规范承诺。
+	 *
+	 * 取 0（空选择子 = 段不可用）是安全的：§28.5.2 规定退出到 IA-32e 模式
+	 * 时 "FS and GS ... otherwise, loaded from the base-address field"，
+	 * 段可不可用不影响 FS.base/GS.base 的恢复，而宿主内核的 per-CPU 寻址
+	 * 要的就是 GS 基址（见下面 refresh 里的 cpu_kernelmode_gs_base）。
+	 *
+	 * 对照 KVM：init_vmcs() 在调用 vmx_set_constant_host_state() 之前先把
+	 * 两者写 0（arch/x86/kvm/vmx/vmx.c:4786-4787），之后
+	 * vmx_set_host_fs_gs()（:1258-1275）在同步宿主 FS/GS
+	 * 时同样把带 RPL/TI 位的选择子强制改成 0 才写进 VMCS —— 就是在躲
+	 * §27.2.3 这条检查。
+	 */
+	mini_vmwrite(HOST_FS_SELECTOR, 0);
+	mini_vmwrite(HOST_GS_SELECTOR, 0);
 
 	/* IDT 基址：全机一份（KVM 在 vmx_hardware_setup 里同样只取一次） */
 	store_idt(&idt);
@@ -439,18 +513,45 @@ static void mini_vmx_set_constant_host_state(void)
  * Guest 从 64 位（IA-32e）模式直接开始执行，这是与真实 KVM 的最大教学
  * 简化（KVM 的 vCPU 从实模式复位状态起步，vmx_vcpu_reset() vmx.c:4883-）。
  *
- * IA-32e 进入检查（SDM 27.3.1.2）要求：
- *   - CR0: PE=1, PG=1（本 CPU FIXED0=0x80000021 ⊆ 0x80010033，本机实证）
- *   - CR4: PAE=1, VMXE=0
- *   - EFER.LMA=1（配合 VM_ENTRY_LOAD_IA32_EFER 写入 0x501）
- *   - CS: L=1, D=0（AR=0xA09B）
- *   - TR 必须可用，类型为 64 位忙 TSS（AR=0x8B）
- *   - 其余段/LDTR 可标记不可用（AR=0x10000）
+ * IA-32e 进入检查（控制寄存器/EFER 见 §27.3.1.1，段寄存器见 §27.3.1.2）：
+ *   - CR0: PG=1 且 PE=1（§27.3.1.1："If the 'IA-32e mode guest' VM-entry
+ *     control is 1, bit 31 in the CR0 field ... and bit 5 in the CR4 field
+ *     ... must each be 1"）。另外 CR0 字段本身还要过 §24.8 的 fixed 位检查
+ *     （见下条 CR4 的说明）；本模块在 insmod 时用 pr_info 打印运行时读到的
+ *     IA32_VMX_CR0_FIXED0/1 与 CR4_FIXED0/1（main.c:221-225），上机对照即可
+ *   - CR4: PAE=1，**并且必须带 VMXE=1**。别以为非根模式下 CR4.VMXE 该是 0：
+ *     §24.8 的 NOTE 写的是 "The first processors to support VMX operation
+ *     require that the following bits be 1 in VMX operation: CR0.PE, CR0.NE,
+ *     CR0.PG, and CR4.VMXE"，而 "VMX operation" 包含 VMX root 与 non-root 两
+ *     种状态；§24.8 正文还有一句 "VM entry or VM exit cannot set any of these
+ *     bits to an unsupported value"，§27.3.1.1 则直接对 guest CR4 字段做这条
+ *     检查（"The CR4 field must not set any bit to a value not supported in
+ *     VMX operation (see Section 24.8)"）。unrestricted guest 只豁免 CR0.PE /
+ *     CR0.PG，不豁免 CR4.VMXE。对照 KVM：`KVM_PMODE_VM_CR4_ALWAYS_ON` /
+ *     `KVM_RMODE_VM_CR4_ALWAYS_ON` / `KVM_VM_CR4_ALWAYS_ON_UNRESTRICTED_GUEST`
+ *     三个常量全都含 X86_CR4_VMXE（vmx.c:156-158），vmx_set_cr4() 无论走哪条
+ *     分支都会或上它（vmx.c:3481-3487），最后 `vmcs_writel(GUEST_CR4,
+ *     hw_cr4)`（vmx.c:3528）。漏这一位 = VM entry 直接失败，退出原因是 33
+ *     "VM-entry failure due to invalid guest state"（§27.8）。
+ *     副作用：我们没开 "use CR4 shadows"，所以 guest 读 CR4 会看到 VMXE=1
+ *     （真实 KVM 用 CR4_READ_SHADOW 字段把它藏成 guest 认为的值，见
+ *     vmx.c:3527）。本项目的 guest 从不读 CR4，可以接受。
+ *   - EFER.LMA 必须等于 "IA-32e mode guest" 控制位，且在 CR0.PG=1 时必须与
+ *     LME 相同（§27.3.1.1）—— 配合 VM_ENTRY_LOAD_IA32_EFER 写入 0x501
+ *   - CS: 必须可用（§27.3.1.2 对 CS 强制 "bits 31:17 ... must all be 0"，
+ *     其中 bit16 就是 unusable 位）、Type ∈ {9,11,13,15}。规范只要求
+ *     "D/B must be 0 if the guest will be IA-32e mode and the L bit ... is 1"，
+ *     **并不强制 L=1**（IA-32e mode guest=1 而 CS.L=0 会以兼容模式开始执行）；
+ *     L=1 是我们要跑 64 位 guest 自己选的（AR=0xA09B）
+ *   - TR: 必须可用（"Bit 16 (Unusable). The unusable bit must be 0"），且
+ *     IA-32e 下 "the Type must be 11 (64-bit busy TSS)"（AR=0x8B）
+ *   - 其余段/LDTR 可标记不可用（AR=0x10000，选择子为 0）
  */
 
 #define MINI_GUEST_CR0		(X86_CR0_PE | X86_CR0_MP | X86_CR0_ET | \
 				 X86_CR0_NE | X86_CR0_WP | X86_CR0_PG)
-#define MINI_GUEST_CR4		X86_CR4_PAE
+/* VMXE 不是笔误：见上面 §24.8 / §27.3.1.1 那条，KVM 同样强制这一位 */
+#define MINI_GUEST_CR4		(X86_CR4_PAE | X86_CR4_VMXE)
 #define MINI_GUEST_EFER		(EFER_SCE | EFER_LME | EFER_LMA)
 
 #define MINI_SEG_AR_LDT_UNUSABLE	0x10000
@@ -468,7 +569,16 @@ static void mini_vmx_set_guest_state(void)
 	mini_vmwrite(GUEST_CR0, MINI_GUEST_CR0);
 	mini_vmwrite(GUEST_CR4, MINI_GUEST_CR4);
 	mini_vmwrite(GUEST_IA32_EFER, MINI_GUEST_EFER);
-	mini_vmwrite(GUEST_DR7, 0x400);			/* SDM 27.2 */
+	/*
+	 * 这一写其实**不决定** guest 的 DR7：VM-Entry 只在 "load debug
+	 * controls"（VM-entry 控制位 2，SDM Table 25-16）为 1 时才从 GUEST_DR7
+	 * 装载 DR7（SDM 27.3.2.1），本模块没有开这一位。guest 拿到的是 VM-Exit
+	 * 时硬件给宿主的固定值 —— "DR7 is set to 400H"（SDM 28.5.1），于是
+	 * 所有局部/全局断言使能位都是 0，配合异常位图里的 #DB 捕获也不会误触
+	 * 调试异常。KVM 正是看明白了这一点，初始化里根本不写 GUEST_DR7。
+	 * 这里保留一次写入，只为 mini_dump_vmcs() 打出来的值确定可读。
+	 */
+	mini_vmwrite(GUEST_DR7, 0x400);
 	mini_vmwrite(GUEST_INTERRUPTIBILITY_INFO, 0);
 	mini_vmwrite(GUEST_PENDING_DBG_EXCEPTIONS, 0);
 	mini_vmwrite(GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_ACTIVE);
@@ -507,6 +617,14 @@ static void mini_vmx_set_guest_state(void)
 	 */
 	mini_vmwrite(GUEST_FS_BASE, 0);
 	mini_vmwrite(GUEST_GS_BASE, 0);
+	/*
+	 * 同一条规则补齐 LDTR 基址：它也是每次进入都装载的字段。我们的 LDTR
+	 * 是空选择子（段不可用，任何穿越它的访问都 #GP），所以这不算修 bug，
+	 * 只是把初值钉成确定的。对照 vmx_vcpu_reset() 里 LDTR 那一组
+	 * （arch/x86/kvm/vmx/vmx.c:4913-4916），其中 :4914 就是
+	 * vmcs_writel(GUEST_LDTR_BASE, 0)。
+	 */
+	mini_vmwrite(GUEST_LDTR_BASE, 0);
 
 	mini_vmwrite(GUEST_TR_SELECTOR, 0x10);
 	mini_vmwrite(GUEST_TR_BASE, 0);
@@ -601,8 +719,15 @@ int mini_vcpu_vmx_setup(struct mini_kvm_vcpu *vcpu)
 		     (1u << 1) | (1u << 6) | (1u << 13) | (1u << 14));
 	mini_vmwrite(PAGE_FAULT_ERROR_CODE_MASK, 0);
 	mini_vmwrite(PAGE_FAULT_ERROR_CODE_MATCH, 0);
-	mini_vmwrite(CR3_TARGET_COUNT, 0);			/* 22.2.1 */
-	mini_vmwrite(VMCS_LINK_POINTER, INVALID_GPA);		/* 22.3.1.5 */
+	mini_vmwrite(CR3_TARGET_COUNT, 0);
+	/*
+	 * CR3_TARGET_COUNT=0：不使用 CR3-target 机制（§25.6.7）。
+	 * VMCS_LINK_POINTER=INVALID_GPA：字段定义见 §25.4.2，§27.3.1.5 的
+	 * 那条检查开头就是 "The following checks apply if the field contains
+	 * a value other than FFFFFFFF_FFFFFFFFH" —— 写全 1 正好绕开全部检查，
+	 * 因为我们不做嵌套。（KVM 同样写 INVALID_GPA，vmx.c:4739。）
+	 */
+	mini_vmwrite(VMCS_LINK_POINTER, INVALID_GPA);
 	mini_vmwrite(TPR_THRESHOLD, 0);
 
 	/* EPTP：WB 内存类型 + 4 级行走（SDM 25.6.11；值由 ept.c 最终填写） */
@@ -660,10 +785,38 @@ void mini_vcpu_vmx_teardown(struct mini_kvm_vcpu *vcpu)
 }
 
 /*
- * 进入失败时的诊断：读 VM_INSTRUCTION_ERROR（SDM 31.4 错误码表）。
+ * VM 指令失败时的诊断：读 VM_INSTRUCTION_ERROR 并按 SDM §31.4 Table 31-1 解码。
+ * 调用点是 VM entry（vcpu.c）与 VMXON（main.c）两条路。
+ *
+ * 为什么值得专门解码：VM entry 的失败分成两档，两档都**不产生 VM-Exit**，
+ * 只是"落到下一条指令"——§27.1 的基本检查（无 current VMCS / shadow VMCS 置
+ * CF；被 MOV-SS 阻塞、launch state 与指令不匹配置 ZF 并写错误号）与 §27.2 的
+ * 控制域/宿主状态检查（"control is passed to the next instruction, RFLAGS.ZF
+ * is set to 1 ... and the VM-instruction error field is loaded with an error
+ * number"）。vmx_entry.S 的判据是"VMRESUME/VMLAUNCH 居然返回了"，两档一网
+ * 打尽，代价是 CF/ZF 本身不再区分二者 —— 能区分的只有这里的错误号。只有
+ * §27.3.1/§27.4 那一档（guest 状态非法、MSR 装载失败）才会装载宿主状态并按
+ * §27.8 记录 exit reason，那条路走 vcpu.c 的 bit 31 分支。
  */
 void mini_vmx_report_error(const char *what)
 {
-	pr_err("mini-kvm: %s 失败, VM_INSTRUCTION_ERROR=%llu\n",
-	       what, mini_vmx_instruction_error());
+	u64 err = mini_vmx_instruction_error();
+	const char *why = "未知错误号";
+
+	switch (err) {
+	case 0:	why = "没有写入错误号——§27.1 第 3/4 条（无 current VMCS 或当前是 shadow VMCS）只置 CF 不写错误号，此时这条 VMREAD 自己也可能 VMfailInvalid"; break;
+	case 4:	why = "VMLAUNCH 时 VMCS launch state 不是 clear（§27.1 第 5.b 条）"; break;
+	case 5:	why = "VMRESUME 时 VMCS launch state 不是 launched（§27.1 第 5.c 条）"; break;
+	case 6:	why = "VMLAUNCH 与 VMRESUME 之间发生过 VMXOFF"; break;
+	case 7:	why = "VM entry 的控制域非法（§27.2.1）"; break;
+	case 8:	why = "VM entry 的宿主状态域非法（§27.2.2/§27.2.3/§27.2.4）"; break;
+	case 12: why = "VMREAD/VMWRITE 访问了不支持的 VMCS 部件"; break;
+	case 13: why = "VMWRITE 写了只读的 VMCS 部件"; break;
+	case 15: why = "VMXON 在 VMX root operation 中再次执行（§31.3 伪码最后一条）——机器上已有 VMX 用户"; break;
+	case 16: why = "VM entry 的 executive-VMCS 指针非法（嵌套相关，本模块不该出现）"; break;
+	case 26: why = "VM entry 被 MOV SS 阻塞（§27.1 第 5.a 条）"; break;
+	}
+
+	pr_err("mini-kvm: %s 失败, VM_INSTRUCTION_ERROR=%llu：%s\n",
+	       what, err, why);
 }

@@ -73,7 +73,8 @@ static inline void mini_wrmsr(u32 msr, u64 val)
 /* 模拟的串口端口（标准 PC COM1） */
 #define MINI_KVM_SERIAL_PORT	0x3f8
 
-/* EPT 叶条目权限位（SDM 29.3.2 Table 29-1） */
+/* EPT 叶条目权限位（SDM §29.3.2 的 Table 29-7 "EPT Page-Table Entry that
+ * Maps a 4-KByte Page"；非叶条目见 Table 29-1/29-2/29-4/29-6，bits 2:0 同义） */
 #define EPT_PTE_READ		(1ULL << 0)
 #define EPT_PTE_WRITE		(1ULL << 1)
 #define EPT_PTE_EXEC		(1ULL << 2)
@@ -105,8 +106,15 @@ static inline void mini_wrmsr(u32 msr, u64 val)
 struct mini_kvm_global {
 	bool vmx_enabled;		/* 全机 VMX 已开启（所有在线 CPU 已 VMXON） */
 	u32 vmcs_revision_id;		/* IA32_VMX_BASIC[30:0]，写入每个 VMCS/VMXON 区首页 */
-	bool true_ctls;			/* IA32_VMX_BASIC[55]：TRUE_* 控制 MSR 可用 */
-	u64 ept_vpid_cap;		/* IA32_VMX_EPT_VPID_CAP（SDM 25.5.6 / Appendix C） */
+	bool true_ctls;			/* IA32_VMX_BASIC[55]：TRUE_* 控制 MSR 可用
+					 * （内核同名宏 VMX_BASIC_TRUE_CTLS，
+					 * arch/x86/include/asm/vmx.h:134） */
+	u64 ept_vpid_cap;		/* IA32_VMX_EPT_VPID_CAP。位定义在规范
+					 * 附录 A.10（不在本仓库这份 Vol.3C PDF
+					 * 里），本模块用到的位都按内核
+					 * arch/x86/kvm/vmx/capabilities.h 的
+					 * cpu_has_vmx_* 谓词核对；
+					 * EPTP 各字段的用法见 §25.6.11） */
 	atomic_t enable_err;		/* per-CPU VMXON 阶段的第一个错误码 */
 };
 

@@ -19,12 +19,17 @@
  *     EPT memory type（6=WB），bit 6 = "ignore PAT"。
  *
  * 本模块不置 bit 6（ignore PAT），有效类型仍是 WB，推导链如下：
- *   §29.3.7.2 —— bit 6 = 0 时，有效内存类型 = "EPT 类型与 PAT 类型按
- *   Table 12-7 组合（EPT 类型顶替 MTRR 类型）"。测试程序建的 guest
- *   Stage-1 是 2MB 页且 PCD/PAT 位为 0（test-mini-kvm.c 的 pd[0]=0x83）
- *   → PAT 索引 0；模块未开 "load IA32_PAT"，guest 看到的就是宿主的
- *   IA32_CR_PAT，本机实测 0x0407050600070106 → PA0 = 6 = WB。
- *   WB × WB = WB。
+ *   §29.3.7.2 —— bit 6 = 0 时，有效内存类型 = "the combination of the EPT
+ *   memory type and the PAT memory type specified in Table 12-7 in Section
+ *   12.5.2.2, using the EPT memory type in place of the MTRR memory type"
+ *   （Table 12-7 不在本仓库这份 PDF 里 —— 它只含 Vol.3C，所以这里只按
+ *   §29.3.7.2 的转述使用）；同节最后一句："The MTRRs have no effect on the
+ *   memory type used for an access to a guest-physical address."
+ *   测试程序建的 guest Stage-1 是 2MB 页且 PCD/PAT 位为 0（test-mini-kvm.c
+ *   的 pd[0]=0x83）→ PAT 索引 0；模块未开 "load IA32_PAT"，非根模式下
+ *   IA32_CR_PAT 还是宿主的值，Linux 启动时会把它打印出来，本机
+ *   `dmesg | grep 'x86/PAT'` → "x86/PAT: Configuration [0-7]: WB WC UC- UC
+ *   WB WP UC- WT"，即 PA0 = WB。WB × WB = WB。
  *   对照 KVM：只有 KVM_X86_QUIRK_IGNORE_GUEST_PAT 生效（且无非一致 DMA）
  *   时才置 VMX_EPT_IPAT_BIT，默认路径同样只写 WB<<3
  *   （vmx_get_mt_mask()，arch/x86/kvm/vmx/vmx.c:7679-7693）。
