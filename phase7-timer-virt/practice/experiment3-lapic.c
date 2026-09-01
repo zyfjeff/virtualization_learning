@@ -94,12 +94,13 @@ static const char *lvtt_mode_name(uint32_t lvtt)
  * 喂一个最小 CPUID: leaf 1 带 ECX[24] (TSC_DEADLINE_TIMER) 与
  * ECX[21] (X2APIC)。
  *
- * 不设会踩一个隐蔽的坑: kvm_update_cpuid() 只在找到 leaf 1 且带
- * TSC_DEADLINE_TIMER 时, 才把 apic->lapic_timer.timer_mode_mask 设成 3<<17
- * (cpuid.c:398-403); 否则 mask 保持 kzalloc 初值 0, apic_update_lvtt()
- * (lapic.c:1781) 会把 LVTT 的模式位全掩掉 → timer_mode 永远是 0 (one-shot),
- * TSC_DEADLINE MSR 写入被 kvm_set_lapic_tscdeadline_msr() **静默拒绝**
- * (KVM_SET_MSRS 照常返回 1, 但定时器不会臂展)。QEMU 总会设置 CPUID 所以
+ * 不设会踩一个隐蔽的坑: 本实验若不给 leaf 1 建 CPUID 条目,
+ * kvm_update_cpuid() 里 best==NULL、整个 if 块不执行, timer_mode_mask
+ * 保持 kzalloc 初值 0 (有 leaf1 但缺该位时则是 1<<17, cpuid.c:399-402);
+ * mask=0 时 apic_update_lvtt() (lapic.c:1781) 把 LVTT 的模式位全掩掉 →
+ * timer_mode 永远是 0 (one-shot), TSC_DEADLINE MSR 写入被
+ * kvm_set_lapic_tscdeadline_msr() 的门挡下 (host 发起的 KVM_SET_MSRS
+ * 照常返回 1, 但定时器不会臂展)。QEMU 总会设置 CPUID 所以
  * 平时看不到; 直接用 KVM API 时它是硬前提。
  *
  * X2APIC 位是给 handler 发 EOI 用的: 中断注入后 ISR[0x20] 置位, 不发
@@ -314,8 +315,8 @@ int main(void)
     printf("  关键前提: guest 必须 IF=1、有 IDT 入口, 且 handler 发 EOI,\n");
     printf("  否则中断投递不了 (halt 的 vCPU 死锁在 kvm_vcpu_block(),\n");
     printf("  或不发 EOI 时同向量被 PPR 挡住)。另外必须先 KVM_SET_CPUID2\n");
-    printf("  声明 TSC_DEADLINE_TIMER, 否则 timer_mode_mask=0, deadline\n");
-    printf("  MSR 写入被静默拒绝 (cpuid.c:398-403)。\n");
+    printf("  声明 TSC_DEADLINE_TIMER, 否则(不建 leaf1 条目时)timer_mode_mask=0,\n");
+    printf("  deadline MSR 写入被拒 (cpuid.c:399-402)。\n");
 
     vcpu_destroy(&vcpu);
     vm_destroy(&vm);

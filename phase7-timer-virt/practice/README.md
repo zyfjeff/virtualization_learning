@@ -170,27 +170,33 @@ KVM_CREATE_VCPU → kvm_arch_vcpu_postcreate() → kvm_create_lapic()
 没有 irqchip 就没有 LAPIC，`KVM_GET/SET_LAPIC` 返回 EINVAL。
 
 **前置条件 ②（隐蔽坑）：必须 `KVM_SET_CPUID2` 声明 TSC_DEADLINE_TIMER**：
-`kvm_update_cpuid()` 只在 guest CPUID leaf 1 带 `X86_FEATURE_TSC_DEADLINE_TIMER`
-时才把 `apic->lapic_timer.timer_mode_mask` 设成 `3<<17`（`cpuid.c:398-403`）。
-不设则 mask 保持 0（kzalloc 初值），`apic_update_lvtt()` 把模式位全掩掉
+`kvm_update_cpuid()` 按 guest CPUID leaf 1 是否带
+`X86_FEATURE_TSC_DEADLINE_TIMER` 把 `apic->lapic_timer.timer_mode_mask` 设成
+`3<<17` 或 `1<<17`（if/else，`cpuid.c:399-402`）。本实验当时**完全没调
+`KVM_SET_CPUID2`**，`kvm_find_cpuid_entry(vcpu,1)` 返回 NULL、整个 if 块不执行，
+mask 保持 kzalloc 初值 0，`apic_update_lvtt()` 把模式位全掩掉
 （`timer_mode = LVTT & timer_mode_mask`，`lapic.c:1781`），`timer_mode` 永远是
 0（one-shot）；此时写 `MSR_IA32_TSC_DEADLINE` 被
-`kvm_set_lapic_tscdeadline_msr()` 的 `!apic_lvtt_tscdeadline()` 门**静默拒绝**
+`kvm_set_lapic_tscdeadline_msr()` 的 `!apic_lvtt_tscdeadline()` 门挡下
 （`lapic.c:2585`）—— `KVM_SET_MSRS` 照常返回 1，但定时器不会臂展，`KVM_RUN`
 永不返回。QEMU 总会设置 CPUID 所以平时看不到；直接用 KVM API 时它是硬前提。
 （6.12 的 `apic_lvtt_tscdeadline()` 查的是缓存的 `timer_mode`，不是 LVTT
-寄存器，`lapic.c:554-567`。）
+寄存器，`lapic.c:554-567`。若 leaf1 存在但缺该位，mask 是 `1<<17` 而非 0，
+deadline 位被 `lapic.c:2391` 掩掉，详见 `../corrections.md` 勘误 28。）
 
 **前置条件 ③（隐蔽坑）：handler 不发 EOI，第二个中断永远不来**：
 中断注入置位 `ISR[vector]`；不发 EOI 则 `kvm_apic_has_interrupt()` 里
 `highest_irr <= apic_get_ppr()` 成立，同向量被挡。实模式够不着 xAPIC MMIO
 （`0xFEE00000 > 1MB`），本实验改用 **x2APIC MSR 发 EOI**（`WRMSR(0x80b)`，
 实模式可用）。这条路径有两道门：
-- `kvm_x2apic_msr_write()` 要求 `apic_x2apic_mode()`，否则静默返回
-  （`lapic.c:3313`）→ 必须先写 `APICBASE(0x1b)` 置 `X2APIC_ENABLE`(bit10)；
+- `kvm_x2apic_msr_write()` 要求 `apic_x2apic_mode()`，否则 `return 1`
+  （`lapic.c:3312-3313`）：本实验走宿主 `KVM_SET_MSRS`，该 1 被
+  `kvm_do_msr_access()`（`x86.c:500`）返回用户态、写入被拒（若是 guest
+  自己 WRMSR 则会注入 #GP）→ 必须先写 `APICBASE(0x1b)` 置
+  `X2APIC_ENABLE`(bit10)；
 - `kvm_set_apic_base()` 规定：guest CPUID 没有 X2APIC 时，`APICBASE` 的
-  `X2APIC_ENABLE` 算保留位、写入被拒（`x86.c:675-676`）→ 步骤 2 的
-  ECX[21] 由此而来。
+  `X2APIC_ENABLE` 算保留位、写入被拒（`x86.c:675-679`）→ 步骤 2 的
+  ECX[21] 由此而来。（详见 `../corrections.md` 勘误 28。）
 
 **Guest 内存布局**（实模式，CS.base=0）：
 ```
@@ -276,8 +282,8 @@ handler WRMSR(0x80b) → case APIC_BASE_MSR... x86.c:3888
 | 2 | `KVM_SET_CLOCK` | `kvm_vm_ioctl_set_clock()` | `x86.c:7006` |
 | 2 | `kvm_guest_time_update()` | — | `x86.c:3215` |
 | 3 | `KVM_CREATE_IRQCHIP` | `kvm_arch_vm_ioctl()` case @ `x86.c:7090` | `x86.c` |
-| 3 | `KVM_SET_CPUID2` | `kvm_update_cpuid()` — 决定 `timer_mode_mask` | `cpuid.c:398-403` |
-| 3 | `KVM_SET_MSRS(APICBASE)` | `kvm_set_apic_base()` — 无 X2APIC CPUID 时拒 `X2APIC_ENABLE` | `x86.c:671` / `:675-676` |
+| 3 | `KVM_SET_CPUID2` | `kvm_update_cpuid()` — 决定 `timer_mode_mask` | `cpuid.c:399-402` |
+| 3 | `KVM_SET_MSRS(APICBASE)` | `kvm_set_apic_base()` — 无 X2APIC CPUID 时拒 `X2APIC_ENABLE` | `x86.c:671` / `:675-679` |
 | 3 | `KVM_SET_LAPIC` | `kvm_vcpu_ioctl_set_lapic()` → `kvm_apic_set_state()` | `x86.c:5122` / `lapic.c:3103` |
 | 3 | `KVM_SET_MSRS(TSC_DEADLINE)` | `kvm_set_msr_common()` → `kvm_set_lapic_tscdeadline_msr()` | `x86.c:3890` / `lapic.c:2585` |
 | 3 | handler `WRMSR(0x80b)` EOI | `kvm_x2apic_msr_write()` → `__kvm_apic_update_eoi()` | `x86.c:3888` / `lapic.c:3308` |

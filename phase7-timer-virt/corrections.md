@@ -468,6 +468,46 @@ APICBASE 位定义：`BSP=(1<<8)`、`X2APIC_ENABLE=(1<<10)`（apicdef.h:153）�
 
 ---
 
+## 勘误 28：勘误 26/27 两处表述过度概括（phase8 复核时澄清）
+
+**触发**：`../phase8-capstone` 毕业项目实测时复核了本文件与
+`practice/README.md` 引用的两条"前置条件"，发现两处措辞会把读者带偏。
+勘误 26/27 记录的**实验本身没错**（experiment3 当时确实完全没调
+`KVM_SET_CPUID2`），但由此归纳出的一般性说法不精确。
+
+**澄清 1（对应勘误 26 / README 前置条件 ②）**：
+"`kvm_update_cpuid()` 只在带 `TSC_DEADLINE_TIMER` 时才设 `3<<17`，不设则
+mask 保持 0" —— 这是 if/else，不是"设或清零"（`cpuid.c:399-402`）：
+
+```c
+if (cpuid_entry_has(best, X86_FEATURE_TSC_DEADLINE_TIMER))
+    apic->lapic_timer.timer_mode_mask = 3 << 17;
+else
+    apic->lapic_timer.timer_mode_mask = 1 << 17;
+```
+
+- guest CPUID **有 leaf1 条目**但缺该位 → mask = `1<<17`，写 LVT Timer 的
+  deadline 位(bit18)被 `lapic.c:2391` 掩掉（`2<<17`→0=one-shot，
+  `3<<17`→`1<<17`=periodic，`apicdef.h:107-109`），deadline 模式设不上。
+- 只有**从未给 leaf1 建条目**（`cpuid.c:398` `kvm_find_cpuid_entry` 返回
+  NULL，整个 if 块不执行）mask 才保持 kzalloc 的 0 —— experiment3 属此类。
+
+引用行号 `cpuid.c:398-403` 一律应为 `cpuid.c:399-402`。
+
+**澄清 2（对应勘误 27 / README 前置条件 ③）**：
+"`kvm_x2apic_msr_write()` 否则静默返回（lapic.c:3313-3314）" —— 该函数是
+`return 1`（`lapic.c:3312-3313`），不是"静默"。这个 1 的去向看发起方：
+guest 发起的 WRMSR 经 `kvm_emulate_wrmsr()`（`x86.c:2079`）→
+`complete_emulated_insn_gp()` → `kvm_inject_gp()` **注入 #GP**；宿主发起的
+`KVM_SET_MSRS`（experiment3 用的这条）由 `kvm_do_msr_access()`（`x86.c:500`）
+把 1 返回用户态、写入被拒。所以实验观察到"没生效"，机制是"拒绝/#GP"而非
+"静默丢弃"。同节 `kvm_set_apic_base()` 的保留位计算在 `x86.c:675-676`、
+拒绝判断在 `:678-679`，引用宜写 `x86.c:675-679`。
+
+**同步修正**：`practice/README.md` 前置条件 ②/③ 与文末对照表已按本条改写。
+
+---
+
 ## 已验证正确的内容
 
 以下声明经核查**确认正确**：
