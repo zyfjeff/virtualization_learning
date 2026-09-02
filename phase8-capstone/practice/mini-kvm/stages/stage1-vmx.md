@@ -347,7 +347,7 @@ sudo dmesg | grep mini-kvm | tail
 ### 不加载模块也能做的静态自检
 
 共享机器上不能随便 `insmod`（要先卸载 `kvm_intel`，会打断宿主上所有 VM），而
-本机 `/dev/cpu/*/msr` 全部返回 EIO，能力 MSR 一个都读不到 —— 下面四条是不上机
+本机 `/dev/cpu/*/msr` 全部返回 EIO，能力 MSR 一个都读不到 —— 下面五条是不上机
 也能验的部分：
 
 ```bash
@@ -365,10 +365,23 @@ objdump -d --no-show-raw-insn mini-kvm.ko | grep -A1 -E "\bvmresume\b|\bvmlaunch
 #   7d:  vmlaunch
 #   80:  jmp    10d <mini_vmx_vmexit+0x7d>     ← 同一处
 
-# 4. 本文档与 README/corrections.md 里每一条 `file:line` 都落在真实代码上
+# 4. VM-Exit 着陆点取回 vcpu 指针的偏移必须是 0x10，不是入口那个 0x8
+objdump -d --no-show-raw-insn vmx_entry.o | sed -n '/<mini_vmx_vmexit>:/,/pop/p'
+#   90:  push   %rax               ← 暂存 guest RAX
+#   91:  mov    0x10(%rsp),%rax    ← vcpu 指针：HOST_RSP+8 再叠加刚 push 的一格
+#   96:  pop    (%rax)             ← guest RAX 落进 regs[0]
+# 这一格之差曾照抄 KVM 的 `mov WORD_SIZE(%rsp),%rax` 写成 8 —— KVM 的 HOST_RSP
+# 指向它 push 的最后一格（就是 @regs），我们的 HOST_RSP 指向 launched，vcpu 在
+# 它上面一格。写错时每次 VM-Exit 都往 VA 0/1 连写 16 个 guest 寄存器，宿主当场
+# #PF，而且只在第一次退出发生 —— 静态读代码最难抓的就是这种（见 corrections.md
+# J12(1)）。这几处偏移现在都由 vmx_entry.S 里的 STACK_LAUNCHED / STACK_VCPU
+# 宏算出来，改栈布局时入口与出口两条路径一起变。
+
+# 5. 文档与本模块源码注释里每一条 `file:line` 都落在真实代码上
 #    （行号漂移是本项目最容易复发的错，见 corrections.md J10(a′)/J11(6)）
 ./check-refs.py --quiet				# README + 五篇 stage
 ./check-refs.py --quiet ../../corrections.md
+./check-refs.py --quiet --kernel --src		# 连 *.c/*.h/*.S 的注释一起扫
 ./check-refs.py --context 2			# 想看每条引用的原文就去掉 --quiet
 ```
 

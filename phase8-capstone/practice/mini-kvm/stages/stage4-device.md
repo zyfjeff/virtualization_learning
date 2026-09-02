@@ -77,7 +77,7 @@ TX-empty / RX-ready）是跑不通的 —— 完整的 16550A 模型是用户态
 ### 代码
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/device.c:61-104（注释略） */
+/* 来源: phase8-capstone/practice/mini-kvm/device.c:77-120（注释略） */
 int mini_handle_io_exit(struct mini_kvm_vcpu *vcpu)
 {
 	u64 qual, rip, len;
@@ -143,10 +143,12 @@ sudo dmesg | grep 'mini-kvm guest'
 # mini-kvm guest: [IRQ 0x21 handled]
 ```
 
-串口是**按行**打点的：`mini_serial_out()`（`device.c:33-56`）逐字节记进环形
-缓冲，遇到 `'\n'` 才把最近一行 `pr_info` 出去。用户态另有
-`MINI_KVM_VM_GET_SERIAL` 可以把整段缓冲取回去做断言，`test-mini-kvm` 用的
-就是这条路。写了别的端口会看到
+串口是**按行**打点的：`mini_serial_out()`（`device.c:49-72`）逐字节记进线性
+缓冲（不是环形：写满 `MINI_KVM_SERIAL_SIZE - 1` = 511 字节后就丢弃后续输入），
+遇到 `'\n'` 才把最近一行 `pr_info` 出去。用户态另有
+`MINI_KVM_VM_GET_SERIAL` 可以把缓冲取回去做断言，但它的返回值只有
+`char[256]`，**只能拿到前 255 字节**，`test-mini-kvm` 用的就是这条路。
+写了别的端口会看到
 `mini-kvm: 忽略 OUT port=0x... val=0x...`（`pr_info_ratelimited`）。
 
 ## 📝 检查清单

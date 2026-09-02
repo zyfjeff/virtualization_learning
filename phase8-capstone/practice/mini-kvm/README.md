@@ -139,12 +139,17 @@ sudo modprobe kvm_intel
 | `KVM_GET_API_VERSION` | kvm | 固定返回 `KVM_API_VERSION`(12) |
 | `KVM_CHECK_EXTENSION` | kvm | 只认 `KVM_CAP_USER_MEMORY` → 1 |
 | `KVM_CREATE_VM` | kvm | 分配 `struct mini_kvm` + EPT 根 |
-| `KVM_GET_VCPU_MMAP_SIZE` | kvm | 一页 |
+| `KVM_GET_VCPU_MMAP_SIZE` | kvm | 一页；真实 KVM 在 x86 上返回三页（run + pio data + coalesced MMIO 环，`kvm_main.c:5552-5561`），按 pgoff 分派 |
 | `KVM_SET_USER_MEMORY_REGION` | VM | 单 slot；`pin_user_pages()` 钉住整段；**只能设一次**，重复设返回 `-EEXIST` |
 | `KVM_CREATE_VCPU` | VM | 单 vCPU；分配 VMCS 页并完成 VMCS 初始化 |
 | `KVM_RUN` | vCPU | 运行循环；结果写 `kvm_run->exit_reason` |
-| `MINI_KVM_VM_GET_SERIAL` | VM | `_IOR('M',0x01,char[256])`，取串口捕获缓冲（NUL 结尾） |
-| `MINI_KVM_VCPU_INJECT_IRQ` | vCPU | `_IOW('M',0x02,int)`，参数 = vector；下次进入前注入 |
+| `MINI_KVM_VM_GET_SERIAL` | VM | `_IOR('M',0x01,char[256])` = `0x81004d01`，取串口捕获缓冲（NUL 结尾，只回传前 255 字节） |
+| `MINI_KVM_VCPU_INJECT_IRQ` | vCPU | `_IOW('M',0x02,int)` = `0x40044d02`，参数 = vector；下次进入前注入 |
+
+两个私有命令的宏在 `mini-kvm.h` 和 `test-mini-kvm.c` 里各抄了一份（用户态程序
+不能 include 内核头）。两侧必须逐字符一致，编号差一位就是 `-ENOTTY`；上表的
+十六进制值是手抄的锚点，改任何一侧都要重新核对（`gcc -include linux/kvm.h`
+编个三行程序打印 `_IOR(...)` 即可复核）。
 
 `KVM_RUN` 返回后 guest 寄存器在 VMCS 里（`kvm_run` 的 `sregs`/`kvm_regs`
 未实现，这是简化点之一，见第 8 节）。
@@ -156,16 +161,16 @@ sudo modprobe kvm_intel
 
 | Exit reason | 处理 | 之后 |
 |---|---|---|
-| `EXTERNAL_INTERRUPT` | 开/关中断的"瞬间窗口"让 pending 的宿主中断走宿主 IDT（`PIN_BASED_EXT_INTR_MASK` 使所有外部中断退出，且未设 `VM_EXIT_ACK_INTR_ON_EXIT`，向量仍 pending 在 LAPIC IRR） | 继续运行 |
+| `EXTERNAL_INTERRUPT` | 开/关中断的"瞬间窗口"让 pending 的宿主中断走宿主 IDT（`PIN_BASED_EXT_INTR_MASK` 使所有外部中断退出，且未设 `VM_EXIT_ACK_INTR_ON_EXIT`，向量仍 pending 在 LAPIC IRR）。**sti 和 cli 之间必须夹一条指令**，否则中断影子没走完就又被 cli 关住 → 每次进入立刻又以原因 1 退出 | 继续运行 |
 | `EXCEPTION_NMI` | NMI → `mini_vcpu_reinject_nmi()`；其它向量 → 打印 guest RIP + dump VMCS | NMI 继续运行；异常 → `KVM_EXIT_INTERNAL_ERROR` |
-| `IO_INSTRUCTION` | `mini_handle_io_exit()` 解码 Table 28-5，0x3f8 记入串口缓冲，推进 RIP；串 IO（bit 4）拒绝 | 继续运行 / 报错 |
+| `IO_INSTRUCTION` | `mini_handle_io_exit()` 解码 Table 28-5，0x3f8 记入串口缓冲，推进 RIP；串 IO（bit 4）拒绝。整个处理在显式 `local_irq_enable()` 的窗口里（与 KVM 一致：`handle_exit()` 也在开中断后执行） | 继续运行 / 报错 |
 | `EPT_VIOLATION` | `mini_ept_handle_violation()`：GPA ← `GUEST_PHYSICAL_ADDRESS`，查 memslot → 4KB 映射（`GFP_ATOMIC`） | 继续运行 |
 | `CPUID` | 返回 0 并跳过指令（guest 不该执行它） | 继续运行 |
 | `HLT` | 不推进 RIP（与 KVM 一致，恢复时重执行） | `KVM_EXIT_HLT` 回用户态 |
 | `TRIPLE_FAULT` | 打印 + dump VMCS | `KVM_EXIT_SHUTDOWN` |
 | 其它 / VM-Entry 失败（`exit_reason` bit31） | `mini_vmx_report_error()` + `mini_dump_vmcs()` | `KVM_EXIT_INTERNAL_ERROR` |
 
-## 7. 三条最容易写错的硬件规则（本项目都踩过）
+## 7. 五条最容易写错的硬件规则（本项目都踩过）
 
 1. **VMCLEAR 必须落在最后持有该 VMCS 的 CPU 上。** SDM 25.11.1：
    "the first logical processor should execute VMCLEAR for the VMCS (to make it
@@ -195,6 +200,30 @@ sudo modprobe kvm_intel
    VM-Exit"），其余靠**逆序 pop**；VM-Entry 失败与正常退出合并到同一条收栈
    路径（对照 `vmenter.S:300-303` 的 `.Lvmfail` 跳到 `:227` 的 `.Lclear_regs`，
    先清寄存器再 pop）。
+4. **开中断窗口里必须夹一条指令。** STI 的中断影子要到**下一条指令执行完**才
+   解除，所以 `sti` 紧跟 `cli` 等于刚把门推开又关上，pending 的可屏蔽中断一个都
+   收不到（这条规则的定义在 Vol.3A 的 RFLAGS/STI 说明里，本仓库这份 PDF 只有
+   Vol.3C，给不出可核对的章节号，故只引下面的源码）。本模块又**没有**开
+   `VM_EXIT_ACK_INTR_ON_EXIT`，向量还挂在 LAPIC IRR（SDM 28.1："An external
+   interrupt does not acknowledge the interrupt controller and the interrupt
+   remains pending"），于是下一次 VM entry 立刻又以原因 1 退出 —— VM-Exit 风暴：
+   guest 不再推进，宿主这个 CPU 的 tick 永远进不来（soft lockup / RCU stall）。
+   KVM 的同一段窗口里放的正是 `++vcpu->stat.exits`，理由写在它自己的注释里：
+   "An instruction is required after local_irq_enable() to fully unblock
+   interrupts on processors that implement an interrupt shadow"
+   （`arch/x86/kvm/x86.c:11149-11158`）。我们放的是 `vcpu->n_extint_exits++`
+   （`vcpu.c:290-292`）。
+5. **`HOST_RSP` 指向哪一格，决定退出后取栈上参数的偏移。** 硬件在 VM-Exit 只把
+   `%rsp` 恢复成 `HOST_RSP`，之后每个 `N(%rsp)` 都以那一格为基准。KVM 的
+   `HOST_RSP` 指向它压的**最后一格，而那格就是 `@regs`**（`push @regs` 在
+   `vmenter.S:103`，地址交给 `vmx_update_host_rsp()` 在 `:108-109`），所以退出后
+   重载用 `WORD_SIZE(%rsp)` = 8（`vmenter.S:203`）。本模块的 `HOST_RSP` 指向
+   `launched`，`vcpu` 在它上面一格，退出路径又先 `push %rax` 暂存 guest RAX ——
+   正确的偏移是 **16 不是 8**。照抄 KVM 的数字会把 `launched`（0 或 1）当指针，
+   `pop REG_RAX(%rax)` 往 VA 0/1 开写，第一次 VM-Exit 就把宿主 #PF 掉。现在两侧
+   偏移都由 `STACK_LAUNCHED` / `STACK_VCPU` 宏算出来（`vmx_entry.S:58-59`），
+   判据是反汇编：退出着陆点必须看到 `mov 0x10(%rsp),%rax`（stage1 静态自检第 4
+   条）。
 
 `guest/guest.S` 里也有一条同级的坑：`OUT`/`IN` 的立即数端口字段只有 8 位，
 `out %al, $0x3f8` 会被汇编器**静默截断**成端口 `0xf8`，必须走 `%dx`。

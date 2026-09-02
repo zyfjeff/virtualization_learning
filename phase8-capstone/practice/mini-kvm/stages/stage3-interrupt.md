@@ -71,11 +71,33 @@ SDM 28.1 写得很直接：
 
 所以 `EXIT_REASON_EXTERNAL_INTERRUPT` 退出时中断还挂在 LAPIC 上，
 `VM_EXIT_INTR_INFO` 是**无效**的（SDM 28.2.2 明确 ack=0 时该字段 bit31 清零、
-其余 undefined）。运行循环因此什么都不读，只做一发
-`local_irq_enable(); local_irq_disable();` 让宿主 IDT 把这个 pending 中断
-就地消费掉，然后重新进入 guest。
+其余 undefined）。运行循环因此什么都不读，只开一扇中断窗口让宿主 IDT 把这个
+pending 中断就地消费掉，然后重新进入 guest：
 
-KVM 走的是相反的路：`VM_EXIT_ACK_INTR_ON_EXIT` 在
+```c
+/* 来源: vcpu.c:275-293（EXIT_REASON_EXTERNAL_INTERRUPT 分支） */
+local_irq_enable();
+vcpu->n_extint_exits++;		/* 这条指令是给中断影子留的出口 */
+local_irq_disable();
+```
+
+**sti 与 cli 之间必须夹一条指令。** 处理器执行完 STI 之后的那条指令才认可
+pending 的可屏蔽中断（这条"中断影子"规则定义在 Vol.3A 的 RFLAGS/STI 说明里，
+本仓库这份 PDF 只有 Vol.3C，给不出可核对的章节号，故只引下面的源码），所以
+背靠背的 `sti; cli` 等于刚把门推开又关上，一个中断都收不到；向量还留在
+LAPIC IRR，下一次 VM entry 立刻又以原因 1 退出 —— 于是 VM-Exit 风暴：guest
+不再推进，宿主这个 CPU 的 tick 永远进不来（soft lockup / RCU stall）。症状
+是"模块把机器拖死了"，而代码里一行错都没有，静态审查最容易放过去。
+
+KVM 同一处放的正是 `local_irq_enable(); ++vcpu->stat.exits;
+local_irq_disable();`，理由写在它自己的注释里
+（`arch/x86/kvm/x86.c:11149-11158`）：
+
+> "An instruction is required after local_irq_enable() to fully unblock
+> interrupts on processors that implement an interrupt shadow, the stat.exits
+> increment will do nicely."
+
+至于 ack-on-exit 这个控制位本身，KVM 走的是相反的路：`VM_EXIT_ACK_INTR_ON_EXIT` 在
 `__KVM_REQUIRED_VMX_VM_EXIT_CONTROLS` 里（`arch/x86/kvm/vmx/vmx.h:515-517`），
 是**必需位**。既然向量已经被硬件从 LAPIC 取走了，KVM 必须自己把它交付出去，
 于是在 root 模式直接跳进宿主 IDT 的对应门：
@@ -122,7 +144,7 @@ int mini_vcpu_inject_irq(struct mini_kvm_vcpu *vcpu, int vector)
 ### 2. 注入窗口（`vcpu.c::mini_vcpu_run_loop()`）
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/vcpu.c:147-157 */
+/* 来源: phase8-capstone/practice/mini-kvm/vcpu.c:152-162 */
 intr = mini_vcpu_take_intr_info(vcpu);
 if (intr) {
 	u64 rflags = 0, ib = 0;
@@ -192,7 +214,7 @@ present + DPL0 + 64 位中断门），全部指向 `irq_stub`（直接 `iretq`�
 
 `PIN_BASED_NMI_EXITING` = 1 时，宿主的 NMI 会以 **退出原因 0（EXCEPTION_NMI）
 + `VM_EXIT_INTR_INFO` type=2 / vector=2** 出现（SDM 28.2.2）。运行循环
-（`vcpu.c:277-284`）认出这个组合后调 `mini_vcpu_reinject_nmi()`，把 NMI
+（`vcpu.c:295-302`）认出这个组合后调 `mini_vcpu_reinject_nmi()`，把 NMI
 转注给 guest：
 
 ```c
@@ -236,7 +258,7 @@ guest 的 NMI 路径可观测；代价是**宿主自己的 NMI 被抢走**，需
 | 中断控制器 | 无（用户态直接指定 vector） | vLAPIC + PIC + IOAPIC，`kvm_irq_delivery_to_apic()`（`arch/x86/kvm/irq_comm.c:47`） |
 | 排队结构 | 单个 `pending_intr_info` | IRR/PIR 位图 + RVI/SVI |
 | 等窗口 | 无：注入前强改 IF 与 interruptibility | interrupt-window / NMI-window exiting |
-| ack-on-exit | 关（中断留在 LAPIC，靠 `local_irq_enable()` blip 交付宿主） | `__KVM_REQUIRED_VMX_VM_EXIT_CONTROLS` 必需位，KVM 自己跳宿主 IDT（`vmx.c:7013-7030`） |
+| ack-on-exit | 关（中断留在 LAPIC，靠开/关中断的窗口 + 中间那条指令交付宿主，见上「宿主的中断从哪来」） | `__KVM_REQUIRED_VMX_VM_EXIT_CONTROLS` 必需位，KVM 自己跳宿主 IDT（`vmx.c:7013-7030`） |
 | 宿主 NMI | 转注给 guest（分歧点，见上） | 宿主自己消费（`vmx_do_nmi_irqoff()`） |
 | NMI 阻塞 | 只看 bit3，放弃即丢 | virtual NMIs（`enable_vnmi`）或软件 `soft_vnmi_blocked` |
 | Posted Interrupts | 无 | `posted_intr.c`：PIR→VIRR、RVI 由硬件评估，正常路径 0 次 VM-Exit（SDM 30.6） |
@@ -256,7 +278,7 @@ sudo ./test-mini-kvm
 （`KVM_EXIT_HLT = 5`，`include/uapi/linux/kvm.h:151`）。串口缓冲是
 `MINI_KVM_VM_GET_SERIAL` 一次性读出的**累计**内容，所以第二次读到的是两行。
 
-内核侧的统计行走 `pr_debug`（`vcpu.c:366-369`），要先打开 dynamic debug：
+内核侧的统计行走 `pr_debug`（`vcpu.c:384-387`），要先打开 dynamic debug：
 
 ```bash
 echo -n 'module mini_kvm +p' | sudo tee /sys/kernel/debug/dynamic_debug/control

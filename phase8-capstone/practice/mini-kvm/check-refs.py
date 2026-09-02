@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把文档里的 `file.c:NN[-MM]` 引用逐条解析并打印被引用的原文。
+"""把文档与本模块源码注释里的 `file.c:NN[-MM]` 引用逐条解析并打印被引用的原文。
 
 行号引用会随代码改动漂移，肉眼核对必漏（见 phase8-capstone/corrections.md
 J10(a′)、J11(6)）。本脚本不做语义判断，只保证两件事：
@@ -12,6 +12,8 @@ J10(a′)、J11(6)）。本脚本不做语义判断，只保证两件事：
     ./check-refs.py --kernel       # 内核树引用也一起解析
     ./check-refs.py --quiet        # 只打印有问题的条目
     ./check-refs.py --kernel ../../corrections.md
+    ./check-refs.py --kernel --src # 连模块自己的源码注释一起扫（那里面的引用
+                                   # 几乎都是内核树引用，所以要配 --kernel）
 
 已知边界：报"找不到文件"多半只是该文件名不在下面的 KERNEL_DIRS 里，加一行即
 可；而"本目录同名文件越界 → 退到内核树同名文件"这一条会被标成"歧义"，因为本
@@ -36,6 +38,13 @@ def default_docs():
     if os.path.isdir(STAGES):
         docs += ["stages/" + f for f in sorted(os.listdir(STAGES)) if f.endswith(".md")]
     return docs
+
+
+def module_sources():
+    """本模块自己的源码（注释里也全是 file:line 引用，同样会漂移）。"""
+    skip = (".mod.c",)
+    return [f for f in sorted(os.listdir(HERE))
+            if f.endswith((".c", ".h", ".S")) and not f.endswith(skip)]
 
 
 REPO_PREFIX = "practice/mini-kvm/"
@@ -69,13 +78,18 @@ def candidates(name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", action="store_true", help="也解析内核树引用")
+    ap.add_argument("--src", action="store_true", help="连本模块源码注释一起扫")
     ap.add_argument("--quiet", action="store_true", help="只报问题")
     ap.add_argument("--context", type=int, default=4, help="每条最多打印几行")
     ap.add_argument("docs", nargs="*", default=None)
     args = ap.parse_args()
 
-    bad = printed = total = 0
-    for doc in (args.docs or default_docs()):
+    files = args.docs or default_docs()
+    if args.src:
+        files = list(files) + module_sources()
+
+    bad = printed = total = fallback = 0
+    for doc in files:
         doc_path = doc if os.path.isabs(doc) else os.path.join(HERE, doc)
         if not os.path.isfile(doc_path):
             print(f"!! 文档不存在: {doc}")
@@ -103,9 +117,9 @@ def main():
                         break
                 if chosen is None:
                     path, is_kernel = cands[-1]
-                    total = len(open(path, errors="replace").read().splitlines())
+                    nlines = len(open(path, errors="replace").read().splitlines())
                     tag = "内核" if is_kernel else "本模块"
-                    print(f"!! {doc}:{lineno} 行号越界（{tag} 文件 {total} 行）  {ref}")
+                    print(f"!! {doc}:{lineno} 行号越界（{tag} 文件 {nlines} 行）  {ref}")
                     bad += 1
                     continue
                 path, is_kernel, lines, ambiguous = chosen
@@ -113,9 +127,9 @@ def main():
                     continue
                 tag = "内核" if is_kernel else "本模块"
                 note = "（裸引用按内核树解析）" if ambiguous else ""
+                if ambiguous:
+                    fallback += 1
                 if args.quiet:
-                    if ambiguous and is_kernel and len(cands) > 1:
-                        print(f"?? {doc}:{lineno} 歧义 {ref} —— 写全路径更易读")
                     continue
                 printed += 1
                 print(f"== {doc}:{lineno} -> {tag}{note} "
@@ -125,7 +139,9 @@ def main():
                     print(f"   {n + 1}\t{lines[n]}")
                 if stop < end:
                     print("   …")
-    print(f"\n共 {total} 条引用，打印 {printed} 条，{bad} 条有问题", file=sys.stderr)
+    extra = f"（{fallback} 条裸引用按内核树解析）" if fallback else ""
+    print(f"\n共 {total} 条引用，打印 {printed} 条，{bad} 条有问题{extra}",
+          file=sys.stderr)
     return 1 if bad else 0
 
 

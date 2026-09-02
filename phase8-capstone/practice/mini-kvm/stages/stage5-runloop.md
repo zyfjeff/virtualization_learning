@@ -36,7 +36,7 @@ KVM:  kvm_arch_vcpu_ioctl_run()
              preempt_disable()（:10979）… VM-Entry … VM-Exit …（:11171 才 enable）
 
 mini-kvm: mini_vcpu_run_ioctl()
-        └→ mini_vcpu_run_loop()                vcpu.c:62     ← 一层 for(;;)
+        └→ mini_vcpu_run_loop()                vcpu.c:67     ← 一层 for(;;)
              全程 preempt_disable（:69）；要回用户态就 goto out
 ```
 
@@ -56,10 +56,10 @@ mini-kvm 的分界更直白：**`continue` = 留在内核重进；`goto out` = �
 
 | VM-Exit 原因 | mini-kvm 的处理 | 去留 |
 |---|---|---|
-| `EXTERNAL_INTERRUPT`(1) | 不读 `VM_EXIT_INTR_INFO`（ack-on-exit=0，该字段无效），`local_irq_enable(); local_irq_disable();` 让宿主 IDT 消费 pending 中断 | `continue` |
+| `EXTERNAL_INTERRUPT`(1) | 不读 `VM_EXIT_INTR_INFO`（ack-on-exit=0，该字段无效），`local_irq_enable(); vcpu->n_extint_exits++; local_irq_disable();` 让宿主 IDT 消费 pending 中断。**enable 与 disable 之间必须有那条自增**：STI 的中断影子要到下一条指令执行完才解除，紧跟 `cli` 等于一个中断都没消费掉，下一次进入立刻又以原因 1 退出（详见 Stage 3「宿主的中断从哪来」） | `continue` |
 | `EXCEPTION_NMI`(0) + type=2/vector=2 | `mini_vcpu_reinject_nmi()` 转注给 guest（Stage 3） | `continue` |
 | `EXCEPTION_NMI` 的其他（#DB/#UD/#GP/#PF） | 打印 RIP + `VM_EXIT_INTR_INFO` + `mini_dump_vmcs()` | `KVM_EXIT_INTERNAL_ERROR`，回用户态 |
-| `IO_INSTRUCTION`(30) | `mini_handle_io_exit()`：串口 0x3f8 收字节，其余忽略；RIP += `VM_EXIT_INSTRUCTION_LEN` | `continue`（串 IO / 解码失败 → `-EIO` 回用户态） |
+| `IO_INSTRUCTION`(30) | 在显式 `local_irq_enable()` 窗口里跑 `mini_handle_io_exit()`：串口 0x3f8 收字节，其余忽略；RIP += `VM_EXIT_INSTRUCTION_LEN`（KVM 同样在开中断下 `handle_exit()`，`x86.c:11170` → `:11198`） | `continue`（串 IO / 解码失败 → `-EIO` 回用户态） |
 | `EPT_VIOLATION`(48) | `mini_ept_handle_violation()` 按需映射，硬件重放 | `continue`（GPA 不在 memslot → `-EFAULT`） |
 | `CPUID`(10) | `regs[0] = 0` + RIP += 长度（guest 不该执行它） | `continue` |
 | `HLT`(12) | `run->exit_reason = KVM_EXIT_HLT` | `goto out`，回用户态 |
@@ -71,7 +71,7 @@ mini-kvm 的分界更直白：**`continue` = 留在内核重进；`goto out` = �
 `EXTERNAL_INTERRUPT` = 1 挨着，是最容易记反的一对。
 
 `VM_EXIT_REASON` 的 bit31 是 "entry failure"，在进入 switch 之前就单独拦掉了
-（`vcpu.c:229-267`）—— 混进 switch 会看到一个"reason 号但字段全不可信"的
+（`vcpu.c:234-272`）—— 混进 switch 会看到一个"reason 号但字段全不可信"的
 假退出。
 
 ## 🔧 实现（`vcpu.c::mini_vcpu_run_loop()`）
@@ -79,7 +79,7 @@ mini-kvm 的分界更直白：**`continue` = 留在内核重进；`goto out` = �
 ### 1. 上机：一次性，且必须在循环外
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/vcpu.c:69-130（注释与错误分支略） */
+/* 来源: phase8-capstone/practice/mini-kvm/vcpu.c:74-137（注释与错误分支略） */
 preempt_disable();
 
 if (!mini_cpu_in_vmx_operation()) { ... KVM_EXIT_INTERNAL_ERROR / -EPROTO ... }
@@ -114,7 +114,7 @@ CPUID、NMI 再注入），所以这段迁移只能放在 `for (;;)` 之前 —�
 ### 2. 循环头：每次进入前只刷"会漂移"的东西
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/vcpu.c:138-157（注入窗口的注释略） */
+/* 来源: phase8-capstone/practice/mini-kvm/vcpu.c:143-162（注入窗口的注释略） */
 /* 每次进入前刷新会漂移的 Host 字段（CR3/CR4/GS/FS） */
 mini_vmx_refresh_host_state();
 
@@ -138,21 +138,22 @@ VMCS 里的 Host 字段是**上一次写进去的快照**，不会跟着宿主�
 紧接着是那段"关中断进、关中断出"的窗口：
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/vcpu.c:188-193 */
+/* 来源: phase8-capstone/practice/mini-kvm/vcpu.c:193-197（末行是摘要，源注释在 :198-205） */
 gs_shadow = mini_rdmsr(MSR_KERNEL_GS_BASE);
 
 local_irq_disable();
 r = mini_vmx_enter(vcpu, vcpu->launched);
 mini_wrmsr(MSR_KERNEL_GS_BASE, gs_shadow);
-/* 退出时中断仍关闭（硬件按 HOST 状态恢复，默认 IF=0） */
+/* 退出时中断仍是关的：宿主状态区没有 RFLAGS 字段，硬件把 RFLAGS 整个清零
+   （SDM §28.5.3，bit 1 恒 1），IF 自然为 0 */
 ```
 
 `mini_vmx_enter()` 是 `vmx_entry.S` 里那套手写世界切换，返回值 0 = 真的进过
 guest，非 0 = VM-Entry 检查失败。失败后立即 `mini_vmx_report_error()` 解
-`VM_INSTRUCTION_ERROR` + `mini_dump_vmcs()`（`vcpu.c:202-210`），别指望
+`VM_INSTRUCTION_ERROR` + `mini_dump_vmcs()`（`vcpu.c:207-215`），别指望
 switch 还能救它。
 
-`launched` 标志只在第一次成功后置位（`vcpu.c:211-212`）：VMCS 的 launch state
+`launched` 标志只在第一次成功后置位（`vcpu.c:216-217`）：VMCS 的 launch state
 是 "clear" 时执行 VMRESUME 会得到 VM-instruction error 5（SDM 31.4
 Table 31-1），而每次迁移里的 `VMCLEAR` 都会把它打回 "clear"
 （SDM 25.11.3），所以 `mini_vmcs_clear()` 必须同时清掉 `vcpu->launched`。
@@ -160,7 +161,7 @@ Table 31-1），而每次迁移里的 `VMCLEAR` 都会把它打回 "clear"
 ### 3. 收尾
 
 `goto out` / `break` 之后只有一句 `preempt_enable()` 和一行 `pr_debug` 统计
-（`vcpu.c:366-369`）：
+（`vcpu.c:384-387`）：
 
 ```
 mini-kvm: RUN 结束 exits=%llu io=%llu ept=%llu hlt=%llu extint=%llu nmi=%llu inj=%llu
@@ -177,7 +178,7 @@ KVM 只在 `vcpu_enter_guest()` 的 `preempt_disable()`（`x86.c:10979`）到
 `preempt_enable()`（`x86.c:11171`）之间关抢占，覆盖的就是 VM-Entry/Exit 那
 一小段；`vcpu_run()` 外层是完全可以被抢占、可以睡眠的。
 
-mini-kvm 的 `preempt_disable()` 在循环**外面**（`vcpu.c:69`），一整个
+mini-kvm 的 `preempt_disable()` 在循环**外面**（`vcpu.c:74`），一整个
 `KVM_RUN` 都不让出 CPU。原因很实际：VMCS 同一时刻只能 active 在一个 CPU 上，
 只要线程被换下 CPU，下一次进入前就得重做 VMCLEAR/VMPTRLD/INVEPT；把它钉死
 最省事。代价是 guest 跑多久，这颗 CPU 就被独占多久 —— RCU stall、watchdog
@@ -212,7 +213,7 @@ mini-kvm 的 HLT 直接把 `KVM_EXIT_HLT` 写进共享的 `kvm_run` 页并
 
 | 特性 | mini-kvm | 真实 KVM |
 |------|----------|---------|
-| 循环层数 | 一层 `for(;;)`（`vcpu.c:132`） | `vcpu_run()` + `vcpu_enter_guest()` 两层 |
+| 循环层数 | 一层 `for(;;)`（`vcpu.c:137`） | `vcpu_run()` + `vcpu_enter_guest()` 两层 |
 | 让出 CPU | 不让，全程 `preempt_disable` | 外层可抢占可睡眠 |
 | 请求机制 | 无 | `KVM_REQ_*` 位图，在 `vcpu_enter_guest()` 开头消费 |
 | 事件注入 | 单个 `pending_intr_info`（Stage 3） | 异常/中断/NMI/异常影子 完整队列 + 窗口退出 |
