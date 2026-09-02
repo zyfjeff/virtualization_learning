@@ -1070,6 +1070,12 @@ lockless 的 log buffer，刷新推迟。
 | `mini_handle_io_exit()` | `device.c:61-104` | `device.c:77-120` |
 | `SYM_FUNC_START(mini_vmx_enter)` | `vmx_entry.S:78` | `vmx_entry.S:92` |
 
+> ⚠️ 本表只对 J12 当时成立。下一轮（J13，第一次真机上机）又动了 `vcpu.c`、
+> `interrupt.c`、`mini-kvm.h`、本模块 `vmx.c` 与 `guest/guest.S`，本表里
+> `vcpu.c:275-293 / 295-302 / 383 / 384-387 / 699-709`、`interrupt.c`、
+> `guest/guest.S` 与 `mini-kvm.h` 的锚点全部再次漂移。当前有效值一律以
+> **J13(7)** 的重测表为准。
+
 未动的文件（`main.c`、`vmx.c`、`ept.c`、`interrupt.c`、`guest/guest.S`）本轮逐条
 重打原文核对，全部仍然对得上。核对手段仍然是脚本，且这轮给它补了两件事：
 
@@ -1085,3 +1091,260 @@ lockless 的 log buffer，刷新推迟。
   `nlines`），一次越界会让统计总数变成最后那个文件的长度。
 - `--quiet` 下每条裸引用都刷一行"歧义"是噪音（63 行），改成在结尾汇总一次
   （"N 条裸引用按内核树解析"）。
+
+### J13. 第一次真机上机：静态审计四轮全漏的两个缺陷，加三处我自己的过度推断
+
+本轮是 mini-kvm **第一次** `insmod`（用户明确批准，含"机器挂了我会来重启"）。流程就
+是 README 第 4 节那五步：确认 `/dev/kvm` 无引用 → `rmmod kvm_intel kvm` →
+`insmod mini-kvm.ko` → `dyndbg` 打开统计行 → `sudo ./test-mini-kvm` → `rmmod
+mini_kvm` + `modprobe kvm_intel`。最终 **`test rc=0`，九步全通过**，收尾后
+`/dev/kvm` 重新可打开、`KVM_GET_API_VERSION` = 12、`KVM_CREATE_VM` 成功，宿主状态
+已复原。
+
+前面 J10/J11/J12 三轮修的二十多条全部来自静态读代码 + 规范核对，这一轮第一次上机
+又抓到**两条**，而且都属于"读代码时看起来完全合理"的那类。两条都不是崩溃级的（宿主
+无恙），但是**功能错的**：注入的中断根本不生效。
+
+#### (1) 事件的"注入"不等于"投递"：投递途中 VM-Exit 会把事件静默丢掉
+
+**症状**（第一次跑，什么都没改）：
+
+```
+--- 注入 vector 0x21 并第二次 KVM_RUN ---
+[信息] 串口缓冲: Hello from Mini-KVM Guest!          ← 没有第二行
+[失败] 中断注入处理: 串口输出不含 "[IRQ 0x21 handled]"
+```
+
+内核侧计数器是 `inj=1` 而 `io` **一个没涨**，`KVM_RUN` 正常返回
+`KVM_EXIT_HLT`，dmesg 里没有任何错误。**注入的计数器涨了，投递却根本没发生。**
+
+**为什么**：SDM 27.6.1 的向量事件投递发生在 VM entry **载入 guest 状态与控制字段
+之后**，而投递本身是一段还要访存的动作——读 IDT 门描述符、按门里的 selector 走
+GDTR 取段描述符、往 guest 栈上压中断帧、再取处理器的第一条指令。SDM 28.2.4 的原文
+列表里就有这一条：*"An EPT violation, EPT misconfiguration, page-modification
+log-full event, or SPP-related event that occurs during event delivery."* 也就是说
+**任何一次访存都能把这次 entry 直接拽回 root 模式**。这种退出会带一条 IDT-vectoring
+information（字段编码 `0x00004408`，`arch/x86/include/asm/vmx.h:314`）：vector 在
+[7:0]、类型在 [10:8]、bit11 是 error-code 有效位，而 **bit31 对这类退出恒为 1、对
+其余退出恒为 0**（28.2.4 末尾 + 格式 Table 25-20）。硬件把没投完的事件**替你记着**。
+
+**mini-kvm 为什么会丢**：事件槽 `pending_intr_info` 在循环头就被
+`mini_vcpu_take_intr_info()` 取走并清空（`vcpu.c:152`），EPT-violation 分支
+`continue` 回循环头时 `VM_ENTRY_INTR_INFO_FIELD` 被写成 0 —— 事件被硬件记着、被
+软件丢掉，guest 回到被中断的指令继续跑，看起来就像"这个中断从来没发生过"。
+
+**修法**：新增 `mini_vcpu_complete_intr_info()`（`interrupt.c:122-143`），每次真实
+VM-Exit 之后与硬件对账一次，bit31 置起且类型是外部中断就把同一个 vector 放回事件
+槽；调用点在分发 switch **之前**（`vcpu.c:282`）——它关心的是"上一次进入投完没有"，
+与这一次退出的原因无关，写进某一条 case 就漏掉其余分支，而 `KVM_EXIT_INTERNAL_ERROR`
+/ `KVM_EXIT_HLT` 那几条 `goto out` 回用户态的路径也必须先经过它。
+
+**KVM 的对等物**（本轮逐行重读）：`__vmx_complete_interrupts()`
+（`arch/x86/kvm/vmx/vmx.c:7111-7163`）先**无条件**清掉 `nmi_injected` 与
+exception/interrupt 两个队列（`:7121-7124`），再只看 `idtv_info_valid`（`:7126`）；
+有效时按类型重新排队，外部中断走 `kvm_queue_interrupt()`（`:7156-7158`），而它第一
+件事就是置 `interrupt.injected = true`（`arch/x86/kvm/x86.h:144`）；下次进入前由
+`kvm_check_and_inject_events()`（`x86.c:10342`）在 `:10386-10387` 再写一遍 VMCS。
+保存/恢复 vCPU 状态时也走同一个队列（`x86.c:12096-12099` + `x86.h:156`
+`kvm_event_needs_reinjection()`）。
+
+顺带否掉一个想当然：**别以为"有 LAPIC 就不会丢，下次会从 IRR 再评估一遍"**。KVM 在
+**取走向量那一刻就 ack 了**——`kvm_cpu_get_interrupt()`（`arch/x86/kvm/irq.c:139`）
+拿到 vector 立刻调 `kvm_apic_ack_interrupt()`（`:147`），后者清 IRR（`lapic.c:3015`）
+并置 ISR（`:3030`）。事件一旦丢了，KVM 也只剩软件里那一份 `interrupt.injected`，
+跟 mini-kvm 一样只能靠 IDT-vectoring 兜。
+
+#### (2) guest 没有 GDT：VM entry 不查描述符表，这个洞要等第一次投递才暴露
+
+修好 (1) 之后仍然失败，这次是硬失败：
+
+```
+[失败] KVM_RUN: errno=5 (Input/output error), exit_reason=17（内核侧详情见 dmesg）
+```
+
+内核侧 `dmesg` 打的是 `mini-kvm: guest 异常 vector=13`（#GP，`VM_EXIT_INTR_INFO`
+类型位 [10:8] = 3 = 硬件异常），随后 `mini_dump_vmcs("guest exception")` 里
+`GUEST_RIP = 0x1045`、`GUEST_CS_SELECTOR = 0x8`、`EXCEPTION_BITMAP = 0x6042`
+（= #DB/#UD/#GP/#PF，与本模块 `vmx.c:724-725` 写进去的位图一致）。
+
+**为什么静态读代码读不出来**：`vmx.c` 的 guest 段初始化只往 VMCS 字段里写值，而
+VM entry 装载 guest 非寄存器状态是**直接从 GDTR/IDTR 字段读**（SDM 27.3.2 "Loading
+Guest Non-Register State"），CPU 一个描述符都不查；顺序执行的 guest 也永远不查。
+**只有 IDT 投递**会按门里的 selector 去 `GDTR.base + index*8` 取描述符。而 `GDTR`
+的初值正是 `GUEST_GDTR_BASE = 0`（本模块 `vmx.c:640`）——取 selector 0x8 就是读
+GPA 0x8。更糟的是本模块 `vmx.c` 的原注释写着"Guest 自己会执行 `lidt` 装载 IDT
+（**GDTR 则完全不用**，无远跳转）"，这句错话让审计时完全没有怀疑这张表。
+
+**归因靠的是 A/B，不是某一行 GPA 打印**：本模块的 VMCS dump（`dump_fields[]`，
+本模块 `vmx.c:650-663`）既不打印 guest GDTR 也不打印
+`GUEST_PHYSICAL_ADDRESS`，所以"炸在取描述符那一步"是用受控实验定下来的——guest 侧
+只加一张 GDT 与一条 `lgdt`、内核模块一字不改，故障立刻消失并九步全过。
+
+**修法**：`guest/guest.S:57` 的 `lgdt gdt_ptr(%rip)`（在建 IDT 之前），表在
+`guest/guest.S:176-184`，三项：空描述符 / 64 位代码段 / 数据段，取值抄
+`arch/x86/boot/compressed/head_64.S:611-612` 的 `__KERNEL_CS`
+（`0x00af9a000000ffff`）与 `__KERNEL_DS`（`0x00cf92000000ffff`），与 VMCS 里
+`GUEST_CS_AR_BYTES = 0xa09b`（L=1、D/B=0）一致。镜像从 214 B 变 266 B。本模块
+`vmx.c` 与 stage1 里那句错注释同时改掉。
+
+#### (3) `ept = 6` 是一笔可以对上的账
+
+实测 `RUN 结束 … ept=6`，恰好等于六次按需映射：**GPA 页 0x1**（guest 镜像）、
+**0x2**（guest 在 0x2000 建的 IDT）、**0x6 / 0x7 / 0x8**（guest 自己的
+PML4/PDPT/PD，用户态摆在 0x6000/0x7000/0x8000）、**0xFF**（guest 栈，`RSP` 从
+0x100000 往下压的第一页）。
+
+这笔账有两个用处：
+
+- 它**直接否掉**了我最初给 (1) 写的归因（见 (6)(a)）：栈页在 `sti` 之前就被
+  `call fill_idt_entries` / `call print` 用过并映射掉了，投递时不可能"第一次触碰
+  栈页"。
+- 它是免费的回归探针：guest 少一张 GDT 时，投递会去读 GPA 0x8，第 0 页从没被碰过
+  → `ept` 会多一次 0 页映射（这一条是推论，本轮没有专门为它取数）。
+
+#### (4) 两条此前只能静态推演的路径，这次真被硬件执行了
+
+- **J12(1) 的 VM-Exit 栈偏移**：改成 `0x10` 之后第一次退出就走通了这条路——标准
+  guest 一趟 RUN 里 `exits=90`（其中 IO 27 次），宿主没有任何 #PF。写错时的后果
+  是往 VA 0/1 连写 16 个 guest 寄存器、当场 oops，这次算是被真实执行确认过。
+- **J12(2) 的 STI 影子窗口**：标准 guest 一进门就 `hlt`，`extint` 恒为 0，**这条
+  路径根本走不到**。所以另编了一个"自旋再停机"的 guest 变体：`sti` 之后跑
+  150,000,000 次 `dec/jne` 再 `hlt`（镜像 274 B）。第一次 RUN 实测
+  **`extint=56`** —— 56 发宿主 tick 全部在窗口里被消费掉，退出数按 tick 节奏增长，
+  **没有** VM-Exit 风暴，也没有 soft lockup / RCU stall / WARN（那一轮 dmesg 里这
+  三类关键字计数为 0）。把窗口里那条占位自增拿掉会怎样，仍然只有静态证据（KVM 的
+  注释 + 本地循环的形状），没有真机复刻过。
+
+**第一次上机才拿到的数字**（换机器就变，只做记录，不进正文）：协商出来的控制值
+`pin=0000001f cpu=850061f2 sec=00000002 exit=00236ffb entry=000093fb`、VMCS
+`rev=0x4`；`GUEST_CR4 = 0x2020` = `PAE|VMXE` —— J11 那条"guest CR4 必须带 VMXE"的
+修正在硬件上成立；`GUEST_IA32_EFER = 0x501`、`GUEST_CS_AR_BYTES = 0xa09b`、
+`GUEST_TR_AR_BYTES = 0x8b`、`HOST_CR4 = 0x7726f0`。
+
+**计数器对账**：两次 RUN 是 `exits=90 io=27 ept=6 hlt=1 extint=56 nmi=0 inj=0` →
+`exits=110 io=46 ept=6 hlt=2 extint=56 nmi=0 inj=1`。`io` 的差 19 **正好等于**
+`[IRQ 0x21 handled]\n` 的字节数，逐字节 `OUT` 一次一退出——这给 J12(4) 里"guest
+总共只打 27 + 19 = 46 字节"那句补上了实测。
+
+#### (5) J5 那类错误复发：`inject_pending_event()` 在 6.12.93 不存在
+
+写本节时按名字去 `grep` 定义，结果 `arch/x86/kvm/x86.c` 里**没有**
+`inject_pending_event()`；6.12.93 的真名是 `kvm_check_and_inject_events()`
+（`x86.c:10342`）。三处已改：`interrupt.c` 头注释、stage3 第 5 节、stage5 的调用
+流程图。同一段里另一个名字也错了：`apic_set_irq()` 在这棵树里不存在（有的是
+`kvm_apic_set_irq()`，`lapic.c:845`）——它出现在全仓扫描命中的
+`examples/bpf-programs/README.md:137`，已就地改成按 6.12.93 实测的完整链路：
+`irqfd_wakeup()`（`virt/kvm/eventfd.c:202`）→ `kvm_arch_set_irq_inatomic()`
+（`arch/x86/kvm/irq_comm.c:159`）→ `kvm_irq_delivery_to_apic_fast()`
+（`lapic.c:1232`）→ `kvm_apic_set_irq()`（`:845`）→ `__apic_accept_irq()`
+（`:1315`，`case APIC_DM_FIXED` 在 `:1328`、实际投递点 `:1352`）→
+`vmx_deliver_interrupt()`（`vmx/vmx.c:4299`；Posted 分支
+`vmx_deliver_posted_interrupt()` 是 `static`，`:4269`）→ 下一次 VM-Entry 前由
+`kvm_check_and_inject_events()`（`x86.c:10342`）经 `kvm_cpu_get_interrupt()`
+（`irq.c:139`）取 vIRR 并 ack（`:147` → `kvm_apic_ack_interrupt()`，
+`lapic.c:3000`）。顺带补了原文漏掉的两件事：`-EWOULDBLOCK` 时才走的慢路径
+（`irqfd_inject()`，`eventfd.c:42` → 通用 `kvm_set_irq()`，`irqchip.c:70`）——
+旧句子里那个 `kvm_set_irq()` 其实只属于这条路径；以及"那张流程图只描述未启用
+APICv 的传统路径，Posted 模式下 vIRR 与中断窗口两步都不发生"的标注。
+`examples/` 没有对应的 corrections.md，先记在这里。
+
+**为什么 `check-refs.py` 抓不到**：它只核对"文件存在 + 行号不越界"，函数名根本不在
+它的能力范围内。这类错和 J5 是同一类（引用了 KVM 里不存在的函数），说明**只核对
+行号会给人虚假的安全感**：一条"`vmx.c:7111` → `inject_pending_event()`"的引用可以
+行号完全正确而函数名完全不存在。给脚本补一条"引用的 KVM 函数名必须能命中定义"是
+待办，本轮没做。
+
+#### (6) 本轮我自己犯的三处过度推断（流程教训）
+
+1. **把归因写成实测**。(1) 的故障访存我第一版写的是"压中断帧时踩到未映射的 guest
+   栈页（GPA 0xFF000）"，听起来很具体，实际上 (3) 那笔账就能否掉它。改成 A/B 归因
+   之后才立得住。
+2. **把布局巧合当成规则**。第二版注释断言"GDT 必须放在 `.text`，跨段地址就不对"。
+   实测 `readelf -S guest/guest.elf`：`.text` 与 `.rodata` 的 **Address 列与 Offset
+   列都相同**（0x1000/0x1000 与 0x10a8/0x10a8），所以放 `.rodata` 也是对的。真正的
+   不变量是"每段 vaddr == 文件偏移"（加载器做的是"把文件字节整段拷到 GPA 0x1000"），
+   它随链接布局而变，**不是**"rodata 只读所以安全"。stage1 的静态自检据此加了第 6
+   条（`readelf -S` 两列相同）。
+3. **引用了本地 PDF 之外的规范内容**。我写过"那次 #GP 的 error code 就是取不到的
+   selector 0x8"。`#GP` 的 error-code 语义在 Vol.3A，本仓库这份 `intel-vmx.pdf` 只有
+   Vol.3C，核对不了；更要命的是**我们根本没取过那个 error code** —— `dump_fields[]`
+   （本模块 `vmx.c:650-663`）里没有 `VM_EXIT_INTR_ERROR_CODE`，用户态的 `kvm_run`
+   也拿不到。三处措辞（`guest/guest.S`、stage1、stage3）已改成只报"exit reason 0 +
+   `VM_EXIT_INTR_INFO` 类型 3 / vector 13，用户态 `-EIO`"。
+
+教训一句话：**"实测到 / 静态推演 / 规范原文"三种依据必须分开标；归因要么有直接打印，
+要么有 A/B，两样都没有就老实写成推论。** 这条与 J8/J10/J11 记的是同一件事，但这次
+是新的一次发生。
+
+#### (7) 行号漂移：本轮重测（第四次记录同一件事）
+
+本轮动过：`interrupt.c`（105 → 165，新增对账函数）、`vcpu.c`（829 → 839，调用点
++ 注释）、`guest/guest.S`（139 → 184，GDT + `lgdt` + 注释）、本模块 `vmx.c`
+（822 → 828，改注释）、`mini-kvm.h`（300 → 306，新原型 + 槽位注释）。当前文件长度：
+`main.c` 504、`vmx.c` 828、`vcpu.c` 839、`ept.c` 261、`interrupt.c` 165、
+`device.c` 120、`vmx_entry.S` 248、`mini-kvm.h` 306、`test-mini-kvm.c` 219、
+`guest/guest.S` 184。
+
+| 引用点 | J12(7) 记的值 | 现为 |
+|---|---|---|
+| `mini_vcpu_run_loop()` | `vcpu.c:67` | `vcpu.c:67`（未动） |
+| `preempt_disable()` / 配对 `preempt_enable()` | `:74` / `:383` | `:74` / **`:393`** |
+| 事件槽取用（注入窗口） | `vcpu.c:152-162` | `vcpu.c:152-162`（未动） |
+| `for (;;)` | `vcpu.c:137` | `vcpu.c:137`（未动） |
+| bit31 entry-failure 拦截 | `vcpu.c:234-272` | `vcpu.c:234-272`（未动） |
+| **新增** 投递对账调用 | — | `vcpu.c:282`（注释 `:274-281`） |
+| 外部中断分支（含窗口） | `vcpu.c:275-293` | `vcpu.c:285-303`（注释 `:286-299`，三条窗口 `:300-302`） |
+| NMI 转注分支 | `vcpu.c:295-302` | `vcpu.c:307-312` |
+| `EXIT_REASON_EXCEPTION_NMI` 整条 case | — | `vcpu.c:305-325` |
+| `HLT` case | — | `vcpu.c:362-370` |
+| 收尾 `pr_debug` 计数器行 | `vcpu.c:384-387` | `vcpu.c:394-397` |
+| `mini_vcpu_ioctl()` / `if (arg)` 拒绝 / `INJECT_IRQ` | `:407` / `:412-415` / — | `:407` / **`:424`** / `:429` |
+| `MINI_KVM_VM_GET_SERIAL` 分支 | `vcpu.c:699-709` | `vcpu.c:709-719` |
+| `mini_vcpu_inject_irq()` | `interrupt.c:55-71` | `interrupt.c:55-71`（未动） |
+| **新增** `mini_vcpu_complete_intr_info()` | — | `interrupt.c:122-143`（文档块 `:85-120`） |
+| `mini_vcpu_reinject_nmi()` | `interrupt.c:149-163`（本轮中段值） | `interrupt.c:151-165` |
+| guest 状态段（stage1 来源块） | `vmx.c:561-638` | `vmx.c:561-644` |
+| FS/GS base 显式清零 | `vmx.c:618-619` | `vmx.c:624-625` |
+| `EXCEPTION_BITMAP` 写入 | `vmx.c:724-725` | `vmx.c:724-725`（未动） |
+| **新增** `dump_fields[]` | — | `vmx.c:650-663` |
+| guest 入口流程（stage3 来源块） | `guest/guest.S:41-78` | `guest/guest.S:41-79`（`lgdt` 在 `:57`，注释 `:44-56`；两处 IDT 填充 `:60-63` 与 `:66-69`，`lidt` 在 `:71`） |
+| **新增** GDT 与伪描述符 | — | `guest/guest.S:176-184`（说明注释 `:159-175`） |
+| `msg:` / `irqmsg:` 两条字符串 | J12(4) 写的是裸文件名 `guest.S` 的第 133 / 135 行 | `guest/guest.S:149` / `:151` |
+| `pending_intr_info` 字段 / 新原型 | `mini-kvm.h:206` / — | `mini-kvm.h:212` / `mini-kvm.h:295` |
+
+未动的文件（`main.c`、`ept.c`、`device.c`、`vmx_entry.S`、`test-mini-kvm.c`）本轮仍
+逐条重打原文核对，全部对得上。四种模式全部干净：
+
+```bash
+./check-refs.py --quiet                        # README + 五篇 stage：154 条，0 问题
+./check-refs.py --quiet --kernel --src         # 再解析内核树 + 本模块 .c/.S：287 条，0 问题
+./check-refs.py --quiet --kernel ../../corrections.md   # 297 条，0 问题
+./check-refs.py --quiet --kernel ../../../examples/bpf-programs/README.md
+                                               # (5) 改过的那个文件：9 条，0 问题
+```
+
+条数比 J12 那轮涨了一截，因为 J13 正文自己就带了几十条引用 —— 第三、四行把
+`corrections.md` 和 (5) 改过的那个 `examples/` 文件也喂给脚本，正是为了让本轮
+新写的行号当场接受核对，而不是等下一轮才发现漂了。
+
+#### (8) 复现
+
+```bash
+cd phase8-capstone/practice/mini-kvm && make            # 模块 + guest + 测试程序
+sudo fuser /dev/kvm                                     # 必须无输出
+sudo rmmod kvm_intel kvm
+sudo insmod mini-kvm.ko
+echo -n 'module mini_kvm +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+sudo ./test-mini-kvm; echo "rc=$?"                      # 期望 rc=0
+sudo dmesg | grep 'RUN 结束'                             # 看 (3)(4) 那两行账
+sudo rmmod mini_kvm && sudo modprobe kvm_intel          # 收尾复原宿主
+```
+
+两个用于归因的 guest 变体（都是一次性产物，不在仓库里）：
+
+- **无 GDT**：删掉 `guest/guest.S` 的 `lgdt`（`:57`）与 `gdt`/`gdt_ptr`
+  （`:176-184`）后 `make guest`，镜像 266 → 214 B。第二次 `KVM_RUN` 回
+  `-EIO` / `exit_reason=17`，dmesg 有 `guest 异常 vector=13`。
+- **自旋**：把 `sti; 1: hlt; jmp 1b` 改成 `sti` + `mov $150000000,%ecx; 2: dec %ecx;
+  jne 2b` 再 `hlt`，镜像 274 B。第一次 RUN 就能看到 `extint` 按宿主 tick 增长，
+  是验证 STI 影子窗口（J12(2)）唯一的办法。
