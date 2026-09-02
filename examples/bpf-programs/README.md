@@ -138,7 +138,7 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 通知向量），vIRR 与"等待中断窗口"两步都不发生，正常路径 0 次 VM-Exit
 （Intel VMX SDM 30.6；差异详见 `phase4-interrupts/`）。
 
-**内核映射**（Linux 6.12.93 实测调用链，`inject_pending_event()` 在此版本已不存在，消费 vIRR 的是 `kvm_check_and_inject_events()`）:
+**内核映射**（Linux 6.12.93 实测调用链，`inject_pending_event()` 在此版本已不存在，消费 vIRR 的是 `kvm_check_and_inject_events()`）: <!-- check-refs:ignore -->
 - `irqfd_wakeup()`（`virt/kvm/eventfd.c:202`）→ `kvm_arch_set_irq_inatomic()`（`arch/x86/kvm/irq_comm.c:159`）→ `kvm_set_msi_irq()`（`:104`）+ `kvm_irq_delivery_to_apic_fast()`（`arch/x86/kvm/lapic.c:1232`）→ `kvm_apic_set_irq()`（`:845`）→ `__apic_accept_irq()` 的 `case APIC_DM_FIXED`（`:1328`、`:1352`）→ `vmx_deliver_interrupt()`（`arch/x86/kvm/vmx/vmx.c:4299`）：Posted 路径直接写 PIR + 发通知向量，失败才 `kvm_lapic_set_irr()` 置 vIRR + `KVM_REQ_EVENT` + `kvm_vcpu_kick()`
 - 下次 VM-Entry 前由 `kvm_check_and_inject_events()`（`arch/x86/kvm/x86.c:10342`）经 `kvm_cpu_get_interrupt()`（`arch/x86/kvm/irq.c:139`）取最高优先级 vIRR 并 ack（`:147` → `kvm_apic_ack_interrupt()`，`lapic.c:3000`），写进 VMCS 的 interruption-information 字段
 - 慢路径：`kvm_arch_set_irq_inatomic()` 返回 `-EWOULDBLOCK` 时 `irqfd_wakeup()` 只 `schedule_work(&irqfd->inject)`，落到进程上下文由 `irqfd_inject()`（`virt/kvm/eventfd.c:42`）调通用的 `kvm_set_irq()`（`:49` → 定义在 `virt/kvm/irqchip.c:70`）走同一张路由表，最终仍汇入上面的 `kvm_apic_set_irq()`
