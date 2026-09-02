@@ -98,7 +98,19 @@ static void run_until_exit(int vcpu_fd, struct kvm_run *run)
 {
 	for (;;) {
 		int r = ioctl(vcpu_fd, KVM_RUN, 0);
-		CHECK(r == 0, "KVM_RUN");
+		int err = errno;
+
+		if (r) {
+			/*
+			 * 内核侧的失败路径都会先填好 run->exit_reason 再返回
+			 * -1（多数是 -EIO/-EPROTO），细节在 dmesg 里。
+			 */
+			fprintf(stderr,
+				"[失败] KVM_RUN: errno=%d (%s), exit_reason=%u"
+				"（内核侧详情见 dmesg）\n",
+				err, strerror(err), run->exit_reason);
+			exit(1);
+		}
 		if (run->exit_reason != 0)
 			return;
 	}

@@ -49,6 +49,16 @@
 #define REG_R15		120
 
 /*
+ * HOST_RSP 指向的那两格栈槽（相对值，正数朝高地址）。
+ *
+ * 用宏而不是字面量，是因为入口和 VM-Exit 两条路径都要取同一个 vcpu 指针，
+ * 而两处的 RSP 相差一格（退出路径先 push 了暂存的 guest RAX）—— 历史上正是
+ * 这里手抄 KVM 的 `8(%rsp)` 抄错了，见 corrections.md J12(a)。
+ */
+#define STACK_LAUNCHED	 0
+#define STACK_VCPU	 8
+
+/*
  * 栈布局。HOST_RSP 写在 pushed launched 那一格，所以 VM-Exit 落地的瞬间
  * RSP 就是这张表的 [rsp]（低地址在上）：
  *   [rsp   ] launched 标志
@@ -60,6 +70,10 @@
  *   [rsp+48] r15
  *   [rsp+56] 保存的 rbp
  *   [rsp+64] 返回地址
+ *
+ * 上面两个宏就是这张表：入口路径直接按 HOST_RSP 取（launched 在 0、vcpu 在
+ * 8），VM-Exit 路径因为多 push 了一格暂存 RAX，取 vcpu 指针要用
+ * STACK_VCPU+8（= 16）。
  *
  * VM-Entry 失败（VMLAUNCH/VMRESUME 本身返回）落在同一个 RSP 上，
  * 而且此时寄存器里装的是刚才为 guest 加载的值 —— 所以失败路径必须和退出
@@ -98,11 +112,11 @@ SYM_FUNC_START(mini_vmx_enter)
 	vmwrite %rax, %rcx
 
 	/* launched → CF（bt 置标志；随后的 mov 序列不动标志位） */
-	mov  (%rsp), %ebx
+	mov  STACK_LAUNCHED(%rsp), %ebx
 	bt   $0, %ebx
 
 	/* vcpu 指针进 RAX，regs[] 就在偏移 0 */
-	mov  8(%rsp), %rax
+	mov  STACK_VCPU(%rsp), %rax
 
 	/* 装载 guest 寄存器（对照 vmenter.S:144-162，RSP 经 VMCS） */
 	mov  REG_RCX(%rax), %rcx
@@ -147,7 +161,15 @@ SYM_INNER_LABEL_ALIGN(mini_vmx_vmexit, SYM_L_GLOBAL)
 
 	/* 暂存 guest RAX，再取回 vcpu 指针 */
 	push %rax
-	mov  8(%rsp), %rax		/* [guest_rax, launched, vcpu, ...] */
+	/*
+	 * 这里是 +16 而不是 KVM 的 WORD_SIZE(=8)：vmenter.S 的 HOST_RSP 指向
+	 * 它自己 push 的最后一格，而那一格正是 @regs（push @regs 在
+	 * arch/x86/kvm/vmx/vmenter.S:103，取地址交给 vmx_update_host_rsp 在
+	 * :108-109，退出后按 8(%rsp) 重载在 :203），所以暂存 RAX 之后 @regs
+	 * 就在上面一格。本模块的 HOST_RSP 指向 launched，vcpu 还要再高一格，
+	 * 于是暂存 RAX 之后差两格。
+	 */
+	mov  STACK_VCPU+8(%rsp), %rax	/* +8 = 刚 push 的暂存 guest RAX */
 
 	/* 保存全部 guest 寄存器（对照 vmenter.S:205-222） */
 	pop  REG_RAX(%rax)

@@ -13,8 +13,10 @@
  * VM_EXIT_INSTRUCTION_LEN (0x440c) 再进入（字段定义见 SDM §25.9.4，
  * 适用场景清单见 §28.2.5，其中 IN/OUT 明确在列）。
  *
- * 串口模拟：只做最简的"字节捕获"——OUT 到 0x3f8 的字节记入环形文本
- * 缓冲，供 MINI_KVM_VM_GET_SERIAL 读取，并把每个完整行打到 dmesg。
+ * 串口模拟：只做最简的"字节捕获"——OUT 到 0x3f8 的字节依次记进
+ * kvm->serial[]（线性缓冲，不是环形：写满 MINI_KVM_SERIAL_SIZE-1 字节后就
+ * 丢弃后续输入），MINI_KVM_VM_GET_SERIAL 只回传前 255 字节（NUL 结尾），
+ * 每收到一个 '\n' 把最近一行打到 dmesg。
  * 不做 16550A 寄存器组（IIR/LSR/中断）——那是用户态 minivmm
  * （examples/minivmm）的课题；这里对照的是 KVM 内核态的退出分发。
  */
@@ -27,8 +29,22 @@
 #include "mini-kvm.h"
 
 /*
- * 串口字节捕获。运行在关中断的退出分发路径上，但 printk 走
- * deferred console，允许在此调用。
+ * 串口字节捕获。调用点是运行循环的 EXIT_REASON_IO_INSTRUCTION 分支，它在
+ * mini_handle_io_exit() 前后显式开了中断（对照 KVM：handle_exit() 也在
+ * local_irq_enable() 之后执行，arch/x86/kvm/x86.c:11170 → :11198）。
+ *
+ * 但这仍然是原子上下文：运行循环从头到尾 preempt_disable()（成对的
+ * preempt_enable() 在 mini_vcpu_run_loop() 末尾），所以这里既不能拿
+ * sleeping lock 也不能做可阻塞的分配。KVM 在
+ * :11170 的 local_irq_enable() 后面紧跟 preempt_enable()，它的退出处理器
+ * 因此可以睡；mini-kvm 不行 —— 这也是 ept.c 的按需映射只用 GFP_ATOMIC 的
+ * 原因。printk 本身合法：控制台拿不到锁时走 trylock 路径
+ * （down_trylock_console_sem()，kernel/printk/printk.c:315-334），记录先进
+ * 环形 log buffer，刷新推迟。
+ *
+ * 写者不持 kvm->lock：唯一写者是运行循环（同一次 KVM_RUN 里由
+ * vcpu->mutex 串行化，天然单写者）。MINI_KVM_VM_GET_SERIAL 那把锁只保证多个
+ * 读者互斥，挡不住这个写者，所以并发读可能读到撕裂的一帧 —— 教学场景可接受。
  */
 static void mini_serial_out(struct mini_kvm *kvm, u8 c)
 {

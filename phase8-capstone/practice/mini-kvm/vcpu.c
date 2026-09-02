@@ -54,9 +54,14 @@ static void mini_kvm_put(struct mini_kvm *kvm);
  *
  * 宿主外部中断：PIN_BASED_EXT_INTR_MASK 让所有外部中断退出到
  * mini-kvm。我们没有 VM_EXIT_ACK_INTR_ON_EXIT，中断向量还在 LAPIC
- * IRR 里 pending；打开中断的"瞬间"（blip）让它走宿主 IDT 正常分发。
+ * IRR 里 pending；靠一发"开中断窗口"让它走宿主 IDT 正常分发，而 STI 的
+ * 中断影子要到下一条指令执行完才解除，所以窗口中间必须夹一条指令
+ * （见下面 EXIT_REASON_EXTERNAL_INTERRUPT 分支）。
  * 对照 KVM 的 handle_external_interrupt_irqoff()（vmx.c）——KVM 用
  * gate descriptor 精确重放，这里用最朴素的开关中断窗口。
+ *
+ * 窗口里只放开中断，不放开抢占：整个循环体都在 preempt_disable 之下，
+ * 所以退出处理里不能睡（KVM 在 x86.c:11170-11171 是两个一起放开的）。
  */
 
 static int mini_vcpu_run_loop(struct mini_kvm_vcpu *vcpu)
@@ -268,9 +273,22 @@ static int mini_vcpu_run_loop(struct mini_kvm_vcpu *vcpu)
 
 		switch (reason) {
 		case EXIT_REASON_EXTERNAL_INTERRUPT:
-			/* 让 pending 的宿主中断走宿主 IDT */
-			vcpu->n_extint_exits++;
+			/*
+			 * 让 pending 的宿主中断走宿主 IDT。sti 和 cli 之间必须
+			 * 还有一条指令：STI 的中断影子要到下一条指令执行完才
+			 * 解除，紧跟 cli 等于把刚放开的门又关上，pending 的中断
+			 * 一个都消费不掉 —— 而本模块没开 VM_EXIT_ACK_INTR_ON_EXIT，
+			 * 向量还挂在 LAPIC IRR 里，于是下一次 VM entry 立刻又以
+			 * 原因 1 退出，形成 VM-Exit 风暴：guest 不再推进，宿主这个
+			 * CPU 的 tick 永远进不来（soft lockup / RCU stall）。
+			 * 计数自增就是那条占位指令，与 KVM 用 ++vcpu->stat.exits
+			 * 完全同理（x86.c:11149-11158，理由写在它自己的注释里：
+			 * "An instruction is required after local_irq_enable() to
+			 *  fully unblock interrupts on processors that implement
+			 *  an interrupt shadow"）。
+			 */
 			local_irq_enable();
+			vcpu->n_extint_exits++;
 			local_irq_disable();
 			continue;
 
@@ -426,7 +444,17 @@ static int mini_vcpu_mmap(struct file *filp, struct vm_area_struct *vma)
 	if (vma->vm_end - vma->vm_start != PAGE_SIZE)
 		return -EINVAL;
 
-	/* 对照 kvm_vcpu_mmap()：把 kvm_run 页映射给用户态 */
+	/*
+	 * 对照 KVM：kvm_vcpu_mmap()（virt/kvm/kvm_main.c:4142-4154）自己不做
+	 * 任何映射，只装一个 vm_ops；真正的映射发生在按 pgoff 分派的缺页处理
+	 * kvm_vcpu_fault()（:4112-4136）—— pgoff 0 是 kvm_run，往后还有
+	 * pio_data、coalesced MMIO 环、dirty ring 各页。
+	 * mini-kvm 只有 kvm_run 一页且一次性 remap_pfn_range()，所以偏移和
+	 * 长度必须自己在上面这两条 if 里挡住：pgoff 非 0 或长度不是整页，
+	 * 真实 KVM 交给缺页处理返回 VM_FAULT_SIGBUS（x86 的
+	 * kvm_arch_vcpu_fault() 就是这一句，arch/x86/kvm/x86.c:6344-6347），
+	 * 这里直接 -EINVAL。
+	 */
 	return remap_pfn_range(vma, vma->vm_start,
 			       page_to_pfn(vcpu->run_page),
 			       PAGE_SIZE, vma->vm_page_prot);
@@ -759,6 +787,14 @@ static long mini_kvm_dev_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 	case KVM_GET_VCPU_MMAP_SIZE:
+		/*
+		 * 对照 kvm_dev_ioctl() 的同名分支：真实 KVM 在 x86 上返回的不止
+		 * 一页 —— PAGE_SIZE(run) + PAGE_SIZE(pio data) + PAGE_SIZE
+		 * (coalesced MMIO 环)（virt/kvm/kvm_main.c:5552-5561），
+		 * 由 kvm_vcpu_fault() 按 pgoff 分派。mini-kvm 只有 kvm_run 一页，
+		 * 这个返回值必须和 mini_vcpu_mmap() 里"长度正好一页"的校验一致，
+		 * 否则用户态按它 mmap 就会拿到 -EINVAL。
+		 */
 		return PAGE_SIZE;
 
 	case KVM_CREATE_VM:
