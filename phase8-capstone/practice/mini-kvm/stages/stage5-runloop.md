@@ -32,12 +32,13 @@ KVM:  kvm_arch_vcpu_ioctl_run()
                KVM_REQ_UNBLOCK / pending timer / irq-window / 信号
              }
         └→ vcpu_enter_guest()                  x86.c:10777   ← 内层，跑一圈事件
-             KVM_REQ_* 全部消费 → inject_pending_event() → static_call(vcpu_run)
+             KVM_REQ_* 全部消费 → kvm_check_and_inject_events()（:10342）
+                                               → static_call(vcpu_run)
              preempt_disable()（:10979）… VM-Entry … VM-Exit …（:11171 才 enable）
 
 mini-kvm: mini_vcpu_run_ioctl()
         └→ mini_vcpu_run_loop()                vcpu.c:67     ← 一层 for(;;)
-             全程 preempt_disable（:69）；要回用户态就 goto out
+             全程 preempt_disable（:74）；要回用户态就 goto out
 ```
 
 外层与内层的分界在 KVM 里是"**要不要让出 CPU**"：`vcpu_block()` /
@@ -73,6 +74,14 @@ mini-kvm 的分界更直白：**`continue` = 留在内核重进；`goto out` = �
 `VM_EXIT_REASON` 的 bit31 是 "entry failure"，在进入 switch 之前就单独拦掉了
 （`vcpu.c:234-272`）—— 混进 switch 会看到一个"reason 号但字段全不可信"的
 假退出。
+
+拦完 bit31、进 switch 之前还有一步**与硬件对账**：`mini_vcpu_complete_intr_info()`
+（`vcpu.c:282`）。它查 IDT-vectoring information 的 bit31，把上一轮 VM entry **没投
+完**的事件放回事件槽等下次重投。放这个位置的理由和 bit31 拦截同源：它关心的是"上一
+次进入做完没有"，与这一次退出的原因无关，所以不能写进某一条 case；而且后面
+`KVM_EXIT_INTERNAL_ERROR` / `KVM_EXIT_HLT` 那几条 `goto out` 回用户态的路径也要先经
+过它，否则事件就随着一趟退出被丢掉。原理与真机症状见 Stage 3 第 5 节、
+corrections.md J13。
 
 ## 🔧 实现（`vcpu.c::mini_vcpu_run_loop()`）
 
@@ -161,7 +170,7 @@ Table 31-1），而每次迁移里的 `VMCLEAR` 都会把它打回 "clear"
 ### 3. 收尾
 
 `goto out` / `break` 之后只有一句 `preempt_enable()` 和一行 `pr_debug` 统计
-（`vcpu.c:384-387`）：
+（`vcpu.c:394-397`）：
 
 ```
 mini-kvm: RUN 结束 exits=%llu io=%llu ept=%llu hlt=%llu extint=%llu nmi=%llu inj=%llu

@@ -237,7 +237,7 @@ c->entry      = mini_vmx_adjust_control(VM_ENTRY_IA32E_MODE |
 ### 3. Guest 状态（`vmx.c::mini_vmx_set_guest_state()`）
 
 ```c
-/* 来源: phase8-capstone/practice/mini-kvm/vmx.c:561-638（部分字段与注释略） */
+/* 来源: phase8-capstone/practice/mini-kvm/vmx.c:561-644（部分字段与注释略） */
 mini_vmwrite(GUEST_RIP, MINI_KVM_GUEST_RIP);	/* 0x1000 */
 mini_vmwrite(GUEST_RSP, MINI_KVM_GUEST_RSP);	/* 0x100000 */
 mini_vmwrite(GUEST_CR3, MINI_KVM_GUEST_CR3);	/* 0x6000，用户态建的页表 */
@@ -289,10 +289,15 @@ mini_vmwrite(GUEST_TR_AR_BYTES, MINI_SEG_AR_TSS64);	/* 0x8B：64 位忙 TSS */
   - SS/DS/ES/FS/GS/LDTR **允许**不可用（AR 的 bit16 = 1），这是 64 位平坦模型
     最省事的做法。
 - **FS/GS 的 base 是独立字段，选择子为空也照样参与寻址**，VMCLEAR 之后 VMCS
-  字段初值不可依赖，必须显式清零（`vmx.c:618-619`）。
-- guest 自己 `lidt` 到 0x2000 装 IDT；`GUEST_IDTR_BASE` 初始写 0 就够了。
-  GDTR 完全不用（没有远跳转）。IDTR/GDTR 基址要 canonical、limit 高 16 位必须为 0
-  （§27.3.1.3）。
+  字段初值不可依赖，必须显式清零（`vmx.c:624-625`）。
+- guest 自己 `lidt` 到 0x2000 装 IDT，**也必须 `lgdt` 装一张 GDT**；`GUEST_IDTR_BASE`
+  / `GUEST_GDTR_BASE` 初始都写 0 就够过检查（基址要 canonical、limit 高 16 位必须为
+  0，§27.3.1.3），因为 VM entry 只是把这两个字段直接载入描述符寄存器，**不会去取
+  任何描述符**（§27.3.2）。但"GDTR 完全不用（没有远跳转）"是错的：第一次事件投递
+  要按 IDT 门里的 selector 走 GDTR 取描述符（§27.6.1），GDTR.base=0 时那就是读
+  GPA 0x8。本模块第一次上机就踩在这条上：注入的 vector 0x21 退化成一次硬件异常
+  （exit reason 0 + `VM_EXIT_INTR_INFO` 类型 3 / vector 13 = #GP），用户态拿到
+  `-EIO`。详见 corrections.md J13 与 `guest/guest.S:57`。
 
 ### 4. VM-Entry / VM-Exit 的世界切换（`vmx_entry.S`）
 
@@ -383,12 +388,24 @@ objdump -d --no-show-raw-insn vmx_entry.o | sed -n '/<mini_vmx_vmexit>:/,/pop/p'
 ./check-refs.py --quiet ../../corrections.md
 ./check-refs.py --quiet --kernel --src		# 连 *.c/*.h/*.S 的注释一起扫
 ./check-refs.py --context 2			# 想看每条引用的原文就去掉 --quiet
+
+# 6. guest 镜像里写死的绝对地址（GDT 伪描述符）必须真的等于 GPA
+#    加载器做的是"把 guest.bin 的文件字节整段拷到 GPA 0x1000"，所以只有
+#    每个段的 vaddr == 文件偏移 时，objcopy 之后那个 .quad gdt 才是对的地址
+readelf -S guest/guest.elf
+#   [1] .text    PROGBITS  0000000000001000  00001000  ← vaddr == offset
+#   [2] .rodata  PROGBITS  00000000000010a8  000010a8  ← GDT 就在这里
+# 段一多（或加了 .data）这个等式就可能不再成立，届时要么改链接脚本，要么
+# 让 guest 先算相对地址。判据是上面两列相同，不是"rodata 只读所以安全"。
 ```
 
-能力 MSR 的实际数值（`VMX_BASIC`、`EPT_VPID_CAP`、`CR0/CR4_FIXED0/1`）只能等
-上机时由模块自己在 `insmod` 里打印，本文档不引用任何"作者在本机量到"的数字。
-（上面第 3 条的地址随构建变化，稳定的判据是"两条进入指令各自紧跟同一个 `jmp`"
-这个结构。）
+能力 MSR 的实际数值（`VMX_BASIC`、`EPT_VPID_CAP`、`CR0/CR4_FIXED0/1`）只能由模块
+自己在 `insmod` 里读并打印，本节仍然不引用任何"作者量到"的数字 —— 平台相关，换一
+台机器就变。上面这些静态判据本身不再是纸面推演：模块已在真机上完整跑通，其中第 4
+条那个 `0x10` 偏移与外部中断分支的 STI 影子窗口是被真实执行验证过的（否则第一次
+VM-Exit 就宿主 #PF、或立刻退成 VM-Exit 风暴）。协商出来的 VMCS 控制值与九步验收日
+志记在 corrections.md J13。
+（第 3 条的地址随构建变化，稳定的判据是"两条进入指令各自紧跟同一个 `jmp`"这个结构。）
 
 ## 📝 检查清单
 

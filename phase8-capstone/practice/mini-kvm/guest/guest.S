@@ -7,7 +7,9 @@
  *   PML4 @ GPA 0x6000 → PDPT @ 0x7000 → PD @ 0x8000，PD[0] = 2MB PS 页
  *
  * 执行流程：
- *   1. 在 GPA 0x2000 建 256 项中断门 IDT：
+ *   1. lgdt 一个 3 项的最小 GDT（空 / 0x08 代码 / 0x10 数据）——中断投递要按
+ *        IDT 门里的 selector 真去 GDT 取描述符，没有 GDT 第一次注入就 #GP；
+ *      再在 GPA 0x2000 建 256 项中断门 IDT：
  *        全部指向 irq_stub（直接 iretq）；
  *        第 0x21 项指向 irq_handler（打印消息）。
  *   2. lidt，经 COM1 (0x3f8) 输出 "Hello from Mini-KVM Guest!"。
@@ -38,6 +40,21 @@
 	.globl _start
 _start:
 	cld
+
+	/*
+	 * GDT 必须先立起来。VM entry 装载段状态是**从 VMCS 的四个字段直接读**
+	 * （selector / base / limit / access rights，SDM 27.3.2 "Loading Guest
+	 * Non-Register State"），不查任何描述符表；而 IDT 投递要按门里的
+	 * selector 真的去 GDTR.base + index*8 取描述符。所以"guest 没有 GDT"
+	 * 这件事在只跑顺序代码时完全看不出来 —— 第一次把中断投进去就退化成
+	 * #GP：运行循环报出 exit reason 0 + `VM_EXIT_INTR_INFO` 类型 3（硬件异
+	 * 常）vector 13，用户态看到 `-EIO`。实测链见 corrections.md J13。
+	 *
+	 * 描述符取值抄 arch/x86/boot/compressed/head_64.S:611-612 的
+	 * __KERNEL_CS / __KERNEL_DS（64 位代码 L=1、D/B=0；数据段 4G 粒度），
+	 * 与 VMCS 里 GUEST_CS_AR_BYTES=0xa09b（L=1、D/B=0）一致。
+	 */
+	lgdt	gdt_ptr(%rip)
 
 	/* 256 项全部指向 irq_stub */
 	lea	irq_stub(%rip), %rsi
@@ -137,3 +154,31 @@ irqmsg:
 idt_ptr:
 	.word	IDT_ENTRIES * 16 - 1	/* limit */
 	.quad	IDT_BASE		/* base（GPA，恒等映射下可直接用） */
+
+	/*
+	 * GDT 与它的伪描述符。lgdt 的内存操作数里写的是**线性地址**，而测试
+	 * 程序是按 guest.bin 的**文件偏移**把这段字节搬到 GPA 0x1000 的，所以
+	 * 伪描述符里那个地址要同时成立两件事：链接期地址 == 文件偏移。
+	 *
+	 * guest.ld 只有一条 `*(.text) *(.rodata...)`，所有 alloc 段共用同一个
+	 * "链接地址 = 文件偏移 + 一个页对齐量" 的平移；本例从 0x1000 起、
+	 * .text(0x1000) 与 .rodata(0x10a8) 之间没被页对齐撑开，平移量恰好是 0。
+	 * 换布局（加 .data、改对齐、把表挪进别的段）就可能不再是 0，所以这条
+	 * 每次都要实测，别照记忆断言：
+	 *   readelf -S guest/guest.elf | grep -E 'Address|\.text|\.rodata'
+	 *   # Address 列与 Offset 列必须逐段相同
+	 *
+	 * 填错的症状不是"没反应"而是 guest 立刻 #GP：GDTR 指向一个不存在的表，
+	 * 第一次中断投递就取不到描述符（就是下面这张表当初整个缺失的同一症状，
+	 * 见 phase8-capstone/corrections.md 的 J13）。
+	 */
+	.balign	8
+gdt:
+	.quad	0			/* 0x00 空描述符（不可被选中） */
+	.quad	0x00af9a000000ffff	/* 0x08 64 位代码段 = IDT 门里的 selector */
+	.quad	0x00cf92000000ffff	/* 0x10 数据段 */
+gdt_end:
+
+gdt_ptr:
+	.word	gdt_end - gdt - 1
+	.quad	gdt

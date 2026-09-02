@@ -56,10 +56,17 @@ KVM_RUN                ──────────────→   guest 的
 收场且串口含 `Hello from Mini-KVM Guest!`；注入 vector `0x21` 后第二次
 `KVM_RUN` 仍回到 HLT 且串口含 `[IRQ 0x21 handled]`。
 
-**验证状态（2026-09-01）**：本目录代码只完成了编译（`make` 通过，
-`objdump` 校验收栈序列）与逐条引用审计；**尚未真机 `insmod` 跑通验收**，
-因为那要求先 `rmmod kvm_intel kvm`，会让本机所有 VM 下线。第 4 节的上机
-流程是给具备条件的机器准备的。
+**验证状态（2026-09-02 已真机跑通）**：本机（96 核 Skylake-SP，运行内核
+6.8.0-51-generic = 模块 vermagic）按第 4 节的流程走完 —— 卸 `kvm_intel kvm` →
+`insmod mini-kvm.ko` → `sudo ./test-mini-kvm` **rc=0（九步全通过）** → `rmmod
+mini_kvm` → `modprobe kvm_intel` 恢复（`/dev/kvm` 重新可打开，`KVM_GET_API_VERSION`
+= 12，`KVM_CREATE_VM` 成功）。这一趟抓到并修掉了两个前面所有静态审计轮都没发现的
+缺陷：**事件投递到一半 VM-Exit 后没人重投**（注入的 vector 静默消失）与 **guest 没
+有 GDT**（第一次投递就 `#GP(8)`），两条都记在 corrections.md J13。此前只能静态推演
+的两条路径也第一次被真实执行验证：VM-Exit 着陆点取 `vcpu` 指针的 `0x10` 偏移（J12(1)
+写错时第一次退出就宿主 #PF），以及外部中断分支的 STI 影子窗口（实测
+`extint=56` 按宿主 tick 节奏被消费干净，无退出风暴、无 soft lockup / RCU stall /
+WARN）。复现命令与逐步日志见 corrections.md J13。
 
 ## 2. 文件结构
 
@@ -170,7 +177,7 @@ sudo modprobe kvm_intel
 | `TRIPLE_FAULT` | 打印 + dump VMCS | `KVM_EXIT_SHUTDOWN` |
 | 其它 / VM-Entry 失败（`exit_reason` bit31） | `mini_vmx_report_error()` + `mini_dump_vmcs()` | `KVM_EXIT_INTERNAL_ERROR` |
 
-## 7. 五条最容易写错的硬件规则（本项目都踩过）
+## 7. 六条最容易写错的硬件规则（本项目都踩过）
 
 1. **VMCLEAR 必须落在最后持有该 VMCS 的 CPU 上。** SDM 25.11.1：
    "the first logical processor should execute VMCLEAR for the VMCS (to make it
@@ -212,7 +219,7 @@ sudo modprobe kvm_intel
    "An instruction is required after local_irq_enable() to fully unblock
    interrupts on processors that implement an interrupt shadow"
    （`arch/x86/kvm/x86.c:11149-11158`）。我们放的是 `vcpu->n_extint_exits++`
-   （`vcpu.c:290-292`）。
+   （`vcpu.c:300-302`）。
 5. **`HOST_RSP` 指向哪一格，决定退出后取栈上参数的偏移。** 硬件在 VM-Exit 只把
    `%rsp` 恢复成 `HOST_RSP`，之后每个 `N(%rsp)` 都以那一格为基准。KVM 的
    `HOST_RSP` 指向它压的**最后一格，而那格就是 `@regs`**（`push @regs` 在
@@ -224,6 +231,17 @@ sudo modprobe kvm_intel
    偏移都由 `STACK_LAUNCHED` / `STACK_VCPU` 宏算出来（`vmx_entry.S:58-59`），
    判据是反汇编：退出着陆点必须看到 `mov 0x10(%rsp),%rax`（stage1 静态自检第 4
    条）。
+6. **注入 ≠ 投递。** 写 `VM_ENTRY_INTR_INFO_FIELD` 只算"排好队"。真正的投递发生在
+   VM entry **载入 guest 状态与控制字段之后**（SDM 27.6.1），而且它自己还要访存好几
+   次：读 IDT 门描述符、按门里的 selector 走 GDTR 取段描述符、往 guest 栈上压中断
+   帧、再取处理器的第一条指令 —— 任何一次都能撞进未映射的 guest 页而 VM-Exit。SDM
+   28.2.4 把这种情况单列出来（"An EPT violation ... that occurs during event
+   delivery"），并规定这类退出**一定**带一条 IDT-vectoring information 记录（vector
+   在 [7:0]、类型在 [10:8]、**bit31 恒为 1**；其余退出该位恒为 0；格式 Table 25-20）。
+   不查这一位并把 vector 放回事件槽，注入的中断就**静默消失**：本模块第一次上机的
+   症状就是 `inj=1` 而 `io` 一个没涨、串口什么都不多。KVM 的对等物是
+   `__vmx_complete_interrupts()`（`vmx/vmx.c:7111-7163`），它在每次真实退出后按类型
+   把没投完的事件重新排队。推导见 Stage 3 第 5 节，实测链条见 corrections.md J13。
 
 `guest/guest.S` 里也有一条同级的坑：`OUT`/`IN` 的立即数端口字段只有 8 位，
 `out %al, $0x3f8` 会被汇编器**静默截断**成端口 `0xf8`，必须走 `%dx`。
@@ -300,4 +318,6 @@ GPA 取错字段、IO qualification 布局、编造的 dmesg 字符串等），�
 | `test-mini-kvm` 报 `KVM_RUN` 返回 `-EPROTO` | `dmesg` 有"CPU%d 未 VMXON" | 模块加载后才上线的 CPU（第 9 节） |
 | 退出原因是 `KVM_EXIT_INTERNAL_ERROR` | `dmesg` 里的 VMCS dump 与 `exit_reason` | guest 执行了 MSR/异常，或运行循环遇到未处理退出 |
 | 串口缓冲为空但 guest 确实在跑 | `dmesg \| grep '忽略 OUT'` | guest 的 `OUT` 端口写错（见第 7 节末尾的截断坑） |
+| 注入了 vector 却**什么都不发生**：`inj=1` 而 `io` 一个没涨、没有任何报错 | `dmesg \| grep '事件投递途中退出'` | 投递到一半 VM-Exit（GPA 未映射）而软件没查 IDT-vectoring bit31，事件被硬件记着、被软件丢掉 —— 第 7 节第 6 条、Stage 3 第 5 节 |
+| 第二次 `KVM_RUN` 回 `-EIO` / `exit_reason=17`，`dmesg` 有 `guest 异常 vector=13` | `grep -n lgdt guest/guest.S`（本模块的 VMCS dump 不打印 guest GDTR） | guest 没有 GDT：投递要按门里的 selector 走 GDTR 取描述符，取不到就是 #GP。"投递途中 reason 48"能来自任何未映射页，这条是靠 A/B（只加 GDT + `lgdt`，其余一字不改）定下来的（J13） |
 | 宿主直接宕机 | 硬重启 + 串口/netconsole | `vmx_entry.S` 的 host-state 或收栈被改动 |

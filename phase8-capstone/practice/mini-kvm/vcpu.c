@@ -271,6 +271,16 @@ static int mini_vcpu_run_loop(struct mini_kvm_vcpu *vcpu)
 			break;
 		}
 
+		/*
+		 * 与硬件对账：上一轮进入排队的事件如果没投递完（投递自己还要
+		 * 访存——读 IDT 门、读 GDT 描述符、压中断帧——任何一次都可能
+		 * VM-Exit），硬件会把没投完的事件记进 IDT-vectoring
+		 * information，这里放回事件槽等下次重投。
+		 * 放在分发 switch 之前，对所有"真实退出"一律生效，包括随后
+		 * goto out 回到用户态的那几条路径。
+		 */
+		mini_vcpu_complete_intr_info(vcpu, reason);
+
 		switch (reason) {
 		case EXIT_REASON_EXTERNAL_INTERRUPT:
 			/*

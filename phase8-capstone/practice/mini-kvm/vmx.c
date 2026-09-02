@@ -589,7 +589,13 @@ static void mini_vmx_set_guest_state(void)
 	/*
 	 * 段寄存器：64 位平坦布局。CS 必须可用；SS/DS/ES/FS/GS/LDTR
 	 * 标记不可用（IA-32e 下允许，SDM 27.3.1.2）；TR 必须可用。
-	 * Guest 自己会执行 lidt 装载 IDT（GDTR 则完全不用，无远跳转）。
+	 *
+	 * 下面这组 GUEST_*GDTR/IDTR 初值只要过得了 §27.3.1 的检查（limit <
+	 * 2^16 即可，base 没有约束），因为 VM entry 装载段与表寄存器是**直接
+	 * 从 VMCS 字段读**，不做任何描述符访存（SDM 27.3.2）。但"不需要
+	 * 描述符"只到进入 guest 为止：IDT 投递要按门里的 selector 真的去
+	 * GDTR 取描述符，所以 guest 自己必须建一张 GDT 并 lgdt —— 见
+	 * guest/guest.S 里的 gdt/gdt_ptr。
 	 */
 	mini_vmwrite(GUEST_CS_SELECTOR, 0x8);
 	mini_vmwrite(GUEST_CS_BASE, 0);

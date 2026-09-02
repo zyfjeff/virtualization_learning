@@ -203,6 +203,11 @@ struct mini_kvm_vcpu {
 	 * 中断注入：非 0 时在下次进入前写入 VM_ENTRY_INTR_INFO_FIELD。
 	 * 位格式见 SDM 25.8.3 / 27.3.1.4：
 	 *   [7:0]=vector [10:8]=类型(0=外部中断) [31]=valid
+	 *
+	 * 这一格同时承担 KVM 里 `vcpu->arch.interrupt.injected` 的职责：运行
+	 * 循环把它取走写进 VMCS 就算"已注入"，但注入不等于投递完成——事件在
+	 * 投递途中引发 VM-Exit 时（SDM 28.2.4），硬件会把该事件记进
+	 * IDT-vectoring information，退出路径据此把它放回这一格重投。
 	 */
 	u32 pending_intr_info;
 
@@ -287,6 +292,7 @@ int mini_ept_invept_global(void);	/* all-context INVEPT；运行循环每次 VMP
 /* interrupt.c —— 中断注入（Stage 3） */
 int mini_vcpu_inject_irq(struct mini_kvm_vcpu *vcpu, int vector);
 u32 mini_vcpu_take_intr_info(struct mini_kvm_vcpu *vcpu);
+void mini_vcpu_complete_intr_info(struct mini_kvm_vcpu *vcpu, u32 reason);
 void mini_vcpu_reinject_nmi(struct mini_kvm_vcpu *vcpu);
 
 /* device.c —— IO 退出解码 + 串口模拟（Stage 4） */
