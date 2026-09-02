@@ -47,7 +47,8 @@ make clean
 
 **关键内核代码路径**：
 ```
-KVM_SET_TSC_KHZ → kvm_arch_set_tsc_khz() → vcpu->arch.tsc_scaling_ratio
+KVM_SET_TSC_KHZ → kvm_set_tsc_khz() x86.c:2465 → set_tsc_khz() x86.c:2429
+                  → kvm_vcpu_write_tsc_multiplier() x86.c:2636 → vcpu->arch.tsc_scaling_ratio x86.c:2646
 KVM_GET_MSRS(TSC) → kvm_get_msr_common() → kvm_read_l1_tsc()
 vmx_write_tsc_offset()     — vmx.c:1951 — VMCS TSC_OFFSET 写入
 vmx_write_tsc_multiplier() — vmx.c:1956 — VMCS TSC_MULTIPLIER 写入
@@ -170,7 +171,7 @@ KVM_CREATE_VCPU → kvm_arch_vcpu_postcreate() → kvm_create_lapic()
 没有 irqchip 就没有 LAPIC，`KVM_GET/SET_LAPIC` 返回 EINVAL。
 
 **前置条件 ②（隐蔽坑）：必须 `KVM_SET_CPUID2` 声明 TSC_DEADLINE_TIMER**：
-`kvm_update_cpuid()` 按 guest CPUID leaf 1 是否带
+`kvm_vcpu_after_set_cpuid()`（定义 `cpuid.c:371`）按 guest CPUID leaf 1 是否带
 `X86_FEATURE_TSC_DEADLINE_TIMER` 把 `apic->lapic_timer.timer_mode_mask` 设成
 `3<<17` 或 `1<<17`（if/else，`cpuid.c:399-402`）。本实验当时**完全没调
 `KVM_SET_CPUID2`**，`kvm_find_cpuid_entry(vcpu,1)` 返回 NULL、整个 if 块不执行，
@@ -185,8 +186,8 @@ mask 保持 kzalloc 初值 0，`apic_update_lvtt()` 把模式位全掩掉
 deadline 位被 `lapic.c:2391` 掩掉，详见 `../corrections.md` 勘误 28。）
 
 **前置条件 ③（隐蔽坑）：handler 不发 EOI，第二个中断永远不来**：
-中断注入置位 `ISR[vector]`；不发 EOI 则 `kvm_apic_has_interrupt()` 里
-`highest_irr <= apic_get_ppr()` 成立，同向量被挡。实模式够不着 xAPIC MMIO
+中断注入置位 `ISR[vector]`；不发 EOI 则 `kvm_apic_has_interrupt()`（`lapic.c:2965`）里
+`apic_has_interrupt_for_ppr()` 的 `(highest_irr & 0xF0) <= ppr` 成立（`lapic.c:963`），同向量被挡。实模式够不着 xAPIC MMIO
 （`0xFEE00000 > 1MB`），本实验改用 **x2APIC MSR 发 EOI**（`WRMSR(0x80b)`，
 实模式可用）。这条路径有两道门：
 - `kvm_x2apic_msr_write()` 要求 `apic_x2apic_mode()`，否则 `return 1`
@@ -225,7 +226,9 @@ KVM_SET_MSRS(TSC_DEADLINE) → kvm_set_msr_common() x86.c:3766
   → vmx_update_hv_timer() vmx.c:7205             — 写 VMX_PREEMPTION_TIMER_VALUE
 preemption timer 到期 → VM-Exit → KVM 注入向量 0x20 → guest handler OUT 0xe9
 handler WRMSR(0x80b) → case APIC_BASE_MSR... x86.c:3888
-  → kvm_x2apic_msr_write() lapic.c:3308 → __kvm_apic_update_eoi() 清 ISR
+  → kvm_x2apic_msr_write() lapic.c:3308 → kvm_lapic_reg_write() lapic.c:2297
+      case APIC_EOI lapic.c:2317 → apic_set_eoi() lapic.c:1489
+      → apic_clear_isr() 清 ISR + apic_update_ppr() lapic.c:990
 ```
 
 **LAPIC Timer 寄存器**（经 `KVM_GET/SET_LAPIC` 访问 `kvm_lapic_state.regs[]`）：
@@ -274,7 +277,7 @@ handler WRMSR(0x80b) → case APIC_BASE_MSR... x86.c:3888
 
 | 实验 | KVM API | 内核函数 | 源码位置 |
 |------|---------|---------|---------|
-| 1 | `KVM_SET_TSC_KHZ` | `kvm_arch_set_tsc_khz()` | `x86.c` |
+| 1 | `KVM_SET_TSC_KHZ` | `kvm_set_tsc_khz()` → `set_tsc_khz()` | `x86.c:2465` / `:2429` |
 | 1 | `KVM_GET_MSRS(TSC)` | `kvm_read_l1_tsc()` | `x86.c:2580` |
 | 1 | `vmx_write_tsc_offset()` | — | `vmx/vmx.c:1951` |
 | 1 | `vmx_write_tsc_multiplier()` | — | `vmx/vmx.c:1956` |
@@ -282,11 +285,11 @@ handler WRMSR(0x80b) → case APIC_BASE_MSR... x86.c:3888
 | 2 | `KVM_SET_CLOCK` | `kvm_vm_ioctl_set_clock()` | `x86.c:7006` |
 | 2 | `kvm_guest_time_update()` | — | `x86.c:3215` |
 | 3 | `KVM_CREATE_IRQCHIP` | `kvm_arch_vm_ioctl()` case @ `x86.c:7090` | `x86.c` |
-| 3 | `KVM_SET_CPUID2` | `kvm_update_cpuid()` — 决定 `timer_mode_mask` | `cpuid.c:399-402` |
+| 3 | `KVM_SET_CPUID2` | `kvm_vcpu_after_set_cpuid()` — 决定 `timer_mode_mask` | `cpuid.c:399-402` |
 | 3 | `KVM_SET_MSRS(APICBASE)` | `kvm_set_apic_base()` — 无 X2APIC CPUID 时拒 `X2APIC_ENABLE` | `x86.c:671` / `:675-679` |
 | 3 | `KVM_SET_LAPIC` | `kvm_vcpu_ioctl_set_lapic()` → `kvm_apic_set_state()` | `x86.c:5122` / `lapic.c:3103` |
 | 3 | `KVM_SET_MSRS(TSC_DEADLINE)` | `kvm_set_msr_common()` → `kvm_set_lapic_tscdeadline_msr()` | `x86.c:3890` / `lapic.c:2585` |
-| 3 | handler `WRMSR(0x80b)` EOI | `kvm_x2apic_msr_write()` → `__kvm_apic_update_eoi()` | `x86.c:3888` / `lapic.c:3308` |
+| 3 | handler `WRMSR(0x80b)` EOI | `kvm_x2apic_msr_write()` → `apic_set_eoi()` | `x86.c:3888` / `lapic.c:1489` |
 | 3 | `restart_apic_timer()` | — | `lapic.c:2200` |
 | 3 | `start_hv_timer()` | — | `lapic.c:2141` |
 | 3 | `vmx_set_hv_timer()` | — | `vmx/vmx.c:8129` |

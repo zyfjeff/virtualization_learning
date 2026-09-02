@@ -22,9 +22,9 @@
 
 | 原文 | 实际函数名 | 行号 |
 |------|-----------|------|
-| `kvm_pit_ioport_write()` | `pit_ioport_write()` | `i8254.c:438` |
-| `kvm_pit_ioport_read()` | `pit_ioport_read()` | `i8254.c:513` |
-| `kvm_pit_timer_expired()` | `pit_timer_fn()` | `i8254.c:268` |
+| `kvm_pit_ioport_write()` | `pit_ioport_write()` | `i8254.c:438` | <!-- check-refs:ignore -->
+| `kvm_pit_ioport_read()` | `pit_ioport_read()` | `i8254.c:513` | <!-- check-refs:ignore -->
+| `kvm_pit_timer_expired()` | `pit_timer_fn()` | `i8254.c:268` | <!-- check-refs:ignore -->
 
 ---
 
@@ -46,7 +46,7 @@
 
 ## 勘误 4：`start_hv_timer()` 文件路径错误
 
-**原文** (README.md §2)：`start_hv_timer()` 在 `vmx.c:2141`
+**原文** (README.md §2)：`start_hv_timer()` 在 `vmx.c:2141` <!-- check-refs:ignore -->
 
 **实际**：`start_hv_timer()` 在 **`lapic.c:2141`**，不在 `vmx.c`。它调用 `kvm_x86_call(set_hv_timer)` 分发到 VMX 的 `vmx_set_hv_timer()`。
 
@@ -399,7 +399,7 @@ case KVM_SET_LAPIC              — x86.c:5917 (kvm_arch_vcpu_ioctl)
 
 同表 `KVM_SET_MSRS(TSC_DEADLINE) → vmx_set_msr()` 一行也偏粗：TSC_DEADLINE
 属 common MSR，走 `kvm_set_msr_common()`（case @ x86.c:3890）→
-`kvm_set_lapic_tscdeadline_msr()`（lapic.c:2585），不经过 `vmx_set_msr()`。
+`kvm_set_lapic_tscdeadline_msr()`（lapic.c:2585），不经过 `vmx_set_msr()`。 <!-- check-refs:ignore -->
 
 **修正**：源码对照表已按上述链路改写，并补 `KVM_CREATE_IRQCHIP`
 （case @ x86.c:7090）与 `vmx_update_hv_timer()`（vmx.c:7205）两行。
@@ -412,7 +412,8 @@ case KVM_SET_LAPIC              — x86.c:5917 (kvm_arch_vcpu_ioctl)
 preemption timer VM-Exit）。用 ftrace `kvm_exit` + kprobe + 最小二分程序
 （SET_LAPIC → 写 deadline → 读回）定位，读回为 0，说明写入被拒。
 
-**根因**：`kvm_update_cpuid()` 只在 guest CPUID leaf 1 带
+**根因**：`kvm_vcpu_after_set_cpuid()`（`cpuid.c:371` 定义，由 `KVM_SET_CPUID2` →
+`kvm_vcpu_ioctl_set_cpuid2()` → `kvm_set_cpuid()`（`cpuid.c:457`）在 `cpuid.c:504` 调进来）只在 guest CPUID leaf 1 带
 `X86_FEATURE_TSC_DEADLINE_TIMER` 时才设置
 `apic->lapic_timer.timer_mode_mask = 3<<17`（`cpuid.c:398-403`，
 `best = kvm_find_cpuid_entry(vcpu, 1); if (best && apic) {...}`）。
@@ -476,7 +477,7 @@ APICBASE 位定义：`BSP=(1<<8)`、`X2APIC_ENABLE=(1<<10)`（apicdef.h:153）�
 `KVM_SET_CPUID2`），但由此归纳出的一般性说法不精确。
 
 **澄清 1（对应勘误 26 / README 前置条件 ②）**：
-"`kvm_update_cpuid()` 只在带 `TSC_DEADLINE_TIMER` 时才设 `3<<17`，不设则
+"`kvm_vcpu_after_set_cpuid()` 只在带 `TSC_DEADLINE_TIMER` 时才设 `3<<17`，不设则
 mask 保持 0" —— 这是 if/else，不是"设或清零"（`cpuid.c:399-402`）：
 
 ```c
@@ -505,6 +506,58 @@ guest 发起的 WRMSR 经 `kvm_emulate_wrmsr()`（`x86.c:2079`）→
 拒绝判断在 `:678-679`，引用宜写 `x86.c:675-679`。
 
 **同步修正**：`practice/README.md` 前置条件 ②/③ 与文末对照表已按本条改写。
+
+---
+
+## 勘误 29：四个"6.12.93 里根本不存在"的函数名（phase8 check-refs.py 机械扫出）
+
+**触发**：`../phase8-capstone/practice/mini-kvm/check-refs.py` 新增第三条核对
+——把文档里每个 `name()` 与它紧贴的 `file:line` 交叉验证（名字不在被引文件的定义
+区间内就报），扫出四个**在 6.12.93 全树 grep 不到**的名字（phase8 那侧记为 J14/J15
+两轮）。它们都不是"行号漂移"，而是照抄了旧内核或别的命名，静态读代码时看不出问题。
+
+| 旧写法 | 6.12.93 实际 | 出现位置 |
+|--------|-------------|----------|
+| `kvm_update_cpuid()` | `kvm_vcpu_after_set_cpuid()`（`cpuid.c:371`） | 5 处，见下 | <!-- check-refs:ignore -->
+| `kvm_arch_set_tsc_khz()` | `kvm_set_tsc_khz()`（`x86.c:2465`）→ `set_tsc_khz()`（`x86.c:2429`） | `practice/README.md` 第 50 行（Experiment 1 代码路径）、第 280 行（对照表） | <!-- check-refs:ignore -->
+| `apic_get_ppr()` | `apic_has_interrupt_for_ppr()` 里的 `(highest_irr & 0xF0) <= ppr`（`lapic.c:963`） | `practice/README.md` 第 189 行（前置条件 ③）、`practice/experiment3-lapic.c` 第 107-109 行 | <!-- check-refs:ignore -->
+| `__kvm_apic_update_eoi()` | `apic_set_eoi()`（`lapic.c:1489`） | `practice/README.md` 第 229-231 行（第 3 节链路）、第 292 行（对照表 EOI 行）、`practice/experiment3-lapic.c` 第 233-235 行 | <!-- check-refs:ignore -->
+
+判据先说清：这四个名字在本树**全树 0 命中**——用
+`grep -rn '\<kvm_update_cpuid\>' --include='*.c' --include='*.h'` 这类命令数的
+（`/root/code/linux-6.12.93/` 不是 git 仓库，`git grep` 在这里只会报
+`not a git repository`，拿它的空输出当"查无此名"是个假绿灯，本轮踩过一次）。
+四条链路逐级读源码确认：
+
+- **CPUID**：`case KVM_SET_CPUID2`（`x86.c:5957`）→ `kvm_vcpu_ioctl_set_cpuid2()`
+  （调用 `x86.c:5964`，定义 `cpuid.c:555`）→ `kvm_set_cpuid()`（定义
+  `cpuid.c:457`，被调 `cpuid.c:571`）→ `kvm_vcpu_after_set_cpuid()`（定义
+  `cpuid.c:371`，被调 `cpuid.c:504`），`timer_mode_mask` 的 if/else 在它内部
+  （`cpuid.c:399-402`，见勘误 28）。别和 `kvm_update_cpuid_runtime()`
+  （`cpuid.c:340`）混，那是运行时能力刷新。
+- **TSC**：`case KVM_SET_TSC_KHZ`（`x86.c:6173`）→ `kvm_set_tsc_khz()`
+  （`x86.c:2465`）→ `set_tsc_khz()`（`x86.c:2429`）→
+  `kvm_vcpu_write_tsc_multiplier()`（`x86.c:2636`）写
+  `vcpu->arch.tsc_scaling_ratio`（`x86.c:2646`）。
+- **PPR**：`kvm_apic_has_interrupt()`（`lapic.c:2965`）先 `__apic_update_ppr()`
+  （`lapic.c:968`）再进 `apic_has_interrupt_for_ppr()`（`lapic.c:956`），判据
+  `highest_irr == -1 || (highest_irr & 0xF0) <= ppr` 在 `lapic.c:963`。
+  本树根本没有 PPR 的读取函数：PPR 由 `__apic_update_ppr()` 就地算出后写回
+  `APIC_PROCPRI` 寄存器（`lapic.c:985`），其余地方取局部变量。
+- **EOI**：`kvm_x2apic_msr_write()`（`lapic.c:3308`）→ `kvm_lapic_reg_write()`
+  （`lapic.c:2297`）的 `case APIC_EOI:`（`lapic.c:2317`）→ `apic_set_eoi()`
+  （`lapic.c:1489`，static）→ `apic_clear_isr()`（`lapic.c:798`）清 ISR
+  + `apic_update_ppr()`（`lapic.c:990`）。去掉前导下划线的
+  `kvm_apic_update_eoi` 在本树同样 0 命中，对外的两个入口是
+  `kvm_lapic_set_eoi()`（`lapic.c:2481`）与 `kvm_apic_set_eoi_accelerated()`
+  （`lapic.c:1517`），都不在这条 MSR 路径上。
+
+**同步修正**：上表位置已全部改写（下列行号一律按**改后**的文件计）。除本条之外，
+本文件另有 5 处 `check-refs:` 豁免标记（勘误 2 的三行原文表、勘误 4 的原文行、
+第 402 行"不经过 `vmx_set_msr()`"那句），都是**故意保留的错误原文**，不是漏网。
+`kvm_update_cpuid` 的 5 处改点：`practice/README.md` 第 174 行（前置条件 ②）、
+第 288 行（对照表 `KVM_SET_CPUID2` 行）、`practice/experiment3-lapic.c` 第 98 行、
+本文件第 415-416 行（勘误 26 根因）、第 480 行（勘误 28 澄清 1 的引用块）。 <!-- check-refs:ignore -->
 
 ---
 

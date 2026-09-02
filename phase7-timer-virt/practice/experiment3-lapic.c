@@ -95,7 +95,7 @@ static const char *lvtt_mode_name(uint32_t lvtt)
  * ECX[21] (X2APIC)。
  *
  * 不设会踩一个隐蔽的坑: 本实验若不给 leaf 1 建 CPUID 条目,
- * kvm_update_cpuid() 里 best==NULL、整个 if 块不执行, timer_mode_mask
+ * kvm_vcpu_after_set_cpuid() 里 best==NULL、整个 if 块不执行, timer_mode_mask
  * 保持 kzalloc 初值 0 (有 leaf1 但缺该位时则是 1<<17, cpuid.c:399-402);
  * mask=0 时 apic_update_lvtt() (lapic.c:1781) 把 LVTT 的模式位全掩掉 →
  * timer_mode 永远是 0 (one-shot), TSC_DEADLINE MSR 写入被
@@ -104,8 +104,9 @@ static const char *lvtt_mode_name(uint32_t lvtt)
  * 平时看不到; 直接用 KVM API 时它是硬前提。
  *
  * X2APIC 位是给 handler 发 EOI 用的: 中断注入后 ISR[0x20] 置位, 不发
- * EOI 则同向量被 PPR 挡住 (kvm_apic_has_interrupt():
- * highest_irr <= apic_get_ppr() → 不投递), 第二个中断永远不来。
+ * EOI 则同向量被 PPR 挡住 (kvm_apic_has_interrupt() lapic.c:2965 →
+ * apic_has_interrupt_for_ppr() 的 (highest_irr & 0xF0) <= ppr,
+ * lapic.c:963 → 不投递), 第二个中断永远不来。
  * 实模式够不着 xAPIC MMIO (0xFEE00000 > 1MB), 只能走 x2APIC MSR
  * (WRMSR 实模式可用); 而 kvm_set_apic_base() (x86.c:675-676) 规定
  * guest CPUID 没有 X2APIC 时 APICBASE 的 X2APIC_ENABLE 位算保留位,
@@ -226,10 +227,12 @@ int main(void)
      * → guest 跳到 0x2000 → OUT 触发 KVM_EXIT_IO → 用户态计数。
      *
      * EOI 不能省: 中断注入置位 ISR[0x20], 不发 EOI 则同向量被
-     * PPR 挡住 (kvm_apic_has_interrupt() lapic.c), 第 2 个中断永远
+     * PPR 挡住 (kvm_apic_has_interrupt() lapic.c:2965), 第 2 个中断永远
      * 不来。实模式够不着 xAPIC MMIO (0xFEE00000 > 1MB), 所以借
      * x2APIC MSR: WRMSR(0x80b=APIC_EOI), 内核侧走
-     * kvm_x2apic_msr_write() → __kvm_apic_update_eoi() (lapic.c:3308)。
+     * kvm_x2apic_msr_write() (lapic.c:3308) → kvm_lapic_reg_write()
+     * (lapic.c:2297) 的 case APIC_EOI (lapic.c:2317) → apic_set_eoi()
+     * (lapic.c:1489) → apic_clear_isr() 清 ISR + apic_update_ppr() (lapic.c:990)。
      */
     uint8_t ivt_entry[4] = { 0x00, 0x20, 0x00, 0x00 };  /* off=0x2000, seg=0 */
     memcpy((char *)vm.mem + 0x80, ivt_entry, 4);
