@@ -71,8 +71,8 @@ static inline bool mini_cpu_has_vmx(void)
  * smp_call_function_single(cpu, kvm_x86_check_cpu_compat)（x86.c:9828，回调
  * 见 x86.c:9736-9739 → :9733 → __kvm_is_vmx_supported()，
  * vmx.c:2782-2798），而
- * kvm_arch_hardware_enable() 在真正要 VMXON 的那台 CPU 上、执行 VMXON
- * 之前又跑一遍同样的检查（x86.c:12694）。
+ * kvm_arch_enable_virtualization_cpu()（x86.c:12682）在真正要 VMXON 的那
+ * 台 CPU 上、执行 VMXON 之前又跑一遍同样的检查（x86.c:12694）。
  */
 static bool mini_cpu_vmx_supported(void)
 {

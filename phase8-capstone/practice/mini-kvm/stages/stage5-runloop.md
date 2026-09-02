@@ -36,7 +36,7 @@ KVM:  kvm_arch_vcpu_ioctl_run()
                                                → static_call(vcpu_run)
              preempt_disable()（:10979）… VM-Entry … VM-Exit …（:11171 才 enable）
 
-mini-kvm: mini_vcpu_run_ioctl()
+mini-kvm: mini_vcpu_ioctl()                    vcpu.c:407
         └→ mini_vcpu_run_loop()                vcpu.c:67     ← 一层 for(;;)
              全程 preempt_disable（:74）；要回用户态就 goto out
 ```

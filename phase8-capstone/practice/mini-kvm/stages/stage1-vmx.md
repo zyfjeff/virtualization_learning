@@ -125,8 +125,8 @@ fault: 	... 	return -EIO;
    别的 CPU 作保。对照 KVM 的两层：模块加载时给每个在线 CPU 下发一次
    `smp_call_function_single(cpu, kvm_x86_check_cpu_compat)`（`x86.c:9828`，
    回调 `x86.c:9736-9739` → `:9733` → `__kvm_is_vmx_supported()`，
-   `arch/x86/kvm/vmx/vmx.c:2782-2798`），并且 `kvm_arch_hardware_enable()` 在真正要 VMXON 的
-   那台 CPU 上、VMXON 之前又跑一遍（`x86.c:12694`）。
+   `arch/x86/kvm/vmx/vmx.c:2782-2798`），并且 `kvm_arch_enable_virtualization_cpu()`
+   （定义 `x86.c:12682`）在真正要 VMXON 的那台 CPU 上、VMXON 之前又跑一遍（`x86.c:12694`）。
 
 2. **VMXON 区域首页要写 revision identifier**（本模块 `main.c:420`），值取
    `IA32_VMX_BASIC[30:0]`；VMCS 页同样要写（`vmx.c:692`）。规范出处是
@@ -382,11 +382,13 @@ objdump -d --no-show-raw-insn vmx_entry.o | sed -n '/<mini_vmx_vmexit>:/,/pop/p'
 # J12(1)）。这几处偏移现在都由 vmx_entry.S 里的 STACK_LAUNCHED / STACK_VCPU
 # 宏算出来，改栈布局时入口与出口两条路径一起变。
 
-# 5. 文档与本模块源码注释里每一条 `file:line` 都落在真实代码上
-#    （行号漂移是本项目最容易复发的错，见 corrections.md J10(a′)/J11(6)）
+# 5. 文档与本模块源码注释里每一条 `file:line` 与每一个函数名都落在真实代码上
+#    （行号漂移是本项目最容易复发的错，见 corrections.md J10(a′)/J11(6)；
+#     "行号完全正确、函数名完全不存在"是同一类错的另一半，见 J13(5)/J14）
 ./check-refs.py --quiet				# README + 五篇 stage
 ./check-refs.py --quiet ../../corrections.md
 ./check-refs.py --quiet --kernel --src		# 连 *.c/*.h/*.S 的注释一起扫
+./check-refs.py --quiet --fn-strict --kernel --src	# 加严：行号离名字太远也判错
 ./check-refs.py --context 2			# 想看每条引用的原文就去掉 --quiet
 
 # 6. guest 镜像里写死的绝对地址（GDT 伪描述符）必须真的等于 GPA

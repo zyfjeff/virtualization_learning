@@ -14,11 +14,12 @@
 
 ### A1. 陷阱 2："缺 TSC-deadline 位 → timer_mode_mask 置 0" 不准确
 
-原文："`kvm_update_cpuid()` 把 `timer_mode_mask` 置 0（cpuid.c:398-403），
+原文："`kvm_update_cpuid()` 把 `timer_mode_mask` 置 0（cpuid.c:398-403）， <!-- check-refs:ignore -->
 mask 为 0 时 `timer_mode = LVTT & mask` 恒 0"。
 
-**正确**：`kvm_update_cpuid()` 是 if/else，不是只设或清零
-（`arch/x86/kvm/cpuid.c:399-402`）：
+**正确**：6.12.93 里没有 `kvm_update_cpuid()` 这个名字（只有 <!-- check-refs:ignore -->
+`kvm_update_cpuid_runtime()`，`cpuid.c:340`），这段 if/else 属于 `kvm_vcpu_after_set_cpuid()`
+（定义 `arch/x86/kvm/cpuid.c:371`，被引行 `arch/x86/kvm/cpuid.c:399-402`）：
 
 ```c
 if (cpuid_entry_has(best, X86_FEATURE_TSC_DEADLINE_TIMER))
@@ -486,7 +487,7 @@ bits 63:32 未定义。指令长度**不在**这个字段里，在
 `interrupt.c` 头注释写「NMI 应当重新注入给 guest（对照 vmx.c
 `handle_exception_nmi` 的 NMI 再注入路径）」。
 
-**正确**：6.12.93 里 `vmx_reinject_nmi()` 不存在（全树 grep 无此符号）。
+**正确**：6.12.93 里 `vmx_reinject_nmi()` 不存在（全树 grep 无此符号）。 <!-- check-refs:ignore -->
 KVM 对"guest 执行期间到达的 NMI"的处理恰好**相反**：在 root 模式直接跳宿主
 IDT 的 NMI 门消费掉（`vmx_vcpu_enter_exit()` → `vmx_do_nmi_irqoff()`，
 `vmx/vmx.c:7330-7338`；声明 `:6978`），`handle_exception_nmi()` 见到
@@ -1229,12 +1230,12 @@ PML4/PDPT/PD，用户态摆在 0x6000/0x7000/0x8000）、**0xFF**（guest 栈，
 `[IRQ 0x21 handled]\n` 的字节数，逐字节 `OUT` 一次一退出——这给 J12(4) 里"guest
 总共只打 27 + 19 = 46 字节"那句补上了实测。
 
-#### (5) J5 那类错误复发：`inject_pending_event()` 在 6.12.93 不存在
+#### (5) J5 那类错误复发：`inject_pending_event()` 在 6.12.93 不存在 <!-- check-refs:ignore -->
 
 写本节时按名字去 `grep` 定义，结果 `arch/x86/kvm/x86.c` 里**没有**
-`inject_pending_event()`；6.12.93 的真名是 `kvm_check_and_inject_events()`
+`inject_pending_event()`；6.12.93 的真名是 `kvm_check_and_inject_events()` <!-- check-refs:ignore -->
 （`x86.c:10342`）。三处已改：`interrupt.c` 头注释、stage3 第 5 节、stage5 的调用
-流程图。同一段里另一个名字也错了：`apic_set_irq()` 在这棵树里不存在（有的是
+流程图。同一段里另一个名字也错了：`apic_set_irq()` 在这棵树里不存在（有的是 <!-- check-refs:ignore -->
 `kvm_apic_set_irq()`，`lapic.c:845`）——它出现在全仓扫描命中的
 `examples/bpf-programs/README.md:137`，已就地改成按 6.12.93 实测的完整链路：
 `irqfd_wakeup()`（`virt/kvm/eventfd.c:202`）→ `kvm_arch_set_irq_inatomic()`
@@ -1253,9 +1254,9 @@ APICv 的传统路径，Posted 模式下 vIRR 与中断窗口两步都不发生"
 
 **为什么 `check-refs.py` 抓不到**：它只核对"文件存在 + 行号不越界"，函数名根本不在
 它的能力范围内。这类错和 J5 是同一类（引用了 KVM 里不存在的函数），说明**只核对
-行号会给人虚假的安全感**：一条"`vmx.c:7111` → `inject_pending_event()`"的引用可以
-行号完全正确而函数名完全不存在。给脚本补一条"引用的 KVM 函数名必须能命中定义"是
-待办，本轮没做。
+行号会给人虚假的安全感**：一条"`vmx.c:7111` → `inject_pending_event()`"的引用可以 <!-- check-refs:ignore -->
+行号完全正确而函数名完全不存在。给脚本补"引用的函数名必须能命中定义"这条判据是
+下一轮（J14）做的事。
 
 #### (6) 本轮我自己犯的三处过度推断（流程教训）
 
@@ -1316,7 +1317,8 @@ APICv 的传统路径，Posted 模式下 vIRR 与中断窗口两步都不发生"
 | `pending_intr_info` 字段 / 新原型 | `mini-kvm.h:206` / — | `mini-kvm.h:212` / `mini-kvm.h:295` |
 
 未动的文件（`main.c`、`ept.c`、`device.c`、`vmx_entry.S`、`test-mini-kvm.c`）本轮仍
-逐条重打原文核对，全部对得上。四种模式全部干净：
+逐条重打原文核对，全部对得上。四种模式全部干净（条数是当时的脚本口径，J14 起脚本
+开始统计省略文件名的续引用并核对函数名，重测的数字见 J14）：
 
 ```bash
 ./check-refs.py --quiet                        # README + 五篇 stage：155 条，0 问题
@@ -1351,3 +1353,206 @@ sudo rmmod mini_kvm && sudo modprobe kvm_intel          # 收尾复原宿主
 - **自旋**：把 `sti; 1: hlt; jmp 1b` 改成 `sti` + `mov $150000000,%ecx; 2: dec %ecx;
   jne 2b` 再 `hlt`，镜像 274 B。第一次 RUN 就能看到 `extint` 按宿主 tick 增长，
   是验证 STI 影子窗口（J12(2)）唯一的办法。
+
+### J14. 给 `check-refs.py` 加函数名核对：抓到四条真错，也抓到脚本自己的两个假绿灯
+
+J13(5) 留的待办本轮做掉了。脚本原来只核对"文件找得到 + 行号不越界 + 打印原文"，函数名
+不在它的能力范围内，而**"行号完全正确、函数名完全不存在"恰好是本文档集最容易犯、也最不
+容易被发现的一类错**（J5、J13(5) 两次复发）。现在多了第 3 项核对，判据是一条条收紧出来的：
+
+1. **名字归整段管**：函数名所在**段落**（连续非空行）里所有被引文件的并集是它的候选文件。
+   文档一句话常跨两三行，引用写在上半句、名字写在下半句是正常写法 —— 按单行配对，本文档
+   集当场报出 22 条误报。
+
+2. **只有"紧贴引用"才算断言**：名字与某条引用之间不超过 `ADJ = 40` 个字符、且中间不夹别的
+   函数名，才算"这个名字就在这个行号"。散文里顺带提到的 `schedule()`、`preempt_disable()`
+   不参与；markdown 表格行整行跳过（那一格里上一列是文件、下一列是名字，配没配对看不出来）。
+   这一条把 22 压到 5。
+
+3. **断言成立后再量邻近度**：被引行号要落在"这个名字的地盘"±`WINDOW = 40` 行内。地盘 =
+   名字出现的行 ∪ 它的定义体（定义行到下一个定义行为止），所以引用函数体内的某一行、引用
+   它的调用点都算对。**不能**拿"必须落在函数体内"当判据 —— 引用调用点、引用一段讲这个函
+   数的注释都是正常写法，那样判满屏误报。5 压到 1。
+
+4. 本模块自己定义的名字（`mini_*()`）不去内核树找。整树搜索分四态：`def` 找得到定义式 /
+   `use` 树里只有调用、名字由宏拼接或生成代码产生（判 `??` 不判错）/ `word` 只剩注释与字符
+   串里的残留（`!!`）/ `none` 全树搜不到（`!!`）。三档里只有 `!!` 计入问题数与退出码，`??`
+   只提示，`--fn-strict` 才把邻近度那档也升级成 `!!`，`--no-fn` 整项关掉。
+
+#### (2) 它当场抓到的四条真错
+
+| # | 位置 | 错在哪 | 6.12.93 的实际情形 |
+|---|---|---|---|
+| 1 | stage1 第 1 节、本模块 `main.c:74-75` 注释 | `kvm_arch_hardware_enable()` 这个名字本版本已没有 | 叫 `kvm_arch_enable_virtualization_cpu()`（`arch/x86/kvm/x86.c:12682`），VMXON 前那次 per-CPU compat 检查在 `:12694`；全树 grep `kvm_arch_hardware_enable` 零命中 | <!-- check-refs:ignore -->
+| 2 | stage5 第 1 节调用图 | `mini_vcpu_run_ioctl()` 是造出来的名字，本模块没有这个函数 | 真名 `mini_vcpu_ioctl()`（`vcpu.c:407`），图里已把行号补上 | <!-- check-refs:ignore -->
+| 3 | `project1-minivmm-boot.md` 第 74、171、185 行 + 本文 A1 节 | `cpuid.c:399-402` 那个 if/else 不归 `kvm_update_cpuid()`，而这名字在 6.12.93 根本不存在 | 属于 `kvm_vcpu_after_set_cpuid()`（定义 `arch/x86/kvm/cpuid.c:371`）。链路：`KVM_SET_CPUID2`（`x86.c:5957`，`:5964` 处调用）→ `kvm_vcpu_ioctl_set_cpuid2()` → `kvm_set_cpuid()`（`cpuid.c:457`，`:504` 处调 after_set_cpuid）。同族现存的名字是 `kvm_update_cpuid_runtime()`（`cpuid.c:340`）与 `__kvm_update_cpuid_runtime()`（`:293`），两者都**不**含这段 `timer_mode_mask` 逻辑 | <!-- check-refs:ignore -->
+| 4 | 本模块 `vcpu.c:639` 注释 | 一句话两半只配了一条引用：`anon_inode_getfd()` 不在 `kvm_main.c:484` | `kvm_main.c:484` 是 `mutex_init(&vcpu->mutex)` 那行（`kvm_vcpu_init()` 里），`anon_inode_getfd()` 在 `virt/kvm/kvm_main.c:4180`（`create_vcpu_fd()`）。现在两半各配一处引用 |
+
+第 3 条同类的错在 `phase7-timer-virt/` 还有五处（`practice/README.md` 第 173、285 行、
+`practice/experiment3-lapic.c` 第 98 行、该目录 `corrections.md` 第 415、479 行，全是用
+`kvm_update_cpuid()` 断言 `arch/x86/kvm/cpuid.c:399-402`）。本轮只处理 phase8 范围内的文 <!-- check-refs:ignore -->
+档，那五处留到 J15 一并改掉 —— 同一把尺子第一次扫 phase7，除了这五处还扫出另外
+三个本版本不存在的名字，见 J15。
+
+顺带记一条容易被"部分匹配"糊过去的：全树里唯一含 `inject_pending_event` 这串字符的是
+`kvm_xen_inject_pending_events()`（`arch/x86/kvm/xen.h:20`），跟 irqfd / `KVM_REQ_EVENT`
+那条路径毫无关系。核对按单词边界搜，所以它救不了 `inject_pending_event()`。 <!-- check-refs:ignore -->
+
+#### (3) 脚本自己的两个假绿灯（写核对工具更要防这个）
+
+1. **`--kernel` 原本连"解析"一起跳过**：不带 `--kernel` 时内核引用根本不进段落并集，第 3
+   项核对对最该查的那批引用**完全免检**。回归夹具不带 `--kernel` 跑，人造的死名一条都抓不
+   到（rc=0）—— J13(5) 说的"虚假的安全感"在我自己写的脚本里复现了一遍。改成解析照做，
+   `--kernel` / `--quiet` 只管打不打印原文。
+2. **`grep -E` 是 POSIX ERE**：全树定义式模式里写的 `(?:…)`、`\s`、`\t` 一概不认（只丢一句
+   `? at start of expression` 警告并返回零命中），于是 `kvm_vcpu_ioctl()` 这类真实存在的符
+   号被成片判成"不存在"。改成普通分组 + `[[:blank:]]` 后既对得上，全树模式耗时也从 83s 掉
+   到 ~50s。
+
+另有两处判据返工。`FN_DEF` 原来要求类型 token 至少两个，`int mini_handle_io_exit(` 会把名
+字认成 `t`；也不认 `#define name(`，而 `lockdep_assert_irqs_disabled()` 正是宏
+（`include/linux/lockdep.h:580`）、`__free_page` 同理（`include/linux/gfp.h:396`）。还有一
+次"改进"是**回退**掉的：把内核树兜底限定成"本目录同名文件容不下才算"，结果 9 条正常写法的
+裸 `vmx.c:NNN`（约定就是指 KVM 那份）全变成假的"行号越界"，最后把规则写进 docstring 的已
+知边界。绝对路径引用（`/root/code/qemu-10.1.0-rc2/hw/i386/x86-common.c:633` 这种指 QEMU
+的）现在原样取文件，`arch/x86/include/uapi/asm/` 也补进了 `KERNEL_DIRS` —— 此前
+`bootparam.h` 那批引用一直报"找不到文件"，`project1-minivmm-boot.md` 一个人就占 7 条。
+
+#### (4) 复述死名字的行需要豁免
+
+`corrections.md` 的本职就是写下"某某名字在本版本不存在"，
+`examples/bpf-programs/README.md:141` 也写着"`inject_pending_event()` 在此版本已不存在"
+—— 这些行按第 3 项核对必然报警。于是加了行内标记 `<!-- check-refs:ignore -->`：带这个标记
+的物理行不参与函数名核对。本轮实打 16 处豁免：本文 15 处（A1 两行、第 490 行那一条、
+J13(5) 四行、J14 八处）+ `examples/bpf-programs/README.md` 一处（第 141 行）。全部是行尾
+追加，不改任何行数；初稿写成"17 处 / J14 九行"，因为上一行里**提到**标记名的那句也被数进去了（机制见 J15(5)）。
+
+#### (5) 行号：本轮零漂移
+
+模块十个文件的行数与 J13(7) 记录的**完全一致**（`main.c` 504、`vmx.c` 828、`vcpu.c` 839、
+`ept.c` 261、`interrupt.c` 165、`device.c` 120、`vmx_entry.S` 248、`mini-kvm.h` 306、
+`test-mini-kvm.c` 219、`guest/guest.S` 184）：改的三处全是行内替换或原地注释。`make` 重新
+编译通过、无新增警告（只有宿主内核与 gcc 的小版本差异提示），`mini_cpu_vmx_supported()`
+仍在 `main.c:77`。
+
+六种跑法按新口径重测（省略文件名的续引用现在计入总数，所以 README + 五篇 stage 的口径从
+J13 记的 155 涨到 197）：
+
+```bash
+./check-refs.py --quiet                                # 197 条，0 问题，38.9s
+./check-refs.py --quiet --kernel --src                 # 372 条，0 问题，~50s
+./check-refs.py --quiet --fn-strict --kernel --src     # 372 条，0 问题 ← 邻近度加严也是 0
+./check-refs.py --quiet --kernel ../../corrections.md  # 423 条，0 问题，1 条 ??
+./check-refs.py --quiet --kernel ../../project1-minivmm-boot.md           # 68 条，0 问题
+./check-refs.py --quiet --kernel ../../../examples/bpf-programs/README.md # 15 条，0 问题
+```
+
+唯一剩下的那条 `??` 在本文第 709 行：那里写的是"`kvm_cpu_vmxoff()` 里 749 与 753 两行，
+调用点都在 `on_each_cpu()` 的 IPI 回调" —— `on_each_cpu()` 只是顺带提到，离 753 那个引用
+只隔八个字符，就被"紧贴引用"认成了断言（它的定义在 `include/linux/smp.h:69`，与本段被引文
+件不同）。这是邻近度判据的固有噪声，也正是 `??` 不判错、要 `--fn-strict` 才升级的理由。
+
+#### (6) 回归夹具
+
+`/tmp/checkrefs-regression.md`（一次性产物，不在仓库里）人造三种错。跑
+`./check-refs.py --quiet /tmp/checkrefs-regression.md` 期望 **rc=1、1 条 `!!` + 1 条 `??`**： <!-- check-refs:ignore -->
+
+- 死名：`inject_pending_event()`（x86.c:7111）→ `!! 函数名在 6.12.93 里不存在` <!-- check-refs:ignore -->
+- 漂到隔壁：`vmx_vcpu_load_vmcs()`（arch/x86/kvm/vmx/vmx.c:1100，真定义 `:1449`，这个名字
+  离 1100 最近出现在 804 行）→ `?? … 有 296 行远` <!-- check-refs:ignore -->
+- 行号越界：本模块 `vmx.c:3199` → 现在按 docstring 里那条取舍落到内核树那份，**不再**判错。
+  这正是"裸文件名指 KVM 那份"这个约定的代价，汇总里的"落到非首选同名文件"计数就是为它准备的。
+
+### J15. J14 的遗留收尾：phase7 又扫出四个死名，外加一条"证否命令自己失败"的假绿灯
+
+**范围**：改动全在 `phase7-timer-virt/` 的三个文件（`practice/README.md` +3 行、
+`practice/experiment3-lapic.c` +3 行、`corrections.md` +54 行 —— 新增勘误 29），
+phase8 这边只多了本条以及把 J14(2) 那句"留着下一轮"改成指向这里。仓库里没有任何文档按
+行号引这三个 phase7 文件（`grep -rn 'experiment3-lapic\.c:' .`、
+`grep -rn 'practice/README\.md:' .`、`grep -rn 'timer-virt/corrections\.md:' .` 全零命中），
+所以这些行号漂移一处都不外溢。
+
+#### (1) 同一把尺子在 phase7 扫出的四个死名
+
+`kvm_update_cpuid` 那五处只是冰山一角；把 J14 的新核对第一次用在 phase7 上，一共
+四个名字**全树 0 命中**。它们的行号全都是对的，错的是名字 —— 静态读代码时看不出任何
+问题，只有"名字 ↔ 行号"双向核对才能捞出来。实际链路（勘误 29 记了每一处改点）：
+
+- **CPUID**：真名 `kvm_vcpu_after_set_cpuid()`（`arch/x86/kvm/cpuid.c:371`）。完整链路
+  `case KVM_SET_CPUID2`（`x86.c:5957`）→ 调用点 `x86.c:5964` →
+  `kvm_vcpu_ioctl_set_cpuid2()`（`cpuid.c:555`）→ `kvm_set_cpuid()`（`cpuid.c:457`，
+  调用点 `cpuid.c:571`）→ `kvm_vcpu_after_set_cpuid()`（调用点 `cpuid.c:504`）。
+- **TSC**：`KVM_SET_TSC_KHZ` 那行原来写的是 `kvm_arch_set_tsc_khz`，本树没有。真链路
+  `case KVM_SET_TSC_KHZ`（`x86.c:6173`）→ `kvm_set_tsc_khz()`（`x86.c:2465`）→
+  `set_tsc_khz()`（`x86.c:2429`）→ `kvm_vcpu_write_tsc_multiplier()`（`x86.c:2636`）
+  写 `vcpu->arch.tsc_scaling_ratio`（`x86.c:2646`）。
+- **PPR**：`apic_get_ppr` 不存在，而且**这个方向根本没有 getter** —— PPR 由
+  `__apic_update_ppr()`（`lapic.c:968`）就地算出后写回 `APIC_PROCPRI` 寄存器
+  （`lapic.c:985`），别人要读只能再算一遍。投递判据是
+  `apic_has_interrupt_for_ppr()`（`lapic.c:956`）里
+  `highest_irr == -1 || (highest_irr & 0xF0) <= ppr` 那一行（`lapic.c:963`）。
+- **EOI**：`__kvm_apic_update_eoi` 不存在，连去掉前导下划线的 `kvm_apic_update_eoi`
+  也是 0 命中。guest 侧 `WRMSR(0x80b)` 走
+  `kvm_x2apic_msr_write()`（`lapic.c:3308`）→ `kvm_lapic_reg_write()`（`lapic.c:2297`）
+  的 `case APIC_EOI:`（`lapic.c:2317`）→ `apic_set_eoi()`（`lapic.c:1489`）→
+  `apic_clear_isr()`（`lapic.c:798`）+ `apic_update_ppr()`（`lapic.c:990`）。
+
+#### (2) 假绿灯第三例：`git grep` 在这棵树里跑不起来
+
+上面 (1) 那些"全树 0 命中"的第一版证据是
+`git grep -c "$n" -- '*.c' '*.h' 2>/dev/null | wc -l`，四个名字各返回 0，看着是铁证。
+实际 `/root/code/linux-6.12.93/` **不是 git 仓库**：`git grep` 只输出一句
+`fatal: not a git repository`（进 stderr，被 `2>/dev/null` 吞掉），stdout 空，
+`wc -l` 数出 0 行。**"没搜成"和"没搜到"在这条管道里是同一个输出。** 换成
+`grep -rn '\<kvm_update_cpuid\>' --include='*.c' --include='*.h' | wc -l` 才是真 0。
+和 J14(3) 那两条比一比：`--kernel` 免检是"检查没跑"，ERE 正则是"检查跑错"，这条是
+**"用来证否的命令自己失败"**，三者都照样把 rc=0 端上来。写核对工具的人尤其容易只防
+前两种。
+
+#### (3) 为了扫 phase7 给脚本补的三处能力
+
+- `OTHER_TREES` = QEMU 两份 + DPDK：带目录的引用（phase7 里的
+  `hw/i386/kvm/clock.c:163`，`kvmclock_vm_state_change()`）此前只在内核树里找，一律
+  "找不到文件"。只对**带 `/`** 的写法生效，裸文件名仍旧先本模块、再
+  内核树，不去 QEMU 撞运气。
+- `KERNEL_DIRS` 补 `arch/x86/kernel/apic/`：宿主自己的 `apic.c` 与 KVM 的 `lapic.c`
+  是两回事，phase7 用裸 `apic.c:419`、`apic.c:584-593`、`apic.c:259` 引的就是前者
+  （`lapic_next_deadline()` / `setup_APIC_timer()` / `TSC_DIVISOR`）。
+- `doc_defs`：被扫文档**自己**的定义也算"模块内名字"。少了它，phase7
+  `experiment3-lapic.c` 里那个 `vcpu_setup_cpuid` 会被推去内核树找，判成死名。
+
+#### (4) 度量
+
+```bash
+cd phase8-capstone/practice/mini-kvm
+# phase7 三篇（README 56 / corrections 152 / experiment3-lapic.c 27）
+./check-refs.py --quiet --fn-strict --kernel ../../../phase7-timer-virt/practice/README.md \
+    ../../../phase7-timer-virt/corrections.md ../../../phase7-timer-virt/practice/experiment3-lapic.c
+#   共 235 条，0 问题，26 条续引用，21 条落到非首选同名文件，10.7s
+./check-refs.py --quiet                              # 197 条，0 问题（J14 口径不变）
+./check-refs.py --quiet --fn-strict --kernel --src   # 372 条，0 问题
+./check-refs.py --quiet --kernel ../../corrections.md  # 449 条，0 问题，1 条 ??（J14 时是 423）
+```
+
+计数有个坑值得记：**`--src` 会把本模块十个源文件追加进扫描列表**，所以"单篇文档多少
+条引用"只有在不带 `--src` 时才准。本轮第一次量 phase7 时拿到 202 / 231 / 327 三个数，
+以为是 phase7 的引用暴涨，其实是模块源码被一起扫了。
+
+两侧都重新编译过：phase7 `practice` 的 `make`（`experiment3-lapic` 重新链接）与
+mini-kvm 的 `make` 均 rc=0、无新增警告，模块十个文件行数与 J13(7)/J14(5) 一致。
+
+#### (5) 标记是子串匹配：正文里"提到"它，就等于给自己开后门
+
+`IGNORE_NAME in body` 判的是**子串**，所以只要某行的正文里出现了
+`check-refs:ignore` 这串字符 —— 哪怕只是解释这个标记怎么写 —— 那一行就**不再受函数名
+核对**。副作用有两个，本轮都撞上了：
+
+1. J14(4) 的豁免数把"提到标记名"的那一行也数了进去，于是
+   "本文 16 处 / J14 九行"实际是 **15 处 / 八处**（那一轮全仓库真标记 16 个：本文 15 +
+   `examples/bpf-programs/README.md` 第 141 行）。已在原文改回。
+2. phase7 勘误 29 的"同步修正"段原本要写"另有 5 处 `check-refs:ignore` 豁免"，一写
+   就把整段变成免检。改成只写 `check-refs:`，字符串不再命中，段的核对照常。
+
+要精确数列只能数**行尾**的完整标记：
+`grep -cE -- '<!-- check-refs:ignore --> *$' corrections.md`（本文 15，phase7 10）。
+本轮 phase7 新增的 10 处标记全部是行尾追加，那三个文件的行号漂移只来自内容改写本身。

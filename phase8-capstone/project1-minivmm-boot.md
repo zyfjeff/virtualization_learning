@@ -71,7 +71,7 @@ cmdline 建议：
 2. `KVM_SET_CPUID2`（case @ `x86.c:5957`）。推荐直接以
    `KVM_GET_SUPPORTED_CPUID` 的返回为底，只改下面几处，别整表重写：
    - **leaf1 ECX bit24 `X86_FEATURE_TSC_DEADLINE_TIMER` 必须保留**：
-     `kvm_update_cpuid()` 依它把 `timer_mode_mask` 设成 `3<<17`，否则只给
+     `kvm_vcpu_after_set_cpuid()` 依它把 `timer_mode_mask` 设成 `3<<17`，否则只给
      `1<<17`（`cpuid.c:399-402`）——guest 写 LVT Timer 的 deadline 位(bit18)
      会被 `lapic.c:2391` 掩掉，TSC-deadline 模式设不上。这是
      `../phase7-timer-virt/practice/` 实验 3 实测踩过的坑（该 README
@@ -168,7 +168,7 @@ cmdline 建议：
 | 内存 | `KVM_SET_USER_MEMORY_REGION` | `kvm_vm_ioctl_set_memory_region()` @ `kvm_main.c` |
 | vCPU | `KVM_CREATE_VCPU` | case @ `kvm_main.c:5170` |
 | kvm_run | `KVM_GET_VCPU_MMAP_SIZE` | case @ `kvm_main.c:5552` |
-| CPUID | `KVM_SET_CPUID2` | case @ `x86.c:5957` → `kvm_update_cpuid()`（`cpuid.c:399-402` 决定 `timer_mode_mask`） |
+| CPUID | `KVM_SET_CPUID2` | case @ `x86.c:5957` → `kvm_set_cpuid()`（`cpuid.c:457`）→ `kvm_vcpu_after_set_cpuid()`（`cpuid.c:399-402` 决定 `timer_mode_mask`） |
 | 寄存器 | `KVM_SET_REGS` / `KVM_SET_SREGS` | case @ `kvm_main.c:4516` / `kvm_main.c:4542` |
 | 串口退出 | `KVM_EXIT_IO` | `include/uapi/linux/kvm.h:148`；io 结构 :252-258 |
 | kvmclock | `WRMSR 0x4b564d01/0x4b564d00` | `kvm_guest_time_update()` @ `x86.c:3215`（常量 @ `kvm_para.h:52-53`） |
@@ -182,7 +182,7 @@ cmdline 建议：
    `kvm->created_vcpus`（`x86.c:7098-7099`）。顺序必须是
    VM → TSS/identity → irqchip → vCPU。
 2. **CPUID 缺 TSC-deadline 位，deadline 模式设不上**：
-   `kvm_update_cpuid()` 是 if/else（`cpuid.c:399-402`）——有该位
+   `kvm_vcpu_after_set_cpuid()` 是 if/else（`cpuid.c:399-402`）——有该位
    `timer_mode_mask = 3<<17`，没有则 `1<<17`（不是 0）。mask 只有
    `1<<17` 时，guest 写 LVT Timer 的 deadline 位(bit18)被 `lapic.c:2391`
    掩掉，TSC-deadline 模式设不上。只有**从未给 leaf1 建 CPUID 条目**

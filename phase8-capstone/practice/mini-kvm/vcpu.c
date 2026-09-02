@@ -636,7 +636,7 @@ static int mini_kvm_create_vcpu(struct mini_kvm *kvm, u32 id)
 	vcpu->vcpu_id = id;
 	vcpu->kvm = kvm;
 	vcpu->loaded_cpu = -1;
-	/* 必须在 anon_inode_getfd() 把 vCPU 交出去之前就位（kvm_main.c:484） */
+	/* 必须在 anon_inode_getfd()（kvm_main.c:4180）交出去之前就位（kvm_main.c:484） */
 	mutex_init(&vcpu->mutex);
 
 	vcpu->run_page = alloc_page(GFP_KERNEL | __GFP_ZERO);

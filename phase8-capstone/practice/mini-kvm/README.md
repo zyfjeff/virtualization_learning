@@ -84,7 +84,7 @@ WARN）。复现命令与逐步日志见 corrections.md J13。
 | `test-mini-kvm.c` | — | 用户态验收程序 | QEMU/crosvm 的 KVM 调用序列 |
 | `guest/guest.S`、`guest/guest.ld` | 3-5 | guest 裸机镜像：自建 IDT、串口输出、sti+hlt | — |
 | `stages/stage1..5.md` | — | 每个 Stage 的原理笔记（已按实现重写，`file:line` 由 `check-refs.py` 机械核对） | — |
-| `check-refs.py` | — | 把文档里所有 `file:line` 解析成原文打印，报越界/找不到 | — |
+| `check-refs.py` | — | 把文档里所有 `file:line` 解析并打印原文，报越界/找不到；省略文件名的续引用（`vmx.c:234、:249`）也认；再核对引用的函数名在 6.12.93 里是否真有定义、是否就在被引行附近（`inject_pending_event()` 这类"行号对、名字不存在"的错，见 corrections.md J13(5)/J14） | — | <!-- check-refs:ignore -->
 
 ## 3. 构建
 
