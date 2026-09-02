@@ -62,7 +62,8 @@ KVM_RUN                ──────────────→   guest 的
 mini_kvm` → `modprobe kvm_intel` 恢复（`/dev/kvm` 重新可打开，`KVM_GET_API_VERSION`
 = 12，`KVM_CREATE_VM` 成功）。这一趟抓到并修掉了两个前面所有静态审计轮都没发现的
 缺陷：**事件投递到一半 VM-Exit 后没人重投**（注入的 vector 静默消失）与 **guest 没
-有 GDT**（第一次投递就 `#GP(8)`），两条都记在 corrections.md J13。此前只能静态推演
+有 GDT**（第一次投递就 `#GP`：exit reason 0 + `VM_EXIT_INTR_INFO` 类型 3 /
+vector 13，用户态 `-EIO`），两条都记在 corrections.md J13。此前只能静态推演
 的两条路径也第一次被真实执行验证：VM-Exit 着陆点取 `vcpu` 指针的 `0x10` 偏移（J12(1)
 写错时第一次退出就宿主 #PF），以及外部中断分支的 STI 影子窗口（实测
 `extint=56` 按宿主 tick 节奏被消费干净，无退出风暴、无 soft lockup / RCU stall /

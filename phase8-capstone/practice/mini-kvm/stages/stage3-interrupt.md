@@ -389,6 +389,11 @@ mini-kvm: RUN 结束 exits=110 io=46 ept=6 hlt=2 extint=56 nmi=0 inj=1
 `io` 正好 +19，就是 `[IRQ 0x21 handled]\n` 的字节数，说明事件确实走到了
 `irq_handler`。
 
+反过来，`nmi=0` **不是**"NMI 路径验证通过"，而是它本轮根本没被执行：那一条要
+宿主在 guest 运行期间正好送进一发 NMI 才会走到，两次 RUN 里没有制造过 NMI。
+所以 `mini_vcpu_reinject_nmi()`（`interrupt.c:151-165`）至今只有静态证据，与
+`extint` 那条"专门编了个变体去撞它"的情况正好相反。
+
 `[IRQ 0x21 handled]` 说明 guest 真的走了 IDT 第 0x21 项
 （`irq_handler`），而不是兜底的 `irq_stub` —— 后者只会静默 `iretq`，串口什么
 都不会多。想验证注入失败的样子：换个 guest 没专门处理的 vector，串口只会多

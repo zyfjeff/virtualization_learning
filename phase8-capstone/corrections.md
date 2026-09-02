@@ -4,8 +4,9 @@
 > 给出正确信息与引用，并同步修正原文。所有行号基于 Linux 6.12.93、
 > QEMU 10.1.0-rc2；"实测"均指本机（宿主是**裸金属**，96 线程 —— 见 H 节，
 > 本文件旧版此处写反了）。A–I 节的结论都已在 `practice/minivmm.c` 里落地并
-> 跑通；**J 节是纯静态勘误**（源码 / 规范比对），mini-kvm 的真机 `insmod`
-> 验收尚未执行。
+> 跑通；**J 节的 J1–J12 是纯静态勘误**（源码 / 规范比对，当时 mini-kvm 从未
+> `insmod`），**J13 起已真机验收**：2026-09-02 首次 `insmod` + `test-mini-kvm`
+> 九步全过 rc=0，而 (1)(2) 两个缺陷恰恰是静态审计四轮全漏、上机才暴露的。
 
 ---
 
@@ -570,7 +571,7 @@ bit 24（本模块 `vmx.c:282`）。
 第 5 行原写「"实测"均指本机（宿主即一台 KVM guest，96 线程）」，与 H 节的
 复核结论（裸金属）冲突。已改为裸金属并注明见 H 节，同时声明 A–I 与 J 的
 验证强度不同：J 是静态勘误，**mini-kvm 的真机 `insmod` 与 `test-mini-kvm`
-验收尚未执行**。
+验收尚未执行**（末句到 J13 已过期，见文件头部）。
 
 ### J10. 本轮自己在引用上犯的三类错
 
@@ -639,6 +640,8 @@ bit 24（本模块 `vmx.c:282`）。
 `strings mini-kvm.ko | grep '^name='` 给出 `name=mini_kvm`，与上面的推导一致。
 仍未验证的是模块的**运行行为**——真机 `insmod` + `test-mini-kvm` 九步验收
 （见本文件开头对 J 节的说明）。
+> ⚠️ 此句只对 J10 当时成立：2026-09-02 的 **J13** 已执行这条验收（九步全过
+> rc=0），并由此暴露出静态审计全漏的两个缺陷，见 J13(1)(2)。
 
 ### J11. 静态审计轮：CR4 的"第二份副本"、guest CR4.VMXE，以及 §27.3.1.2 的两处过度概括
 
@@ -1316,7 +1319,7 @@ APICv 的传统路径，Posted 模式下 vIRR 与中断窗口两步都不发生"
 逐条重打原文核对，全部对得上。四种模式全部干净：
 
 ```bash
-./check-refs.py --quiet                        # README + 五篇 stage：154 条，0 问题
+./check-refs.py --quiet                        # README + 五篇 stage：155 条，0 问题
 ./check-refs.py --quiet --kernel --src         # 再解析内核树 + 本模块 .c/.S：287 条，0 问题
 ./check-refs.py --quiet --kernel ../../corrections.md   # 297 条，0 问题
 ./check-refs.py --quiet --kernel ../../../examples/bpf-programs/README.md
