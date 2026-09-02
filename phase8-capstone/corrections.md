@@ -834,7 +834,13 @@ stage 与 J1–J11 里出现的本地行号，都已按这一列刷新过。
 | `mini_handle_io_exit()`（stage4/J3） | `device.c:59-102` | `device.c:61-104` |
 
 `interrupt.c` 的四处（`55-71`、`59-63`、`91-105`、`96-99`）、`guest/guest.S:39-62`、
-`test-mini-kvm.c:9-19`、`vmx_entry.S:78` 本轮没有改动，重测仍然对得上。
+`test-mini-kvm.c:9-19`、`vmx_entry.S:78`（= `SYM_FUNC_START(mini_vmx_enter)`）本轮
+没有改动，重测仍然对得上。
+
+> ⚠️ 本表与上一句话都只对 J11 当时成立。下一轮（J12）又动了 `vcpu.c`、`device.c`
+> 与 `vmx_entry.S` 的注释，`vcpu.c:202-210 / 211-212 / 229-267 / 277-284 / 366-369`、
+> `device.c:33-56 / 61-104`、`vmx_entry.S:78` 全部再次漂移。当前有效值一律以
+> **J12(7)** 的重测表为准 —— 这就是 J10(a′) 说的"漂移是本项目最容易复发的错"。
 
 另外两处引用纪律的修正：`main.c:215-219` 那句原来写"打印**实测**的 CR0/CR4
 FIXED0/1"，本机 MSR 一个都读不到，措辞改成"运行时读到"；`vmx.c:287` 附近原来把
@@ -874,3 +880,208 @@ Vol.3C 27-8 页、guest CR4 那条 bullet 落在 27-9 页；Table 31-1 在 31-31
 "10897-10923"是**本机 `pdftotext -layout` 抽取结果**的行区间，不是卷内行号。
 本模块 `vmx.c` 里 msr-index.h 的范围写漏一行：`IA32_VMX_BASIC` 在 1182（不是
 1183），与上文 J11(6) 的 `1182-1200` 对齐。
+
+### J12. 用户态边界与世界切换的静态审计轮：一处会当场 oops 的栈偏移、一处 VM-Exit 风暴、四处过度声称
+
+本轮范围仍然是**不加载模块**（约束见 `practice/mini-kvm/README.md` 第 4 节：本机
+是共享裸金属，卸载 `kvm_intel` 会打断宿主上所有 VM），手段是 `make` +
+`objdump`/`nm`/`grep` + 逐条读源码与规范。下面 (1)(2) 两条是**会打死宿主**的缺陷，已同时补进 `practice/mini-kvm/README.md` 第 7 节（该节从三条扩到五条）。所有"会怎样"的判断都标成静态推演 +
+上游代码佐证，没有任何一条声称是本机实测到的运行时行为。
+
+#### (1) VM-Exit 落地点按 `8(%rsp)` 取 `@regs` —— 把 `launched` 的值当指针解引用
+
+`vmx_entry.S` 的退出路径原本是：
+
+```asm
+push %rax
+mov  8(%rsp), %rax        /* ← 错 */
+pop  REG_RAX(%rax)        /* 往 %rax 指向的地址写 8 字节 */
+```
+
+栈上的布局由**我们自己写进 `HOST_RSP` 的那个 `%rsp`** 决定。入口序言依次压入
+`rbp / r15..rbx / rdi(vcpu) / rsi(launched)`，随后 `mov %rsp,%rax; vmwrite %rax`
+（`HOST_RSP` 字段编码 `0x6c14`，见 `arch/x86/include/asm/vmx.h:381`），所以
+`HOST_RSP` 指向的**最低一格是 `launched`**，`vcpu` 在它上面一格。硬件在 VM-Exit
+时把 `%rsp` 恢复成 `HOST_RSP`，于是：
+
+| | `[rsp+0]` | `[rsp+8]` | `[rsp+16]` |
+|---|---|---|---|
+| 入口路径（`vmresume` 返回） | `launched` | `vcpu` | — |
+| 退出路径（刚 `push %rax` 暂存 guest RAX） | 暂存 RAX | `launched` | `vcpu` |
+
+入口路径按 `8(%rsp)` 取 `vcpu` 是对的；退出路径多了一格暂存，同一个偏移取到的是
+**`launched`（0 或 1）**，紧接着 `pop REG_RAX(%rax)` 就是往 `0x0 + offsetof(regs,
+REG_RAX)` / `0x1 + ...` 写 8 字节 —— 内核态解引用接近 NULL 的地址，第一次退出
+当场 #PF/oops。这不是"guest 数据写坏宿主内存"，是"把自己的栈槽位当成指针"。
+
+**为什么照抄 KVM 会抄错**：KVM 的 `mov WORD_SIZE(%_ASM_SP), %_ASM_AX`
+（`arch/x86/kvm/vmx/vmenter.S:203`，`WORD_SIZE` 定义在 `:12`）之所以是 8，是因为
+KVM 的 `HOST_RSP` 指向**它自己压的最后一格，而那格就是 `@regs`**：`push
+%_ASM_ARG2` 在 `:103`，紧接着 `lea (%_ASM_SP),%_ASM_ARG2; call
+vmx_update_host_rsp` 在 `:108-109`（`vmx_update_host_rsp()` 本体在
+`arch/x86/kvm/vmx/vmx.c:7231-7237`），所以暂存 RAX 之后 `@regs` 恰好在上面一格。
+本模块多压了 `launched`/`vcpu` 两格，差的是**两格不是 8 字节**。
+
+修法是把偏移写成宏并让两条路径各自显式引用，杜绝"同一个数字在两处含义不同"：
+`STACK_LAUNCHED`(=0) / `STACK_VCPU`(=8) 在 `vmx_entry.S:58-59`，入口路径用
+`STACK_VCPU(%rsp)`（`:119`），退出路径用 `STACK_VCPU+8(%rsp)`（`:172`，= 16），
+`SYM_INNER_LABEL_ALIGN(mini_vmx_vmexit, …)` 在 `:158`。反汇编是这一条唯一的判据：
+
+```
+$ make && objdump -d --no-show-raw-insn mini-kvm.ko | sed -n '/<mini_vmx_vmexit>:/,/pop/p' | head
+  90:	push   %rax
+  91:	mov    0x10(%rsp),%rax      ← 修复前是 0x8
+  96:	pop    (%rax)               ← regs[REG_RAX]，偏移 0
+```
+
+`git log -S 'mov  8(%rsp), %rax'` 显示这条错跟着拆分提交 `5ca02c1` 进来。拆分前的
+单文件版本（`examples/mini-kvm/mini-kvm.c`）**根本没有独立的世界切换汇编**：
+`HOST_RIP` 直接指向 C 函数里的 `vmx_exit_handler:` 标签，`asm volatile("vmresume")`
+裸写在函数体中，一个宿主 GPR 都不保存，也就没有 `@regs` 数组可取 —— 所以这条
+偏移是"新写的汇编第一次落地就带着的"，不存在"以前是对的、被改坏了"。同一段偏移的推演见 stage1「不加载模块也能做的静态自检」第 4 条与 `vmx_entry.S:165-171` 的注释。
+
+#### (2) `sti` 紧跟 `cli`：一个中断都不消费，然后就是 VM-Exit 风暴
+
+外部中断分支原本是：
+
+```c
+vcpu->n_extint_exits++;
+local_irq_enable();
+local_irq_disable();
+continue;
+```
+
+`sti` 的**中断影子（interrupt shadow）要到下一条指令执行完**才解除，紧跟一条
+`cli` 等于刚推开的门又关上 —— pending 在 LAPIC IRR 里的那个向量一个都没被
+消费。而本模块**没有**开 `VM_EXIT_ACK_INTR_ON_EXIT`（SDM 28.1：ack=0 时
+"the interrupt remains pending"，且 `VM_EXIT_INTR_INFO` 无效，28.2.2），于是
+下一次 VM entry 立刻又以原因 1 退出，形成**本地循环**：guest 不再推进，宿主这个
+CPU 的 tick 永远进不来（soft lockup / RCU stall）。这不是"性能差一点"，是把宿主
+的一个 CPU 锁死在退出循环里。
+
+上游的同一段代码已经把理由写在注释里：KVM 也是 `local_irq_enable()` +
+`local_irq_disable()`，中间夹一条 `++vcpu->stat.exits`，注释原文
+*"An instruction is required after local_irq_enable() to fully unblock interrupts
+on processors that implement an interrupt shadow, the stat.exits increment will do
+nicely"*（`arch/x86/kvm/x86.c:11149-11158`，三条语句分别在 `:11156`/`:11157`/
+`:11158`）。mini-kvm 用同一条占位：把 `vcpu->n_extint_exits++` 移进窗口
+（`vcpu.c:290-292`）。
+
+两点补充，都是查出来的而不是推的：
+
+- 计数器自增会不会被编译器挪出窗口？不会。`native_irq_enable()` /
+  `native_irq_disable()` 是带 `"memory"` clobber 的 `asm volatile("sti"/"cli")`
+  （`arch/x86/include/asm/irqflags.h:35-43`），窗口两边就是完整的内存屏障点，
+  对 `vcpu->...` 的写不可能跨过去重排。
+- **"中断影子"这条规则的原文不在本仓库这份 PDF 里。** `intel-vmx.pdf` 只含
+  Vol.3C（24-33 章），STI 的 `IF` 影子定义在 Vol.3A §22.x，本地无法复核，所以
+  stage3 与代码注释都**不写章节号**，只写"规则 + KVM 注释为证"（README 第 1 节
+  的编号纪律）。
+
+#### (3) `device.c` 声称"这里拿 sleeping lock 合法"——不合法
+
+上一轮给 `mini_serial_out()` 写的上下文注释是："运行循环的 IO 分支显式开了中断
+（对照 KVM 的 `handle_exit()`），所以这里 printk 与拿 sleeping lock 都合法"。
+后半句是错的，而且错在把 KVM 的一半抄了过来：
+
+| | 中断 | 抢占 | 结论 |
+|---|---|---|---|
+| KVM `vcpu_enter_guest()` 退出后 | `local_irq_enable()` `x86.c:11170` | `preempt_enable()` `x86.c:11171` | 完全回到进程上下文，**可以睡** |
+| mini-kvm 运行循环 | IO 分支的窗口里开 | **全程 `preempt_disable()`**（`vcpu.c:74` → `:383`） | 仍属原子上下文，不能拿 sleeping lock、不能阻塞分配 |
+
+也就是说 mini-kvm 只放开了 KVM 那两件事里的一半。顺带把 ept.c 只用 `GFP_ATOMIC`
+的理由挂在同一处（不是"怕关中断"，是因为整个循环都不可睡）。`printk` 本身仍然
+合法，但要用得上的证据说：控制台拿不到锁时走的是 trylock 路径
+`down_trylock_console_sem()`（`kernel/printk/printk.c:315-334`），阻塞版
+`down_console_sem()` 在 `:310-313` 且只在不处于原子上下文时被选到 —— 记录先进
+lockless 的 log buffer，刷新推迟。
+
+#### (4) 串口缓冲的三处过度声称
+
+| 原话 | 实际 | 依据 |
+|---|---|---|
+| "环形缓冲" | **线性**缓冲，写满 `MINI_KVM_SERIAL_SIZE - 1`（=511）后新字节静默丢弃 | `device.c:54-55` 的 `if (kvm->serial_len < MINI_KVM_SERIAL_SIZE - 1)`；`mini-kvm.h:33` |
+| "GET_SERIAL 可以把**整段**缓冲取回去" | `_IOR('M',0x01,char[256])` 只有 256 字节，且 `memcpy` 上限写死 255 → **只能拿到前 255 字节** | `mini-kvm.h:95`、`vcpu.c:699-709` |
+| "写者持 `kvm->lock` 串行化"（隐含） | 写者**不持任何锁**：唯一写者是运行循环，靠 `vcpu->mutex` 天然单写者；`GET_SERIAL` 那把锁只互斥读者，所以并发读会看到撕裂的一帧（但不会 UAF：`struct file` 的引用计数保证 `filp->private_data` 在这次 ioctl 期间不被 `close()` 释放） | `vcpu.c:408`、`:703-705` |
+
+`test-mini-kvm` 的 guest 总共只打两条字符串（`guest/guest.S:133`/`:135`）：
+27 + 19 = 46 字节，所以 255 截断不影响验收；
+这一点写进 stage4 的正文，避免读者以为"缓冲多大就能取回多少"。
+
+#### (5) `mmap` / `KVM_GET_VCPU_MMAP_SIZE` 的对照原先只有一句空壳
+
+原来 `mini_vcpu_mmap()` 上面的注释只写"对照 `kvm_vcpu_mmap()`：把 kvm_run 页映射
+给用户态"，两处都是不完整的：
+
+- 真实 KVM 的 `kvm_vcpu_mmap()`（`virt/kvm/kvm_main.c:4142-4154`）**不做任何映射**，
+  只装一个 `vm_ops`；真正建映射的是按 pgoff 分派的 `kvm_vcpu_fault()`
+  （`:4112-4136`：0 = `kvm_run`、`KVM_PIO_PAGE_OFFSET`、
+  `KVM_COALESCED_MMIO_PAGE_OFFSET`、dirty ring 各页，其余落到
+  `kvm_arch_vcpu_fault()`）。
+- `KVM_GET_VCPU_MMAP_SIZE` 在 x86 上返回的**不是一页而是三页**（run + pio data +
+  coalesced MMIO 环，`virt/kvm/kvm_main.c:5552-5561`）。用户态如果按"页"去 mmap
+  真实 KVM 的 vCPU fd，是拿不到全部窗口的。
+- 反面：越界 pgoff 在 x86 上得到的是 `VM_FAULT_SIGBUS`
+  （`arch/x86/kvm/x86.c:6344-6347` 就这一句 `return VM_FAULT_SIGBUS;`），
+  mini-kvm 因为一次性 `remap_pfn_range()`，只能在 `vcpu.c:442-445` 用 `-EINVAL`
+  提前挡（`vm_pgoff != 0` 或长度不是一页）。
+
+两条已补进 `vcpu.c` 的注释与 README 第 5 节的表格。
+
+#### (6) ioctl 编号是手抄两份的，改一侧不会编译报错
+
+`MINI_KVM_VM_GET_SERIAL` / `MINI_KVM_VCPU_INJECT_IRQ` 两个宏在 `mini-kvm.h:95`、
+`:98` 与 `test-mini-kvm.c` 各有一份（用户态程序不能 include 内核头）。编号差一位
+的失败模式是静默的 `-ENOTTY`，所以 README 第 5 节把实测编码写死作为锚点：
+`_IOR('M',0x01,char[256])` = **`0x81004d01`**、`_IOW('M',0x02,int)` =
+**`0x40044d02`**（用一个 `gcc -include linux/ioctl.h` 的三行宿主程序算出，与
+`KVM_RUN`=`0xae80`、`KVM_CREATE_VM`=`0xae01`、`KVM_CREATE_VCPU`=`0xae41` 同法）。
+另外 `KVM_RUN` 的 `arg` 非 0 必须拒（对照 `virt/kvm/kvm_main.c:4474-4475`），本模块
+在 `vcpu.c:412-415` 已经照做。
+
+测试程序的失败路径同时补了信息量：`run_until_exit()`（`test-mini-kvm.c:97-117`）
+原来只 `CHECK(r == 0, "KVM_RUN")`，errno 之外什么都不印；现在连 `errno` 和
+`run->exit_reason` 一起打印并提示看 dmesg —— 内核侧每条失败路径都会先填好
+`exit_reason` 再返回。
+
+#### (7) 行号漂移：本轮重测（第三次记录同一件事）
+
+本轮动过 `vcpu.c`（793 → 829）、`device.c`（104 → 120）、`vmx_entry.S`（226 → 248）、
+`test-mini-kvm.c`（207 → 219）。当前文件长度：`main.c` 504、`vmx.c` 822、`vcpu.c` 829、
+`ept.c` 261、`interrupt.c` 105、`device.c` 120、`vmx_entry.S` 248、`mini-kvm.h` 300、
+`test-mini-kvm.c` 219。
+
+| 引用点 | J11 表里的"现值" | 现为 |
+|---|---|---|
+| `mini_vcpu_run_loop()` | `vcpu.c:62` | `vcpu.c:67` |
+| `preempt_disable()` | `vcpu.c:69` | `vcpu.c:74`（配对的 `preempt_enable()` 在 `:383`） |
+| 上机段（stage5 来源块） | `vcpu.c:69-130` | `vcpu.c:74-137` |
+| 循环头 + 刷新 Host | `vcpu.c:138-157` | `vcpu.c:143-162` |
+| 注入窗口（stage3 来源块） | `vcpu.c:147-157` | `vcpu.c:152-162` |
+| `for (;;)` | `vcpu.c:132` | `vcpu.c:137` |
+| gs_shadow + 关中断窗口 | `vcpu.c:188-193` | `vcpu.c:193-197`（RFLAGS 注释在 `:198-205`） |
+| 进入失败分支 | `vcpu.c:202-210` | `vcpu.c:207-215` |
+| `launched` 置位 | `vcpu.c:211-212` | `vcpu.c:216-217` |
+| bit31 entry-failure 拦截 | `vcpu.c:229-267` | `vcpu.c:234-272` |
+| 外部中断窗口（含新注释） | — | `vcpu.c:275-293` |
+| NMI 转注分支 | `vcpu.c:277-284` | `vcpu.c:295-302` |
+| 收尾 `pr_debug` | `vcpu.c:366-369` | `vcpu.c:384-387` |
+| `mini_serial_out()` | `device.c:33-56` | `device.c:49-72`（上下文注释 `:31-48`） |
+| `mini_handle_io_exit()` | `device.c:61-104` | `device.c:77-120` |
+| `SYM_FUNC_START(mini_vmx_enter)` | `vmx_entry.S:78` | `vmx_entry.S:92` |
+
+未动的文件（`main.c`、`vmx.c`、`ept.c`、`interrupt.c`、`guest/guest.S`）本轮逐条
+重打原文核对，全部仍然对得上。核对手段仍然是脚本，且这轮给它补了两件事：
+
+```bash
+./check-refs.py --quiet                       # README + 五篇 stage：134 条，0 问题
+./check-refs.py --quiet --kernel --src        # 再解析内核树 + 本模块 .c/.S：262 条，0 问题
+./check-refs.py --quiet --kernel ../../corrections.md   # 228 条，0 问题
+```
+
+- 新增 `--src`：把被引用到的**本模块源文件**也一并解析打印，否则"只改文档没改
+  代码"和"两边都改了"这两种漂移在输出里长得一样。
+- 修掉一个自伤 bug：越界分支把"被引用文件的行数"赋给了累计计数器 `total`（现改名
+  `nlines`），一次越界会让统计总数变成最后那个文件的长度。
+- `--quiet` 下每条裸引用都刷一行"歧义"是噪音（63 行），改成在结尾汇总一次
+  （"N 条裸引用按内核树解析"）。
