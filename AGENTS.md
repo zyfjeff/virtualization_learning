@@ -17,8 +17,7 @@ phase6-vfio/            VFIO 设备直通
 phase7-timer-virt/      时钟虚拟化
 phase8-capstone/        毕业建造：最小 VMM
 phase9-performance/     性能测量方法论 + 独占机制 + 跨章结论索引
-phase10-debugging/       调试与测试
-phase11-microvm/        MicroVM 架构
+phase10-debugging/       KVM 运行时调试与诊断
 examples/  notes/  scripts/  shared/
 ```
 

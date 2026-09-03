@@ -23,7 +23,6 @@
 - ★ KVM性能优化技术：PLE 与超卖自救 (phase9) / halt-polling (phase0) / VPID (phase1) / APICv (phase4)
 - ★ 性能测量方法论：观测者扰动预算 + 跨 phase 结论索引 (phase9)
 - ★ KVM调试与测试 (ftrace, perf kvm stat, selftests, bpftrace)
-- ★ MicroVM架构专项 (启动路径, 最小设备模型, guest_memfd, 安全模型)
 
 ## 环境信息
 
@@ -104,12 +103,15 @@ kvm-study/
 │   ├── index.md                 ← 跨 phase 性能结论索引（A/B/C/D 可信度分级）
 │   ├── corrections.md           ← 本章勘误
 │   └── practice/                ← E1–E5 五个实验（md + 可直接跑的 bench-*.sh）
-├── phase10-debugging/           ← 第十阶段：KVM调试与测试
-│   ├── README.md                ← 调试场景速查 + 决策树
-│   └── annotations.md           ← trace events目录 + selftests + bpftrace
-├── phase11-microvm/             ← 第十一阶段：MicroVM架构专项
-│   ├── README.md                ← MicroVM技术栈全景
-│   └── annotations.md           ← 启动路径/设备模型/安全模型/guest_memfd
+├── phase10-debugging/           ← 第十阶段：KVM运行时调试与诊断
+│   ├── README.md                ← 场景驱动导航 + 决策树
+│   ├── annotations.md           ← trace events目录 + 12个bpftrace脚本
+│   ├── launch-failures.md       ← VM启动失败诊断
+│   ├── vcpu-exit-diagnosis.md   ← vCPU异常退出诊断
+│   ├── performance-analysis.md  ← 性能瓶颈定位
+│   ├── case-studies.md          ← 3个端到端案例
+│   ├── corrections.md           ← 11条常见错误
+│   └── practice/                ← 3个场景实验
 ├── examples/                    ← 可运行示例代码 (★ 重点!)
 │   ├── kvm-api-demo/            ← KVM API用户空间演示 (C语言)
 │   │   ├── kvm-demo.c           ← ★ 完整VM生命周期 (make && ./kvm-demo)
@@ -221,8 +223,7 @@ sudo bpftrace examples/bpf-programs/trace-vmexit.bpf
 | 7 | 时钟虚拟化 | 1周 | i8254.c, lapic.c(timer), x86.c(kvmclock) | ✓ | 3 个 practice 实验 |
 | 8 | ★ 毕业建造：最小 VMM | 持续 | 全部（KVM API 综合） | - | kvm-api-demo 起步 |
 | 9 | ★ 性能测量方法论 + 独占机制 + 结论索引 | 1-2周 | vmx.c(PLE), mmu.c(大页/PML), x86.c(主时钟), kvm_main.c(directed yield) | ✓ | bench-*.sh（E1–E5） |
-| 10 | ★ KVM调试与测试 | 1周 | trace.h, selftests/ | - | bpftrace 脚本集 |
-| 11 | ★ MicroVM架构专项 | 1-2周 | guest_memfd.c, nested.c | ✓ | Firecracker/Cloud Hypervisor |
+| 10 | ★ KVM运行时调试与诊断 | 1周 | trace.h, vmx.c(exit), x86.c(exception) | - | 3个场景实验 + bpftrace脚本集 |
 
 > 建议阅读顺序（子系统间依赖）：phase2 → **phase3(IOMMU)** → phase4 → phase6；
 > phase3 同时是 phase6(VFIO) 的地基。phase8 毕业建造建议放在 0-7 之后。
@@ -237,8 +238,8 @@ sudo bpftrace examples/bpf-programs/trace-vmexit.bpf
 - ✓ ★ 性能专题 (phase9): 测量纪律与观测者扰动预算 + 三块独占机制源码走读
   （PLE 与定向让出 / EPT 粒度与 PML / 主时钟与 TSC offset）+ E1–E5 可跑实验
   + 参数默认值唯一来源 + 跨章结论索引
-- ✓ ★ 调试与测试专题 (phase10): 完整 trace events 目录 + selftests + bpftrace
-- ✓ ★ MicroVM架构专项 (phase11): guest_memfd/jailer/启动路径优化
+- ✓ ★ 调试与测试专题 (phase10): 场景驱动的运行时诊断（启动失败/vCPU退出/性能瓶颈）
+  + 完整 trace events 目录 + 12 个 bpftrace 脚本 + 3 个场景实验 + 11 条勘误
 - ✓ 配套KVM调试实战指南 (`notes/debugging-guide.md`)
 - ✓ 所有 trace events 和函数行号均基于 6.12.93 实际源码验证
 
