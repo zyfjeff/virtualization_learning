@@ -408,16 +408,32 @@ echo 2 > /proc/irq/<irq_num>/smp_affinity
 ### 4. 优化CPU性能
 
 ```bash
-# 1. 绑定vCPU亲和性
-taskset -p 0x1 $QEMU_PID  # vCPU 0 → pCPU 0
-taskset -p 0x2 $QEMU_PID  # vCPU 1 → pCPU 1
+# 1. 绑定 vCPU 亲和性 —— ★ 要绑的是 vCPU **线程**的 TID，不是 QEMU 主进程
+#    （taskset -p $QEMU_PID 改的是主线程，vCPU 一个都没动）
+ls /proc/$QEMU_PID/task | while read -r tid; do
+    printf '%s\t%s\n' "$tid" "$(cat /proc/$tid/comm)"     # vCPU 线程 comm 形如 "CPU 0/KVM"
+done
+# grep -l 给的是 /proc/<tid>/comm 这个路径，要先把 TID 剥出来
+TID=$(grep -l 'CPU 0/KVM' /proc/$QEMU_PID/task/*/comm | sed 's|.*/task/||; s|/comm$||')
+taskset -pc 0 "$TID"        # vCPU 0 → pCPU 0（多个匹配时 $TID 是一串，用 for 逐个绑）
 
-# 2. 调整halt-polling
-echo 400000 > /sys/module/kvm/parameters/halt_poll_ns
+# 2. 调整 halt-polling 窗口（默认 200000 ns = 200 μs，KVM_HALT_POLL_NS_DEFAULT）
+cat  /sys/module/kvm/parameters/halt_poll_ns      # 先记原值
+echo 400000 > /sys/module/kvm/parameters/halt_poll_ns   # 0644，运行时可写
 
-# 3. 启用VPID
-echo 1 > /sys/module/kvm_intel/parameters/vpid
+# 3. VPID / APICv / EPT 这类**特性开关**运行时改不了：
+stat -c %a /sys/module/kvm_intel/parameters/vpid  # → 444，只读（module_param_named，
+                                                  #    arch/x86/kvm/vmx/vmx.c:90）
+#    要换就得 insmod 时传或写内核启动参数，改完必须重启 VM
 ```
+
+★ 上面第 2 条**未必有效**：本仓实测过 halt-polling 调参，空闲场景零收益、
+flood 场景买不到延迟反而多付 CPU，结论见
+[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2；
+逐参数的权限与原值见
+[`../phase9-performance/parameters.md`](../phase9-performance/parameters.md)。
+任何"优化"都要按 [`../phase9-performance/measurement.md`](../phase9-performance/measurement.md)
+的纪律**改前改后各测一遍**，别把建议当数据。
 
 ---
 

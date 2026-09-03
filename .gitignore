@@ -37,6 +37,9 @@ phase8-capstone/practice/mini-kvm/guest/guest.bin
 # phase8 自制 virtio-blk 后端测试盘（运行时自建 64MB）
 phase8-capstone/practice/blk.img
 
+# phase9 bench-*.sh 的实测结果目录（运行产物，换宿主就换一批）
+phase9-performance/practice/bench/
+
 # 9p 共享暂存区（只放拷进 guest 的产物）
 scripts/shared/*
 !scripts/shared/.gitkeep

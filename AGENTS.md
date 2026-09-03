@@ -16,7 +16,7 @@ phase5-virtio/          virtio / vhost / vhost-user
 phase6-vfio/            VFIO 设备直通
 phase7-timer-virt/      时钟虚拟化
 phase8-capstone/        毕业建造：最小 VMM
-phase9-performance/     性能优化
+phase9-performance/     性能测量方法论 + 独占机制 + 跨章结论索引
 phase10-debugging/       调试与测试
 phase11-microvm/        MicroVM 架构
 examples/  notes/  scripts/  shared/
@@ -112,6 +112,30 @@ int vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
 ```
 
 发现已有文档有错：在对应 phase 目录写 `corrections.md`，说明错误、给出正确信息与引用，并同步修正原文。
+
+### 性能内容的单一来源
+
+| 内容 | 唯一来源 | 其它章节怎么写 |
+|---|---|---|
+| 实测性能数字 | 该实验所属章节；跨章汇总在 `phase9-performance/index.md`（A/B/C/D 分级） | **只给指针，禁止复制数字**；没有实测就标"待实测" |
+| 模块参数默认值与权限 | `phase9-performance/parameters.md` | 只写"存在吗 / 运行时可改吗"+ `file:line`，不抄默认值 |
+| 测量方法（重复、噪声、观测者扰动、清场） | `phase9-performance/measurement.md` | 给指针 |
+
+三条硬约束：
+
+1. `tracing_on=0` **不等于**零开销。
+2. tracefs 是**全局**状态：`set_event`、`set_ftrace_filter`、`set_event_pid` **三个**文件上
+   带 `O_TRUNC` 的写（`echo x > file`、不带 `-a` 的 `tee`）都会先清掉**全部**已有配置 ——
+   `set_event` 清掉所有已启用事件（`kernel/trace/trace_events.c:2411` → `:2422-2423`）；
+   `set_ftrace_filter` 把 filter 换成只有本次写入的名字（`kernel/trace/ftrace.c:4536` →
+   `:4579-4581`，收尾 `:6438`/`:6478-6479`）；`set_event_pid` 清掉所有已有 PID
+   （`kernel/trace/trace_events.c:2432` → `:2442-2444`，但 `:2167-2168` 对空写直接返回，
+   所以纯 `: >` 截断就是干净清空）。加用 `>>`，清场要显式写并注明。
+   规则唯一来源：`phase9-performance/measurement.md` §5 第 3 条。
+3. `kvm:kvm_exit` 在 **trace 文本**里打的是符号名（`reason MSR_WRITE`），在 **BPF** 里
+   `args->exit_reason` 才是数字；6.12.93 **没有** `exit_reason_full` 这个字段。
+   按 `reason=[0-9]` 去 grep trace 永远抓不到东西。字段与译名链路唯一来源：
+   `phase10-debugging/annotations.md` §1.1。
 
 ## 常用命令
 

@@ -20,7 +20,8 @@
 - EPT页表管理 (并发、大页、脏页跟踪)
 - 中断虚拟化 (Posted Interrupts零VM-Exit)
 - vhost内核态加速 (数据面卸载)
-- ★ KVM性能优化技术 (halt-polling, VPID, APICv, PLE)
+- ★ KVM性能优化技术：PLE 与超卖自救 (phase9) / halt-polling (phase0) / VPID (phase1) / APICv (phase4)
+- ★ 性能测量方法论：观测者扰动预算 + 跨 phase 结论索引 (phase9)
 - ★ KVM调试与测试 (ftrace, perf kvm stat, selftests, bpftrace)
 - ★ MicroVM架构专项 (启动路径, 最小设备模型, guest_memfd, 安全模型)
 
@@ -95,10 +96,14 @@ kvm-study/
 │   ├── project2-minivmm-virtio.md← 自制 virtio-mmio 设备
 │   ├── project3-minivmm-vfio.md ← VFIO 直通进自己的 VMM
 │   └── project4-minivmm-bench.md← 与 QEMU/Firecracker 性能对标
-├── phase9-performance/          ← 第九阶段：KVM性能优化深入
-│   ├── README.md                ← 性能优化概览 + 调优参数
-│   ├── annotations.md           ← halt-polling/VPID/APICv/PLE源码注释
-│   └── practice/                ← EPT/时钟性能测量方法
+├── phase9-performance/          ← 第九阶段：性能测量方法论 + 独占机制 + 结论索引
+│   ├── README.md                ← 本章定位 + 文件清单 + 三条硬性规则
+│   ├── measurement.md           ← 测量纪律：重复/噪声/分辨率/观测者扰动/开跑前自检
+│   ├── parameters.md            ← ★ 参数默认值与权限的唯一来源（含"能不能运行时改"）
+│   ├── annotations.md           ← 三块独占机制：PLE与定向让出 / EPT粒度与PML / 主时钟
+│   ├── index.md                 ← 跨 phase 性能结论索引（A/B/C/D 可信度分级）
+│   ├── corrections.md           ← 本章勘误
+│   └── practice/                ← E1–E5 五个实验（md + 可直接跑的 bench-*.sh）
 ├── phase10-debugging/           ← 第十阶段：KVM调试与测试
 │   ├── README.md                ← 调试场景速查 + 决策树
 │   └── annotations.md           ← trace events目录 + selftests + bpftrace
@@ -215,7 +220,7 @@ sudo bpftrace examples/bpf-programs/trace-vmexit.bpf
 | 6 | VFIO设备直通 | 2-3周 | vfio_main.c, vfio_pci_core.c | ✓ | trace-vfio-dma.bpf |
 | 7 | 时钟虚拟化 | 1周 | i8254.c, lapic.c(timer), x86.c(kvmclock) | ✓ | 3 个 practice 实验 |
 | 8 | ★ 毕业建造：最小 VMM | 持续 | 全部（KVM API 综合） | - | kvm-api-demo 起步 |
-| 9 | ★ KVM性能优化深入 | 1-2周 | kvm_main.c(halt_poll), vmx.c(PLE) | ✓ | perf kvm stat |
+| 9 | ★ 性能测量方法论 + 独占机制 + 结论索引 | 1-2周 | vmx.c(PLE), mmu.c(大页/PML), x86.c(主时钟), kvm_main.c(directed yield) | ✓ | bench-*.sh（E1–E5） |
 | 10 | ★ KVM调试与测试 | 1周 | trace.h, selftests/ | - | bpftrace 脚本集 |
 | 11 | ★ MicroVM架构专项 | 1-2周 | guest_memfd.c, nested.c | ✓ | Firecracker/Cloud Hypervisor |
 
@@ -224,11 +229,14 @@ sudo bpftrace examples/bpf-programs/trace-vmexit.bpf
 
 **新增特性**：
 - ✓ 每章包含VMM视角对比，帮助理解KVM设计决策
-- ✓ 每章包含性能优化技术，指导实际调优
+- ✓ 每章包含性能优化技术，指导实际调优；**实测结论统一收在 phase9/index.md**，
+  按可信度分级，其他章节只留指针、不复制数字
 - ✓ 每章包含常见陷阱，避免踩坑
 - ✓ ★ IOMMU 专题 (phase3)：与 EPT 同一心智模型，8 问深入 + 三后端对照
 - ✓ ★ 毕业建造 (phase8)：从裸 KVM API 写可启动最小 VMM，逐级加 virtio/VFIO/性能对标
-- ✓ ★ 性能优化专题 (phase9): halt-polling/PLE/VPID 源码级分析
+- ✓ ★ 性能专题 (phase9): 测量纪律与观测者扰动预算 + 三块独占机制源码走读
+  （PLE 与定向让出 / EPT 粒度与 PML / 主时钟与 TSC offset）+ E1–E5 可跑实验
+  + 参数默认值唯一来源 + 跨章结论索引
 - ✓ ★ 调试与测试专题 (phase10): 完整 trace events 目录 + selftests + bpftrace
 - ✓ ★ MicroVM架构专项 (phase11): guest_memfd/jailer/启动路径优化
 - ✓ 配套KVM调试实战指南 (`notes/debugging-guide.md`)

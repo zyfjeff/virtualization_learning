@@ -3,6 +3,27 @@
 > 目标：测量 EPT 缺页处理路径、对比 4K/2M 页、量化脏页日志开销。
 > 理论背景见 `../../phase2-mem-virt/`；本文只给方法与已核实的观测点。
 
+> **⚠ 已废弃，保留作反面记录。** 可执行版本是
+> [`bench-huge-dirty.md`](bench-huge-dirty.md)（E2，含驱动脚本），
+> 保留本文只为让 [`../measurement.md`](../measurement.md) §4 规则 2 与
+> [`../corrections.md`](../corrections.md) D2 里"旧版怎么错"的引用还能翻到原文：
+>
+> * **实验 1 的设计本身不成立** —— function tracer 给每个命中函数插 `mcount` 调用，
+>   而缺页路径的热点函数就在 µs 量级，**观测开销与被测量同级**，跑出来测的是 tracer。
+>   E2 改成只用 `kvm:kvm_page_fault` 事件：按 `fault_address >> 21` 去重，
+>   "同一 2 MiB 块只出现 1 次 vs 出现 512 次"就是映射级别的判据；VM 侧另有
+>   `pages_4k` / `pages_2m` 两个即时计数器可作旁证
+>   （`STATS_DESC_ICOUNTER(VM, pages_4k)`，`arch/x86/kvm/x86.c:241-242`；
+>   ★ 6.12.93 的表里**没有** `mmu_expte`，也没有叫 `page_fault` 的项，
+>   vCPU 侧只有 `pf_taken` / `pf_fixed` / `pf_emulate` … 与总数 `exits`）。
+> * **下面实验 2 里"`kvm:kvm_page_fault` 事件携带 `level` 相关上下文"是错的**（D2）：
+>   `TRACE_EVENT(kvm_page_fault, …)`（`arch/x86/kvm/trace.h:402`）只有
+>   `vcpu_id` / `guest_rip` / `fault_address` / `error_code`，没有任何级别字段。
+> * **实验 3 把两笔账记成了一笔**：脏页跟踪除了写保护造成的退出，还会让新建映射
+>   **退到 4K** —— `kvm_mmu_hugepage_adjust()`（`arch/x86/kvm/mmu/mmu.c:3172`）
+>   开头就 `if (kvm_slot_dirty_track_enabled(slot)) return;`（`:3185-3186`），
+>   级别调整根本不执行；且 PML 开启时正常写入不退出。拆开的做法见 E2。
+
 **所用观测点在 6.12.93 中的位置**：
 
 | 观测点 | 位置 |

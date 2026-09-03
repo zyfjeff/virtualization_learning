@@ -7,6 +7,19 @@
 > 本文只给方法与观测点，**所有数字以实测为准**（旧版文档曾给出编造的
 > "典型值"表，已全部删除）。
 
+> **⚠ 实验 6 在 6.12.93 上不可执行，别照抄。** 6.12.93 只有
+> `lapic_timer_advance`（`bool`，`arch/x86/kvm/lapic.c:70-71`，0444 只读）与
+> per-vCPU 的 debugfs 只读文件 `lapic_timer_advance_ns`
+> （`debugfs_create_file("lapic_timer_advance_ns", 0444, …)`，
+> `arch/x86/kvm/debugfs.c:67`）—— **手动设固定提前量做不到**，
+> 那两行 `cat /sys/module/kvm/parameters/lapic_timer_advance_ns` 是宿主
+> 6.8.0-51 的布局（详见 [`../corrections.md`](../corrections.md) D1）。
+> 主时钟启停与 timer advance 的可执行版本是
+> [`bench-clock-master.md`](bench-clock-master.md)（E4，含驱动脚本）。
+> 其余实验（clocksource 读取延迟、cyclictest、TSC 多 CPU 同步）仍是有效的
+> **guest 侧手工手段**；机制与已实测的结论一律看 `../../phase7-timer-virt/`，
+> 本文不重复。
+
 ---
 
 ## 实验环境

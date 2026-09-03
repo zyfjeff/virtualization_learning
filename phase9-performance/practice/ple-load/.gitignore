@@ -1,0 +1,7 @@
+*.o
+*.ko
+*.ko.cmd
+.cache_cmd
+Module.symvers
+modules.order
+.module-common.o

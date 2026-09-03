@@ -202,6 +202,10 @@ QEMU: ioctl(vfio_fd, VFIO_IOMMU_MAP_DMA)
 
 ## 模块参数速查
 
+★ 本页只列**开机时能传什么**。逐个参数的默认值、运行时权限（多数是 `0444` 只读，
+`echo` 会失败）、能不能在一轮实验里连续扫 —— 权威表只有一份，在
+[`../phase9-performance/parameters.md`](../phase9-performance/parameters.md)。
+
 ### kvm_intel 关键参数
 ```
 ept=1           ← 启用EPT (Extended Page Tables)
@@ -211,22 +215,31 @@ enable_apicv=1  ← 启用APIC虚拟化
 enable_ipiv=1   ← 启用IPI虚拟化
 nested=1        ← 启用嵌套虚拟化
 pml=1           ← 启用脏页日志 (Page Modification Logging)
-ple_gap/ple_window ← PLE窗口参数
+ple_gap/ple_window ← PLE窗口参数（★ 开机后全只读，运行时改不了）
 ```
 
 ### kvm 关键参数
 ```
-halt_poll_ns=400000    ← HLT轮询时间(ns)
+halt_poll_ns=200000     ← HLT轮询窗口上限(ns)，KVM_HALT_POLL_NS_DEFAULT
 halt_poll_ns_grow=2    ← 增长倍数
 halt_poll_ns_grow_start=10000 ← 增长起始值(10μs)
-halt_poll_ns_shrink=2  ← 缩小除数
-nx_huge_pages=1        ← NX大页缓解
-mmio_caching=1         ← MMIO缓存
+halt_poll_ns_shrink=2  ← 缩小除数（★ 0 表示"一次失手就归零"）
+nx_huge_pages=auto     ← NX大页缓解；★ 不是布尔，只收 off/force/auto/never
+                         （arch/x86/kvm/mmu/mmu.c:87 module_param_cb；解析在 :7259，
+                          四个字符串分支 :7268-7284，最后才 `kstrtobool` 兜底）
+mmio_caching=1         ← MMIO缓存（`0444` 只读，arch/x86/kvm/mmu/spte.c:24）
 ```
 
 ---
 
 ## ★ Phase 9: 性能优化相关源码
+
+★ 本节只留"去哪找符号"的坐标。机制走读各有归属：halt-polling 在
+[`../phase0-kvm-framework/annotations.md`](../phase0-kvm-framework/annotations.md) §9，
+PLE / PML 与脏页 / 主时钟三块在
+[`../phase9-performance/annotations.md`](../phase9-performance/annotations.md) §1/§2/§3，
+参数表在 [`../phase9-performance/parameters.md`](../phase9-performance/parameters.md)，
+测量规范在 [`../phase9-performance/measurement.md`](../phase9-performance/measurement.md)。
 
 ### halt-polling
 ```
@@ -256,7 +269,9 @@ arch/x86/kvm/trace.h          ← kvm_pml_full trace event
 ### TSC 同步
 ```
 arch/x86/kvm/x86.c:2670-2783  ← __kvm_synchronize_tsc() / kvm_synchronize_tsc()
-arch/x86/kvm/x86.c:1951-1959  ← vmx_write_tsc_offset() / vmx_write_tsc_multiplier()
+arch/x86/kvm/vmx/vmx.c:1951-1960 ← vmx_write_tsc_offset() / vmx_write_tsc_multiplier()
+                                 （★ 只把 arch.tsc_offset / arch.tsc_scaling_ratio
+                                  写进 VMCS 两个字段，偏移的**计算**不在这里）
 arch/x86/kvm/trace.h          ← kvm_track_tsc, kvm_write_tsc_offset trace events
 ```
 
