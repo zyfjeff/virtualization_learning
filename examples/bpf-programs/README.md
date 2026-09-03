@@ -57,21 +57,46 @@ sudo bpftrace trace-vfio-dma.bpf        # 设备直通
 
 **内核映射**:
 - 追踪点: `kvm:kvm_exit` (定义于 `arch/x86/kvm/trace.h`)
-- 触发链: `vcpu_enter_guest()` → `vmx_handle_exit()` → `trace_kvm_exit()`
+- 触发链: `vcpu_enter_guest()` → `kvm_x86_call(vcpu_run)(vcpu, run_flags)`
+  (`arch/x86/kvm/x86.c:11079`) → `vmx_vcpu_run()` (`arch/x86/kvm/vmx/vmx.c:7344`)，
+  同一个函数体里 `trace_kvm_entry()` 在 `:7372`、VM-entry 返回后
+  `trace_kvm_exit()` 在 `:7489`。★ 两个事件都打在 **irqoff** 段内，
+  退出原因的分类处理（`vmx_handle_exit()`）还没开始；
+  `vmx_handle_exit_irqoff()` 是另一个函数（定义在 `vmx.c:7032`），
+  它**不**打印 `kvm_exit`。
 - exit_reason: 对应 Intel SDM Vol.3C Appendix C
 
-**退出原因速查**:
-| 原因码 | 名称 | 含义 | 频率 |
-|--------|------|------|------|
+**退出原因速查**（名称 = 内核打出的字符串，见 `arch/x86/include/uapi/asm/vmx.h`
+的值定义 `:32-95` 与字符串表 `VMX_EXIT_REASONS` `:96` 起）:
+
+| 原因码 | 名称 | 含义 | 典型负载下 |
+|--------|------|------|-----------|
 | 0 | EXCEPTION_NMI | 异常/NMI | 低 |
-| 1 | EXTERNAL_IRQ | 外部中断 | 高 |
-| 7 | INT_WINDOW | 中断窗口等待 | 中 |
+| 1 | EXTERNAL_INTERRUPT | 外部中断 | 高 |
+| 7 | INTERRUPT_WINDOW | 中断窗口等待 | 中 |
 | 10 | CPUID | CPUID 指令 | 中 |
 | 12 | HLT | HLT 指令 (空闲) | 中 |
 | 18 | VMCALL | Hypercall | 低 |
-| 24 | EPT_VIOLATION | EPT 缺页 | 最高 |
-| 25 | EPT_MISCONFIG | EPT 错误 | 罕见 |
-| 48 | MSR_WRITE | WRMSR | 低 |
+| 30 | IO_INSTRUCTION | IN/OUT | 模拟设备多时高 |
+| 31 | MSR_READ | RDMSR | 低 |
+| 32 | MSR_WRITE | WRMSR | 低 |
+| 40 | PAUSE_INSTRUCTION | PLE 触发 | 只有超卖自旋时才有 |
+| 48 | EPT_VIOLATION | EPT 缺页 | 内存热身上时最高，稳定后极低 |
+| 49 | EPT_MISCONFIG | EPT 保留位/权限配错 | 罕见（出现即 bug） |
+| 52 | PREEMPTION_TIMER | 抢占定时器到期 | 用到才非零 |
+| 62 | PML_FULL | PML 缓冲区满 | 脏页跟踪 + 写密集时高 |
+
+★ 本表旧版把 `EPT_VIOLATION` 写成 24、`EPT_MISCONFIG` 写成 25、`MSR_WRITE` 写成 48
+（24/25 根本不是这两个原因），登记在 `../../phase9-performance/corrections.md` F 节。
+
+★ 最后一列是**定性描述，不是实测**。真实的退出分布与单次退出成本（本仓 A 级数据）见
+`../../phase9-performance/index.md` §1.3；分布随负载变化极大，别把这张表当基准。
+
+★ 表里的**数字只在 BPF 侧成立**（`args->exit_reason` 是 VMCS 原始值）。ftrace 的 trace
+文本打的是**符号名** —— `reason MSR_WRITE`，不是 `reason=32`，按 `reason=[0-9]` 去 grep
+永远抓不到东西；6.12.93 也没有 `exit_reason_full` 这个字段。字段与译名链路的单一来源：
+`../../phase10-debugging/annotations.md` §1.1。本目录 `run-trace-vmexit.sh` 的汇总管线与
+名字映射表已按这条事实重写（登记在 `../../phase9-performance/corrections.md` D11）。
 
 **使用**:
 ```bash
@@ -83,7 +108,9 @@ sudo bash run-trace-vmexit.sh --pid 12345  # 追踪指定 VM
 sudo bpftrace -e 'tracepoint:kvm:kvm_exit { @exits[args->exit_reason] = count(); }'
 
 # ftrace
-echo kvm:kvm_exit | sudo tee /sys/kernel/debug/tracing/set_event
+#   ★ 必须 tee -a：tee 默认带 O_TRUNC，而 set_event 见到 O_TRUNC 会先清掉
+#     **所有**已启用事件（../../phase9-performance/measurement.md §5 第 3 条）
+echo kvm:kvm_exit | sudo tee -a /sys/kernel/debug/tracing/set_event
 sudo cat /sys/kernel/debug/tracing/trace_pipe
 ```
 
@@ -103,8 +130,13 @@ HPA (Host Physical Address)
 ```
 
 **内核映射**:
-- `handle_ept_violation()` → `kvm_mmu_page_fault()` → `kvm_tdp_page_fault()`
-- 追踪点: `kvm:kvm_exit` (reason=24), `kvm:kvm_page_fault`
+- `handle_ept_violation()`（`arch/x86/kvm/vmx/vmx.c:5782`）→ `__vmx_handle_ept_violation()`
+  （`arch/x86/kvm/vmx/common.h:9`，`:31` 调下一跳）→ `kvm_mmu_page_fault()`
+  （`arch/x86/kvm/mmu/mmu.c:6106`）→ `kvm_mmu_do_page_fault()`
+  （`arch/x86/kvm/mmu/mmu_internal.h:293`，`:326` 调下一跳）→ `kvm_tdp_page_fault()`
+  （`arch/x86/kvm/mmu/mmu.c:4726`）
+- 追踪点: `kvm:kvm_exit`（trace 文本里是 `reason EPT_VIOLATION`；BPF 里 `args->exit_reason`
+  才是数字 **48**，24 是 `VMRESUME`）、`kvm:kvm_page_fault`
 - 关键文件: `arch/x86/kvm/mmu/mmu.c`, `arch/x86/kvm/mmu/tdp_mmu.c`
 
 **使用**:
@@ -113,7 +145,7 @@ sudo bpftrace trace-ept-faults.bpf
 sudo bpftrace trace-ept-faults.bpf -p $(pidof qemu-system-x86)
 
 # ftrace 等效
-echo kvm:kvm_page_fault | sudo tee /sys/kernel/debug/tracing/set_event
+echo kvm:kvm_page_fault | sudo tee -a /sys/kernel/debug/tracing/set_event
 sudo cat /sys/kernel/debug/tracing/trace_pipe
 ```
 
@@ -208,7 +240,12 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 sudo bpftrace kvm-overview.bpf
 
 # ftrace 等效 (全量追踪)
-echo 'kvm:*' | sudo tee /sys/kernel/debug/tracing/set_event
+#   ★ `tee -a`（理由见本节 §1 的说明）。另外 `kvm:*` 全开**本身就是一次扰动**：
+#     每个退出都要落 buffer，耗时/延迟类数字已经不可信；连计数也可能因 buffer
+#     溢出而**静默偏低**（../../phase9-performance/measurement.md §4(c)）。
+#     这一档到底值多少开销，本仓不猜数字，由 E5 实测：
+#     ../../phase9-performance/practice/bench-observer-cost.md §3（O4 臂）
+echo 'kvm:*' | sudo tee -a /sys/kernel/debug/tracing/set_event
 sudo cat /sys/kernel/debug/tracing/trace_pipe
 
 # 或使用 trace-cmd 记录后分析

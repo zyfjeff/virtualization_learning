@@ -517,6 +517,121 @@ static bool vmx_can_use_vtd_pi(struct kvm *kvm)
 
 ---
 
+## 勘误 7：练习 2 的事件名、函数表里三个名字、以及三处会挂错文件的续引用
+
+发现时机：2026-09-03 做 `phase9-performance` 重设计时顺带核对（机制登记在
+`../phase9-performance/corrections.md` D10 / D11 / D12），三组都已改。
+
+### 错误 1：练习 2「DMA 映射跟踪」的三条 `set_event` 命令没有一条生效
+
+原文是 `echo iommu_map / iommu_unmap / vfio_iommu_type1 > set_event`。
+
+- `set_event` 收的是 **`system:event`**：iommu 那两个事件的名字就是 `map` / `unmap`
+  （`include/trace/events/iommu.h:79`、`:103`，`TRACE_SYSTEM iommu` 在 `:9`），
+  要写 `iommu:map`。宿主只读实测 `/sys/kernel/debug/tracing/events/iommu/` 下的目录名
+  正是 `map`、`unmap`、`add_device_to_group`、`remove_device_from_group`、
+  `attach_device_to_domain`、`io_page_fault`；`events/iommu/map/format` 的 `name:` 也是 `map`。
+- **`vfio_iommu_type1` 根本不是 trace system**：6.12.93 的 `include/trace/events/` 下
+  没有 `vfio.h`，宿主 `events/` 下也没有 `vfio*` 目录 —— 它只是模块名
+  （`drivers/vfio/vfio_iommu_type1.c`）。
+- 附带一条全局状态问题：第一条用 `>` 打开 `set_event` 带 `O_TRUNC`，会先清掉**全部**
+  已启用事件（`kernel/trace/trace_events.c:2411` → `:2422-2423`）。
+
+**修正**：练习 2 改为「`iommu:map` / `iommu:unmap` + function tracer 抓 VFIO 侧四个函数」
+—— `vfio_dma_do_map`（`vfio_iommu_type1.c:1548`）、`vfio_dma_do_unmap`（`:1270`）、
+`vfio_pin_map_dma`（`:1448`）、`vfio_iommu_type1_ioctl`（`:2991`），四个名字均在宿主
+`available_filter_functions` 里实测存在（模块 `vfio_iommu_type1`）。写法遵守
+`../phase9-performance/measurement.md` §5 第 3 条：显式清场 + 一个名字一次 `>>`，
+收尾补上 `current_tracer` / `set_ftrace_filter` / `set_event` 三个出口。
+
+### 错误 2：README「关键函数」表里三个名字/文件名在 6.12.93 里对不上
+
+| 原写法 | 6.12.93 实际 |
+|---|---|
+| `vfio_file_iommu_group()` @ `vfio_main.c` | 定义在 `drivers/vfio/group.c:839`（声明 `include/linux/vfio.h:300`），`vfio_main.c` 里没有 |
+| `vfio_pci_mmap` @ `vfio_pci_core.c` | 无此函数。真名 `vfio_pci_core_mmap()`（`drivers/vfio/pci/vfio_pci_core.c:1752`，ops 挂在 `vfio_pci.c:140`）；同前缀的只有 `vfio_pci_mmap_ops` `vfio_pci_core.c:1745` 与 `vfio_pci_mmap_{page,huge}_fault` `vfio_pci_core.c:1740`/`:1685` |
+| `kvm_vfio_group_add` @ `virt/kvm/vfio.c` | 无此函数。6.12 起 group 接口改成 file：`kvm_vfio_file_add()`（`virt/kvm/vfio.c:143`，dispatch `:277`），属性名 `KVM_DEV_VFIO_FILE_ADD`（`include/uapi/linux/kvm.h:1133`），`KVM_DEV_VFIO_GROUP_ADD` 只剩 uapi 兼容别名（`:1136-1140`） |
+
+**为什么危险**：这张表是「照着 grep 就能读到代码」的入口，名字错一个就整行失效；
+而 `kvm_vfio_group_add` 是**旧内核真有过**的名字，凭记忆写下来看着完全合理。
+
+**修正**：三行已按上表改写并补行号。
+
+### 错误 3（表述缺陷，非行号错）：1.4.2 里三处续引用会被挂到错误的文件上
+
+「所以 `lspci` 里某一跳…」与「第 2' 类为什么要读设备自己的位？」两段用了
+`:3649-3651`、`:3657-3659`、`:3693`、`:3671`、`:3681` 这种省略文件名的写法，本意都指
+`drivers/pci/pci.c`（行号与语义经逐行核对**全部正确**：`:3642-3651` 桥类无条件 false、
+`:3657-3659` Downstream/Root Port 读配置空间、`:3671` multifunction 判断、
+`:3681` return true、`:3693` `pci_acs_path_enabled()`）。但紧邻上文分别出现了
+`drivers/pci/probe.c:1940` 与 `include/uapi/linux/pci_regs.h:997`，按「最近提到的文件」
+去解析就会挂到那两个文件上并判定"行号越界"（`probe.c` 只有 3451 行、`pci_regs.h` 只有
+1195 行）—— 本仓 `../phase8-capstone/practice/mini-kvm/check-refs.py` 正是这么报的。
+
+**修正**：这三处补全成 `drivers/pci/pci.c:NNNN`（段内后续同文件的仍写 `pci.c:NNNN`）。
+教训：**续引用的"上文"必须是同一个文件**，中间插入别的文件就要重新写全路径。
+
+---
+
+## 勘误 8：验收时用 `??`（可疑）提示复核出来的三处既有缺陷
+
+发现时机：2026-09-03，跑 `../phase8-capstone/practice/mini-kvm/check-refs.py` 做本轮验收。
+这三条工具报的是 `??`（可疑）而不是 `!!`（错），**逐条回源码复核后确认前两条是真错、
+第三条是漏条件**，都已改。
+
+### 错误 1：1.4 节把一行代码归给了上一层函数
+
+- **错处**：`/* 来源: drivers/iommu/iommu.c:427 —— __iommu_probe_device() */`。
+- **正确**：`drivers/iommu/iommu.c:427` 就是 `group = ops->device_group(dev);`（行号没错），
+  但它所在的函数是 `iommu_init_device()`（定义 `:402`）；`__iommu_probe_device()` 定义在
+  `:513`，是在 `:544` 调 `iommu_init_device(dev, ops)` 才走到这行的。
+- **为什么危险**：读者按注释去 `__iommu_probe_device()` 函数体里找这行会找不到（该函数
+  从头到尾没有 `ops->device_group`），进而怀疑"分组不是这么划的"。
+- **修正**：注释改成 `iommu_init_device()`（定义 `:402`）并把调用关系一并写出。
+
+### 错误 2：1.5.6 两处裸 `iommu.c` 在 Intel 上下文里有歧义
+
+- **错处**：`device_block_translation()`（`iommu.c:3394`）、`info->ats_enabled` 被清成 0
+  （`iommu.c:1311`）。
+- **正确**：内核里有**两个** `iommu.c`，这两处指的都是 `drivers/iommu/intel/iommu.c`
+  —— `device_block_translation` 在 `drivers/iommu/iommu.c` 里**零命中**（真身
+  `drivers/iommu/intel/iommu.c:3394`）；`:1311` 正是 `iommu_disable_pci_caps()`
+  （定义 `:1300`）里的 `info->ats_enabled = 0;`。**行号本身全对，只有文件名会挂错。**
+- **为什么危险**：与勘误 7 错误 3 同类，但更隐蔽 —— 裸文件名不报"行号越界"
+  （两个 `iommu.c` 都够长），工具只能给 `??`，人眼则完全看不出问题，照着
+  `drivers/iommu/iommu.c:3394` 去读会读到毫不相干的代码。
+- **修正**：两处补成 `drivers/iommu/intel/iommu.c:3394` / `intel/iommu.c:1311`
+  并注明函数定义行。教训：**内核里有同名文件的（`iommu.c`、`main.c`、`vfio.c`）
+  一律写全路径，不留裸名。**
+
+### 错误 3（漏条件）：`domain_context_clear()` 那一步只在非 scalable mode 走
+
+- **错处**：时序表第 4 步写「`domain_context_clear()`（`:3413`）」，读起来像唯一路径。
+- **正确**：源码是 `if (sm_supported(iommu)) intel_pasid_tear_down_entry(…) else
+  domain_context_clear(info);`（`drivers/iommu/intel/iommu.c:3409-3413`），
+  scalable mode 下走 `intel_pasid_tear_down_entry()`（`:3410`）。
+- **为什么危险**：在开了 scalable mode 的机器上按这条路径挂 kprobe 会**一次都不命中**，
+  然后得出"Linux 没有倒置时序"的相反结论。
+- **修正**：表格里补上分支条件与另一支的行号。
+
+### 复核后判定为工具误报的四条（未改）
+
+| `??` 提示 | 复核结果 |
+|---|---|
+| `prepare_irte_posted()` @ `irq_remapping.c:1111` | 定义就在 `drivers/iommu/intel/irq_remapping.c:1111`，正确。工具是把 `posted_msi_supported()`（`:1377`、`:1469`）跟这个行号配了对 |
+| `vmx_deliver_interrupt()` @ `main.c:107` | `arch/x86/kvm/vmx/main.c:107` 正是 `.deliver_interrupt = vmx_deliver_interrupt,`，引的是**注册点**不是定义处（定义 `arch/x86/kvm/vmx/vmx.c:4299`），正确 |
+| `vmx_deliver_posted_interrupt()` @ `lapic.c:1352` | `arch/x86/kvm/lapic.c:1352` 正是 `kvm_x86_call(deliver_interrupt)(apic, …)`，引的是**调用点**（定义 `vmx.c:4269`），正确 |
+| `pci_acs_init()` @ `../../AGENTS.md:84` → `pci.c:3624` | 两个引用各自都对：`pci_acs_init()` 定义在 `drivers/pci/pci.c:3717`，在 `:3727` 调 `pci_enable_acs()` 才走到 `pci_std_enable_acs()`（`:1052`）；而 `:3624` 是 `ret = pci_dev_specific_acs_enabled(pdev, acs_flags);`，属于**陷阱 11** 引的调用点（所在函数 `pci_acs_enabled()` 定义 `:3620`）。工具把陷阱 13 提到的函数名配到了陷阱 11 的行号上 |
+
+教训：`check-refs.py` 的函数名核对只判"这个名字是否在被引文件里定义"，**引用注册点 /
+调用点 / 结构体成员赋值时它必然给 `??`**，这类提示要人工回源码看一眼再决定改不改，
+不能照单全收，也不能一律忽略。★ 还有一个来源：**相邻长条目会跨条错配** ——
+像 `AGENTS.md` 那种一条陷阱占一整行的写法，"上一条提到的函数名"会被安到
+"下一条的行号"上。所以 `??` 里的函数名与行号可能压根不属于同一句话，复核时先确认
+这两者是不是真的出自同一处引用。
+
+---
+
 ## 参考
 
 - 实验程序：`phase6-vfio/practice/`（说明见该目录 `README.md`）

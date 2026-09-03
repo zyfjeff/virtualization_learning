@@ -17,15 +17,23 @@
 #
 # ======================== 内核源码映射 ========================
 #   BPF C 内核部分: 见同目录 trace-vmexit.c
-#   追踪点: kvm:kvm_exit (arch/x86/kvm/trace.h)
-#   触发链: vcpu_enter_guest() -> vmx_handle_exit() -> trace_kvm_exit()
+#   追踪点: kvm:kvm_exit (arch/x86/kvm/trace.h:336)
+#   触发链 (6.12.93): vcpu_enter_guest()
+#     -> kvm_x86_call(vcpu_run)(vcpu, run_flags)  arch/x86/kvm/x86.c:11079
+#     -> vmx_vcpu_run()                          arch/x86/kvm/vmx/vmx.c:7344
+#        同一函数体内 trace_kvm_entry() 在 :7372、VM-entry 返回后 trace_kvm_exit() 在 :7489
+#     ★ 两个事件都打在 irqoff 段内；vmx_handle_exit_irqoff() (vmx.c:7032) 是另一个函数,
+#       它不打印 kvm_exit。
 #
 # ======================== bpftrace 等效命令 ========================
 #   bpftrace -e 'tracepoint:kvm:kvm_exit { @exits[args->exit_reason] = count(); }
 #   interval:s:5 { print(@exits, 10); clear(@exits); }'
 #
 # ======================== ftrace 等效命令 ========================
-#   echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event
+#   # set_event 上加事件用 >>: 带 O_TRUNC 的写会先清掉全部已启用事件
+#   # (kernel/trace/trace_events.c:2411 -> :2422-2423 调 ftrace_clear_events()),
+#   # 详见 ../../phase9-performance/measurement.md §5 第 3 条
+#   echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
 #   cat /sys/kernel/debug/tracing/trace_pipe
 
 set -euo pipefail
@@ -74,7 +82,10 @@ run_ftrace() {
     mount -t debugfs none /sys/kernel/debug/tracing 2>/dev/null || true
 
     # 清除之前的追踪配置
-    echo > /sys/kernel/debug/tracing/set_event
+    # ★ `: > set_event` 是**显式**清空全部事件（带 O_TRUNC 的写会先走
+    #   ftrace_clear_events()，kernel/trace/trace_events.c:2411 → :2422-2423）。
+    #   下面挂事件一律用 `>>`，否则又会把别人的探针顺手关掉。
+    : > /sys/kernel/debug/tracing/set_event
     echo > /sys/kernel/debug/tracing/trace
 
     # 设置 PID 过滤 (ftrace 使用 pid 过滤器)
@@ -84,7 +95,7 @@ run_ftrace() {
     fi
 
     # 启用 kvm_exit 事件
-    echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event
+    echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
 
     echo -e "${GREEN}开始追踪... 按 Ctrl+C 停止${NC}"
     echo -e "${YELLOW}--- 事件流 (按 exit_reason 统计请 Ctrl+C 后查看下方汇总) ---${NC}"
@@ -101,14 +112,21 @@ cleanup_ftrace() {
     echo -e "${CYAN}=== 汇总统计 ===${NC}"
 
     # 从 trace 文件提取统计
+    # ★ trace 行里**没有数字** reason：TRACE_EVENT_KVM_EXIT 的 TP_printk 打的是
+    #   `reason %s`，字符串由 kvm_print_exit_reason() 用 __print_symbolic() 译出
+    #   （arch/x86/kvm/trace.h:289-295、:325-328）。所以只能按符号名聚合，
+    #   `grep -oP 'reason=\K[0-9]+'` 永远抓不到东西（本仓 corrections 有登记）。
     if [[ -f /sys/kernel/debug/tracing/trace ]]; then
         echo "各 exit_reason 出现次数 (Top 10):"
         grep kvm_exit /sys/kernel/debug/tracing/trace 2>/dev/null | \
-            grep -oP 'reason=\K[0-9]+' | sort | uniq -c | sort -rn | head -10 || true
+            sed -n 's/.* reason \([^ ]*\).*/\1/p' | \
+            sort | uniq -c | sort -rn | head -10 || true
     fi
 
     # 清理
-    echo > /sys/kernel/debug/tracing/set_event
+    # ★ 这一句清的是**全宿主**的 set_event，不只是本脚本挂的那一个；
+    #   同机别人（或你上一轮）挂的探针会一起停，需要各自重新 `>>` 挂回。
+    : > /sys/kernel/debug/tracing/set_event
     echo > /sys/kernel/debug/tracing/set_event_pid
     echo -e "${GREEN}追踪已停止${NC}"
 }
@@ -116,7 +134,7 @@ cleanup_ftrace() {
 # ======================== 模式: bpftrace ========================
 run_bpftrace() {
     echo -e "${CYAN}=== bpftrace 模式: 追踪 KVM VM-Exit ===${NC}"
-    echo -e "${YELLOW}等效 ftrace: echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event${NC}"
+    echo -e "${YELLOW}等效 ftrace: echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event${NC}"
     echo ""
 
     if ! command -v bpftrace &>/dev/null; then
@@ -132,14 +150,17 @@ run_bpftrace() {
 /*
  * bpftrace 脚本: KVM VM-Exit 追踪
  *
- * KVM 内核路径:
- *   vcpu_enter_guest() -> vmx_handle_exit() -> trace_kvm_exit()
+ * KVM 内核路径 (6.12.93):
+ *   vcpu_enter_guest() -> kvm_x86_call(vcpu_run) (arch/x86/kvm/x86.c:11079)
+ *   -> vmx_vcpu_run() (arch/x86/kvm/vmx/vmx.c:7344)，trace_kvm_exit() 在 vmx.c:7489
  *
- * exit_reason 含义 (Intel SDM):
- *   0=EXCEPTION_NMI  1=EXTERNAL_IRQ  10=CPUID  12=HLT
- *   18=VMCALL  24=EPT_VIOLATION  25=EPT_MISCONFIG  48=MSR_WRITE
+ * exit_reason 含义 (arch/x86/include/uapi/asm/vmx.h:32-95):
+ *   0=EXCEPTION_NMI  1=EXTERNAL_INTERRUPT  10=CPUID  12=HLT  18=VMCALL
+ *   30=IO_INSTRUCTION  31=MSR_READ  32=MSR_WRITE  40=PAUSE_INSTRUCTION
+ *   48=EPT_VIOLATION  49=EPT_MISCONFIG  52=PREEMPTION_TIMER  62=PML_FULL
+ *   ★ args->exit_reason 是**数字**；trace 文本里打的是符号名（trace.h:289）
  *
- * ftrace 等效: echo kvm:kvm_exit > set_event && cat trace_pipe
+ * ftrace 等效: echo kvm:kvm_exit >> set_event && cat trace_pipe
  */
 
 tracepoint:kvm:kvm_exit
@@ -176,7 +197,7 @@ interval:s:5
 run_bcc() {
     echo -e "${CYAN}=== BCC 模式: 追踪 KVM VM-Exit ===${NC}"
     echo -e "${YELLOW}等效 bpftrace: bpftrace -e 'tracepoint:kvm:kvm_exit { @exits[args->exit_reason] = count(); }'${NC}"
-    echo -e "${YELLOW}等效 ftrace:   echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event${NC}"
+    echo -e "${YELLOW}等效 ftrace:   echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event${NC}"
     echo ""
 
     if ! python3 -c "import bcc" 2>/dev/null; then
@@ -201,14 +222,15 @@ BCC Python 用户态: KVM VM-Exit 追踪
 ====================================
 
 内核源码映射:
-  追踪点: kvm:kvm_exit (arch/x86/kvm/trace.h)
-  触发:   vcpu_enter_guest() -> vmx_handle_exit() -> trace_kvm_exit()
+  追踪点: kvm:kvm_exit (arch/x86/kvm/trace.h:336)
+  触发 (6.12.93): vcpu_enter_guest() -> kvm_x86_call(vcpu_run) (arch/x86/kvm/x86.c:11079)
+                  -> vmx_vcpu_run() (arch/x86/kvm/vmx/vmx.c:7344)，trace_kvm_exit() 在 :7489
 
 bpftrace 等效:
   bpftrace -e 'tracepoint:kvm:kvm_exit { @exits[args->exit_reason] = count(); }'
 
 ftrace 等效:
-  echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event
+  echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
   cat /sys/kernel/debug/tracing/trace_pipe
 """
 
@@ -219,7 +241,7 @@ from bcc import BPF
 
 # ======================== BPF C 内核代码 ========================
 # 此代码运行在内核态, 挂载到 kvm:kvm_exit 追踪点
-# 对应内核函数: vcpu_enter_guest() -> vmx_handle_exit()
+# 对应内核函数: vcpu_enter_guest() -> vmx_vcpu_run() (arch/x86/kvm/vmx/vmx.c:7344)
 BPF_PROGRAM = r"""
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
@@ -260,38 +282,100 @@ TRACEPOINT_PROBE(kvm, kvm_exit) {
 """
 
 # ======================== Exit Reason 名称映射 ========================
-# 来源: arch/x86/include/uapi/asm/kvm.h + Intel SDM Vol.3C Table C-1
+# 全表抄自 arch/x86/include/uapi/asm/vmx.h:32-95（与内核 VMX_EXIT_REASONS 字符串表
+# :96-158 同名），trace 文本里打的就是这些名字，两边对得上。
 EXIT_REASON_NAMES = {
-    0:  "EXCEPTION_NMI",      # 异常或 NMI 注入
-    1:  "EXTERNAL_IRQ",       # 外部中断 (物理 IRQ 到达)
-    2:  "TRIPLE_FAULT",       # 三重故障 (guest 崩溃)
-    3:  "INIT_SIGNAL",        # INIT 信号
-    4:  "SIPI_SIGNAL",        # SIPI 信号 (多核启动)
-    7:  "INT_WINDOW",         # 中断窗口打开 (等待递送中断)
-    8:  "NMI_WINDOW",         # NMI 窗口打开
-    9:  "TASK_SWITCH",        # 任务切换
-    10: "CPUID",              # CPUID 指令触发
-    12: "HLT",                # HLT 指令 (guest 空闲)
-    14: "WBINVD",            # WBINVD 指令
-    18: "VMCALL",             # VMCALL/VMMCALL (hypercall)
-    19: "TPR_BELOW_THRESHOLD",# TPR 低于阈值 (APIC 优化)
-    20: "APIC_ACCESS",        # APIC 内存访问
-    24: "EPT_VIOLATION",      # EPT 页表违规 (最常见!)
-    25: "EPT_MISCONFIG",      # EPT 配置错误 (通常是 bug)
-    26: "INVEPT",             # INVEPT 指令
-    28: "PREEMPT_TIMER",      # VMX preemption timer 到期
-    29: "INVVPID",            # INVVPID 指令
-    32: "APIC_WRITE",         # APIC 写操作 (VMX 虚拟APIC)
-    36: "ENCLS",              # ENCLS 指令 (SGX)
-    38: "PML_FULL",           # Page Modification Log 满
-    40: "XRSTORS",            # XRSTORS 指令
-    43: "UMWAIT",             # UMWAIT 指令
-    44: "TPAUSE",             # TPAUSE 指令
+    0:  "EXCEPTION_NMI",
+    1:  "EXTERNAL_INTERRUPT",
+    2:  "TRIPLE_FAULT",
+    3:  "INIT_SIGNAL",
+    4:  "SIPI_SIGNAL",
+    7:  "INTERRUPT_WINDOW",
+    8:  "NMI_WINDOW",
+    9:  "TASK_SWITCH",
+    10: "CPUID",
+    12: "HLT",
+    13: "INVD",
+    14: "INVLPG",
+    15: "RDPMC",
+    16: "RDTSC",
+    18: "VMCALL",
+    19: "VMCLEAR",
+    20: "VMLAUNCH",
+    21: "VMPTRLD",
+    22: "VMPTRST",
+    23: "VMREAD",
+    24: "VMRESUME",
+    25: "VMWRITE",
+    26: "VMOFF",
+    27: "VMON",
+    28: "CR_ACCESS",
+    29: "DR_ACCESS",
+    30: "IO_INSTRUCTION",
+    31: "MSR_READ",
+    32: "MSR_WRITE",
+    33: "INVALID_STATE",
+    34: "MSR_LOAD_FAIL",
+    36: "MWAIT_INSTRUCTION",
+    37: "MONITOR_TRAP_FLAG",
+    39: "MONITOR_INSTRUCTION",
+    40: "PAUSE_INSTRUCTION",
+    41: "MCE_DURING_VMENTRY",
+    43: "TPR_BELOW_THRESHOLD",
+    44: "APIC_ACCESS",
+    45: "EOI_INDUCED",
+    46: "GDTR_IDTR",
+    47: "LDTR_TR",
+    48: "EPT_VIOLATION",
+    49: "EPT_MISCONFIG",
+    50: "INVEPT",
+    51: "RDTSCP",
+    52: "PREEMPTION_TIMER",
+    53: "INVVPID",
+    54: "WBINVD",
+    55: "XSETBV",
+    56: "APIC_WRITE",
+    57: "RDRAND",
+    58: "INVPCID",
+    59: "VMFUNC",
+    60: "ENCLS",
+    61: "RDSEED",
+    62: "PML_FULL",
+    63: "XSAVES",
+    64: "XRSTORS",
+    67: "UMWAIT",
+    68: "TPAUSE",
+    74: "BUS_LOCK",
+    75: "NOTIFY",
+}
+
+# tracepoint 的 exit_reason 是 VMCS 原始值，高位可能带标志
+# （arch/x86/include/uapi/asm/vmx.h:29-30）。内核译名时先 `& 0xffff`，再用
+# __print_flags() 把高位按 VMX_EXIT_REASON_FLAGS 附加（arch/x86/kvm/trace.h:289-295）。
+# ★ VMX_EXIT_REASON_FLAGS 里**只有** FAILED_VMENTRY（vmx.h:160-161）；
+#   SGX_ENCLAVE_MODE 那个位虽在 vmx.h:30 定义，但没进这张表，__print_flags()
+#   对不认识的位直接打十六进制 —— 这里照内核的行为做，不自己发明名字。
+EXIT_REASON_FLAGS = {
+    0x80000000: "FAILED_VMENTRY",
 }
 
 def get_exit_name(reason):
-    """将 exit_reason 数值映射为可读名称"""
-    return EXIT_REASON_NAMES.get(reason, f"UNKNOWN({reason})")
+    """将 exit_reason 数值映射为可读名称（与 trace 文本同格式）"""
+    name = EXIT_REASON_NAMES.get(reason & 0xffff, f"UNKNOWN({reason & 0xffff})")
+    high = reason & ~0xffff
+    if not high:
+        return name
+    # trace_print_flags_seq()（kernel/trace/trace_output.c:65，由 __print_flags 宏
+    # include/trace/stages/stage3_trace_output.h:67-72 调用）：命中的位打名字并清掉
+    # （:74-87），剩下的位打十六进制（:89-94）
+    parts = []
+    for bit, flag_name in EXIT_REASON_FLAGS.items():
+        if high & bit == bit:
+            parts.append(flag_name)
+            high &= ~bit
+    if high:
+        parts.append(hex(high))
+    return " ".join([name] + parts)
 
 # ======================== 主程序 ========================
 running = True
@@ -323,7 +407,7 @@ def main():
     # 设置 PID 过滤
     if target_pid > 0:
         pid_map = b.get_table("target_pid")
-        pid_map[0] = bcc_targets = target_pid  # type: ignore
+        pid_map[0] = target_pid
         print(f"[+] PID 过滤: {target_pid}")
     else:
         print("[*] 追踪所有 KVM VM (未设置 PID 过滤)")
@@ -331,7 +415,7 @@ def main():
     print(f"\n[*] 开始追踪 kvm:kvm_exit... 按 Ctrl+C 停止")
     print(f"{'='*60}")
     print(f"  等效 bpftrace: bpftrace -e 'tracepoint:kvm:kvm_exit {{ @exits[args->exit_reason] = count(); }}'")
-    print(f"  等效 ftrace:   echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event")
+    print(f"  等效 ftrace:   echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event")
     print(f"{'='*60}\n")
 
     # 每秒轮询 BPF map 并输出统计
@@ -369,20 +453,30 @@ def main():
             rate = count - prev_counts.get(reason, 0)
             rate_str = f"{rate:,}/s" if rate > 0 else ""
 
-            # 为常见退出原因添加说明
+            # 为常见退出原因添加说明（原因码见 arch/x86/include/uapi/asm/vmx.h:32-95；
+            # 高位标志先掩掉，只比 basic exit reason）
             desc = ""
-            if reason == 24:
-                desc = "EPT缺页 → 需建立影子页表映射"
-            elif reason == 1:
-                desc = "物理中断 → 处理IRQ后VM-Entry"
-            elif reason == 12:
-                desc = "Guest空闲 → 可注入halt-exit优化"
-            elif reason == 10:
-                desc = "CPUID → KVM模拟CPU特性"
-            elif reason == 18:
-                desc = "Hypercall → Guest主动请求服务"
-            elif reason == 48:
-                desc = "WRMSR → MSR写入需KVM拦截处理"
+            basic = reason & 0xffff
+            if basic == 48:
+                desc = "EPT_VIOLATION → 补二级映射（TDP MMU）"
+            elif basic == 1:
+                desc = "EXTERNAL_INTERRUPT → 宿主处理 IRQ 后重新 VM-Entry"
+            elif basic == 12:
+                desc = "HLT → guest 空闲；轮询档位见 phase9-performance/parameters.md §1"
+            elif basic == 10:
+                desc = "CPUID → KVM 模拟 CPU 特性"
+            elif basic == 18:
+                desc = "VMCALL → guest 主动 hypercall"
+            elif basic == 30:
+                desc = "IO_INSTRUCTION → 端口 I/O 被拦截"
+            elif basic == 31:
+                desc = "MSR_READ → RDMSR 被拦截"
+            elif basic == 32:
+                desc = "MSR_WRITE → WRMSR 被拦截"
+            elif basic == 40:
+                desc = "PAUSE_INSTRUCTION → PLE 触发，handle_pause (vmx.c:5911)"
+            elif basic == 52:
+                desc = "PREEMPTION_TIMER → VMX preemption timer 到期"
 
             print(f"  {reason:<6} {name:<24} {count:>12,}  {rate_str:>10}  {desc}")
 

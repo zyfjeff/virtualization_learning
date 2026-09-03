@@ -48,7 +48,10 @@ if [ -n "$REMAPPED_SECTION" ]; then
     echo "$REMAPPED_SECTION"
     echo ""
 
-    REMAPPED_COUNT=$(echo "$REMAPPED_SECTION" | grep -c "^ *[0-9]" 2>/dev/null || echo "0")
+    # ★ `|| true` 而不是 `|| echo "0"`：grep -c 计数为 0 时**照样打印 0**、只是退出码为 1，
+    #   再 echo 一个 0 会让变量捕到两行 "0\n0"，下面的输出会多出一行裸 `0`。
+    #   出处：../../phase9-performance/corrections.md D13。
+    REMAPPED_COUNT=$(echo "$REMAPPED_SECTION" | grep -c "^ *[0-9]" 2>/dev/null || true)
     echo "  Remapped 模式 IRTE 数量: $REMAPPED_COUNT"
 else
     echo "  未找到 Remapped 模式 IRTE"
@@ -67,7 +70,8 @@ if [ -n "$POSTED_SECTION" ]; then
     echo "$POSTED_SECTION"
     echo ""
 
-    POSTED_COUNT=$(echo "$POSTED_SECTION" | grep -c "^ *[0-9]" 2>/dev/null || echo "0")
+    # ★ 同上：`|| true`，理由见上面 REMAPPED_COUNT 处的注释
+    POSTED_COUNT=$(echo "$POSTED_SECTION" | grep -c "^ *[0-9]" 2>/dev/null || true)
     echo "  Posted 模式 IRTE 数量: $POSTED_COUNT"
 else
     echo "  未找到 Posted 模式 IRTE"

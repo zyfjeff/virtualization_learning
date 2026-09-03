@@ -334,7 +334,7 @@ QEMU 两侧都靠**固件信息**绕开：
 **minivmm-tuned 阴性对照**：cmdline 追加 `8250.nr_uarts=1 i8042.nokbd
 i8042.noaux`，ready 1291.6 vs 1289.0 ms，无效。8250 那 253 ms 是
 `autoconfig_irq()` 逐端口探测、与端口数无关；`i8042.nokbd/noaux` 拦不住
-`i8042_probe()` 里无条件的 `i8042_controller_init()`（`i8042.c:1556`）。
+`i8042_probe()` 里无条件的 `i8042_controller_init()`（`drivers/input/serio/i8042.c:1556`）。
 结论：**cmdline 调参补不回缺失的固件信息**。
 
 反直觉点：minivmm 设备模型远小于 QEMU（无 PCI/ACPI/BIOS，首字节最快
@@ -346,8 +346,9 @@ guest 推上了 msleep 密集的 legacy 探测路径。与
 ### M2：VM-Exit 分布
 
 方法：`perf kvm stat record -a -- sleep 15` + `report`。`-a` 必须：不加时
-record 只跟踪被包裹进程（`builtin-kvm.c:1959`），vCPU 线程的退出全丢；
-数据写入 `perf.data.guest` 文件由 report 读取（`builtin-kvm.c:602-614`）。
+record 只跟踪被包裹进程（`tools/perf/builtin-kvm.c:1959-1960`），vCPU 线程的退出全丢；
+数据写入 `perf.data.guest` 文件由 report 读取（`tools/perf/builtin-kvm.c:602-613`，
+分支在 `:609`）。
 负载：boot（包裹 VMM 进程全程）、idle（shell 空转 15 s）、busy（guest 内
 `while :; do :; done` 15 s）。数据：`bench/exits-20260901-101641/`。
 
@@ -487,14 +488,21 @@ no-op 分支，`kvm_main.c:3865`）。数据：`bench/halt-20260901-110933/`。
 4. **phase9 优化在本场景的可测性**：
    - **halt-polling**：可测（M3）。本场景的正确结论是"默认参数即可，
      空闲场景可关"；它的收益形态是延迟↔CPU 的交换，不是单方面提升。
-   - **PLE**：单 vCPU、无超卖自旋，测不出；需要多 vCPU 超卖实验。
+     收益曲线的实测数据在 `../../phase9-performance/index.md` §1.2（本仓规则：
+     数字只放一处，这里只给指针），参数默认值/权限在
+     `../../phase9-performance/parameters.md` §1。
+   - **PLE**：单 vCPU、无超卖自旋，测不出；需要多 vCPU 超卖实验 ——
+     那一套的设计与判据在 `../../phase9-performance/practice/bench-ple.md`（E1），
+     且 `ple_*` 五个参数**全部 `0444` 只读**
+     （`arch/x86/kvm/vmx/vmx.c:204-219`），运行时改不了，只能重新 insmod + 重启 VM。
    - **VPID/大页**：KVM 默认开启/按需，对 VMM 透明，本规模无独立可测收益。
 
 ### 测量陷阱备忘（已固化进脚本）
 
 - `perf kvm stat record` 必须 `-a`，否则只跟踪被包裹进程、vCPU 线程退出
-  全丢（`builtin-kvm.c:1959` 仅 target 为空才默认 system-wide）；数据走
-  `perf.data.guest` 文件（`builtin-kvm.c:602-614`），与 tracefs 缓冲无关。
+  全丢（`tools/perf/builtin-kvm.c:1959-1960` 仅 target 为空才默认 system-wide）；
+  数据走 `perf.data.guest` 文件（`tools/perf/builtin-kvm.c:602-613`，分支在 `:609`），
+  与 tracefs 缓冲无关。
 - flood 字符总量必须 < guest busybox ash lineedit 行缓冲（约 1024 字节，
   宿主 pty 实测：超限时字符照收不回显），否则 flood 中途静默停摆、后续
   全部超时。`bench-halt.sh` 限 800 字符，且连续 3 次超时即中止。

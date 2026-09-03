@@ -11,21 +11,35 @@
 ```
 kvm:kvm_entry
   来源: arch/x86/kvm/trace.h:17
-  参数: vcpu_id, rip
+  参数: vcpu_id, rip, immediate_exit
   用途: 跟踪每次 VM-Entry
-  命令: echo kvm:kvm_entry > /sys/kernel/debug/tracing/set_event
+  命令: echo kvm:kvm_entry >> /sys/kernel/debug/tracing/set_event
 
 kvm:kvm_exit
-  来源: arch/x86/kvm/trace.h:336 (TRACE_EVENT_KVM_EXIT)
-  参数: vcpu_id, rip, exit_reason (数字), exit_reason_full (字符串)
+  来源: arch/x86/kvm/trace.h:336 (TRACE_EVENT_KVM_EXIT，宏体在 :297-331)
+  参数: exit_reason (数字), guest_rip, isa, info1, info2, intr_info,
+        error_code, vcpu_id —— 字段定义 :303-310
+  ★ 没有 exit_reason_full 这个字段（全树 grep 不到）；trace **文本**里打的是
+    符号名：TP_printk 是 `reason %s`（:325-330），字符串由 kvm_print_exit_reason()
+    先 `exit_reason & 0xffff` 查 VMX_EXIT_REASONS、再把高位标志按
+    VMX_EXIT_REASON_FLAGS 附上（:289-295；arch/x86/include/uapi/asm/vmx.h:96-158、
+    :160-161）。所以想按原因聚合 trace 文本要抓符号名，想拿数字走 BPF 的
+    args->exit_reason。
   用途: 跟踪每次 VM-Exit 及原因
-  命令: echo kvm:kvm_exit > /sys/kernel/debug/tracing/set_event
+  命令: echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
 
 kvm:kvm_userspace_exit
-  来源: include/trace/events/kvm.h
+  来源: include/trace/events/kvm.h:22
   参数: vcpu_id, exit_reason, ret
   用途: 跟踪返回用户空间的事件
 ```
+
+> ★ **上面以及本文所有 `set_event` 命令都用 `>>`**：以写方式打开 `set_event` 只要带
+> `O_TRUNC`（`echo x > file` 与不带 `-a` 的 `tee` 都是），内核会先
+> `ftrace_clear_events()` 把**全部**已启用事件清掉再处理本次写入
+> （`kernel/trace/trace_events.c:2411` → `:2422-2423`，函数定义 `:883`）。
+> 需要清场就显式写 `: > set_event`。规则的唯一来源：
+> `../phase9-performance/measurement.md` §5 第 3 条。
 
 ### 1.2 中断相关事件
 
@@ -86,9 +100,9 @@ kvm:kvm_ioapic_set_irq
 ```
 kvm:kvm_page_fault
   来源: arch/x86/kvm/trace.h:402
-  参数: vcpu_id, fault_address, error_code
+  参数: vcpu_id, guest_rip, fault_address, error_code（字段定义 :406-411）
   用途: ★ 最重要的内存事件，跟踪每次 EPT Violation
-  命令: echo kvm:kvm_page_fault > /sys/kernel/debug/tracing/set_event
+  命令: echo kvm:kvm_page_fault >> /sys/kernel/debug/tracing/set_event
 
 kvm:kvm_mmio
   来源: include/trace/events/kvm.h
@@ -149,24 +163,27 @@ kvm:kvm_wait_lapic_expire
 
 ```
 kvm:kvm_halt_poll_ns
-  来源: include/trace/events/kvm.h
+  来源: include/trace/events/kvm.h:347
   参数: grow (bool), vcpu_id, new (ns), old (ns)
-  用途: ★ halt-polling 窗口自适应跟踪
-  命令: echo kvm:kvm_halt_poll_ns > /sys/kernel/debug/tracing/set_event
+  用途: ★ halt-polling 窗口自适应跟踪（增长/收缩的打印点在
+        virt/kvm/kvm_main.c:3686 与 :3705）
+  命令: echo kvm:kvm_halt_poll_ns >> /sys/kernel/debug/tracing/set_event
 
 kvm:kvm_ple_window_update
-  来源: arch/x86/kvm/trace.h
+  来源: arch/x86/kvm/trace.h:978
   参数: vcpu_id, new, old
   用途: PLE 窗口变化跟踪
 
 kvm:kvm_pml_full
-  来源: arch/x86/kvm/trace.h
-  参数: vcpu_id, full_count
+  来源: arch/x86/kvm/trace.h:963
+  参数: vcpu_id —— **只有这一个**，没有 full_count（字段定义 :967-969，
+        TP_printk 是 "vcpu %d: PML full"）
   用途: PML buffer 满事件
 
 kvm:kvm_vcpu_wakeup
-  来源: include/trace/events/kvm.h
-  参数: vcpu_id, runnable, blocking
+  来源: include/trace/events/kvm.h:43
+  参数: ns, waited (bool), valid (bool) —— 没有 vcpu_id，也没有
+        runnable/blocking 这两个字段（字段定义 :47-51）
   用途: vCPU 唤醒事件
 ```
 
@@ -179,8 +196,10 @@ kvm:kvm_nested_vmenter
   用途: L1→L2 VM-Entry
 
 kvm:kvm_nested_vmexit
-  来源: arch/x86/kvm/trace.h
-  参数: vcpu_id, rip, exit_reason, exit_reason_full, l1_rsp
+  来源: arch/x86/kvm/trace.h:679（`TRACE_EVENT_KVM_EXIT(kvm_nested_vmexit)`，
+        宏体 :297-331）
+  参数: 与 kvm_exit **完全相同**（exit_reason, guest_rip, isa, info1, info2,
+        intr_info, error_code, vcpu_id）—— 没有 exit_reason_full，也没有 l1_rsp
   用途: L2→L1 VM-Exit
 
 kvm:kvm_nested_vmenter_failed
@@ -301,52 +320,75 @@ done
 
 ### 3.1 sysfs 模块参数 (`/sys/module/kvm*/parameters/`)
 
-```
-KVM 核心模块参数 (kvm):
-──────────────────────────────────────────────────────────────────
-halt_poll_ns              [uint]   全局 halt-polling 上限 (默认 400000ns)
-halt_poll_ns_grow         [uint]   增长倍数 (默认 2)
-halt_poll_ns_grow_start   [uint]   增长起始值 (默认 10000ns)
-halt_poll_ns_shrink       [uint]   缩小除数 (默认 2)
-tdp_mmu                   [bool]   启用 TDP MMU (默认 1)
-nx_huge_pages             [bool]   NX 大页缓解 (默认 1)
-nx_huge_pages_recovery_period_ms [uint] NX 大页恢复周期
-nx_huge_pages_recovery_ratio [uint] NX 大页恢复比例
-mmio_caching              [bool]   MMIO 缓存 (默认 1)
-eager_page_split          [bool]    eager 页分裂
-lapic_timer_advance_ns    [int]    LAPIC 定时器提前量 (默认自动)
-min_timer_period_us       [uint]   最小定时器周期
-kvmclock_periodic_sync    [bool]   kvmclock 定期同步
-pi_inject_timer           [bool]   PI 注入定时器
-tsc_tolerance_ppm         [uint]   TSC 容差 (ppm)
+★ **默认值不在这里**。逐参数的默认值、作用域与"能不能在一轮实验里连续扫"只有一份，
+在 [`../phase9-performance/parameters.md`](../phase9-performance/parameters.md) ——
+本节曾经抄了一份，抄出来的四个数**全是错的**（`halt_poll_ns` 写成 400000、
+`nx_huge_pages` 标成 `[bool] 默认 1`、列了一个根本不存在的 `lapic_timer_advance_ns`、
+`ple_window_shrink`/`ple_window_max` 两个默认值也不对），所以整段重做。
+本节只回答调试者真正要问的两件事：**这个参数存不存在**、**运行时能不能改**。
 
-Intel VMX 模块参数 (kvm_intel):
-──────────────────────────────────────────────────────────────────
-ept                       [bool]   ★ 启用 EPT (默认 1)
-eptad                     [bool]   ★ EPT A/D 位 (默认 1)
-vpid                      [bool]   VPID 支持 (默认 1)
-enable_apicv              [bool]   ★ APIC 虚拟化 (默认 1)
-enable_ipiv               [bool]   IPI 虚拟化 (默认 1)
-flexpriority              [bool]   TPR Shadow (默认 1)
-fasteoi                   [bool]   快速 EOI (默认 1)
-nested                    [bool]   ★ 嵌套虚拟化 (默认 1)
-pml                       [bool]   ★ PML 脏页日志 (默认 1)
-ple_gap                   [uint]   PLE gap (默认 128)
-ple_window                [uint]   PLE 窗口 (默认 4096)
-ple_window_grow           [uint]   PLE 窗口增长 (默认 2)
-ple_window_shrink         [uint]   PLE 窗口缩小 (默认 2)
-ple_window_max            [uint]   PLE 窗口上限 (默认 16384)
-enable_shadow_vmcs        [bool]   shadow VMCS (嵌套用)
-enlightened_vmcs          [bool]   Hyper-V enlightened VMCS
-emulate_invalid_guest_state [bool] 模拟无效 Guest 状态
-dump_invalid_vmcs         [bool]   dump 无效 VMCS (调试)
-allow_smaller_maxphyaddr  [bool]   允许较小的 MAXPHYADDR
-
-查看与修改:
-  cat /sys/module/kvm_intel/parameters/ept
-  echo 1 > /sys/module/kvm/parameters/halt_poll_ns
-  # 注意: 部分参数需要重启 KVM 模块才能生效
+```bash
+# 存在性：直接列，别照文档抄
+ls /sys/module/kvm/parameters/ /sys/module/kvm_intel/parameters/
+# 可写性：%a 是八进制权限，444 就是只读，echo 会 EPERM
+stat -c '%n  %a' /sys/module/kvm_intel/parameters/vpid
 ```
+
+### kvm 模块（★ = `0444` 只读，运行时改不了）
+
+```
+halt_poll_ns                    0644  virt/kvm/kvm_main.c:79
+halt_poll_ns_grow               0644  virt/kvm/kvm_main.c:84
+halt_poll_ns_grow_start         0644  virt/kvm/kvm_main.c:89
+halt_poll_ns_shrink             0644  virt/kvm/kvm_main.c:94   ← ★ 0 表示"一次失手就归零"
+tdp_mmu                       ★ 0444  arch/x86/kvm/mmu/mmu.c:112
+nx_huge_pages                   0644  arch/x86/kvm/mmu/mmu.c:87   ← ★ module_param_cb，
+                                         只收 off/force/auto/never（解析在 :7259，
+                                         分支 :7268-7284），**不是布尔**
+nx_huge_pages_recovery_ratio    0644  arch/x86/kvm/mmu/mmu.c:89
+nx_huge_pages_recovery_period_ms 0644 arch/x86/kvm/mmu/mmu.c:92
+mmio_caching                  ★ 0444  arch/x86/kvm/mmu/spte.c:24
+eager_page_split                0644  arch/x86/kvm/x86.c:194
+min_timer_period_us             0644  arch/x86/kvm/x86.c:161
+kvmclock_periodic_sync        ★ 0444  arch/x86/kvm/x86.c:164
+pi_inject_timer                 0644  arch/x86/kvm/x86.c:186
+tsc_tolerance_ppm               0644  arch/x86/kvm/x86.c:168
+```
+
+★ **`lapic_timer_advance_ns` 不是 kvm 模块参数**，`/sys/module/kvm/parameters/` 下没有它。
+6.12.93 里模块参数只有 `lapic_timer_advance`（`bool`，`arch/x86/kvm/lapic.c:70-71`，0444）；
+`lapic_timer_advance_ns` 是 **per-vCPU 的 debugfs 只读文件**
+（`arch/x86/kvm/debugfs.c:67`），**手动设固定提前量做不到**。
+★ 宿主内核可能与参考内核**恰好相反**（本机 6.8.0-51 有 `lapic_timer_advance_ns` 参数、
+没有 `lapic_timer_advance` bool），所以**先 `ls` 再写文档**。
+
+### kvm_intel 模块（这一组几乎全是 `0444`）
+
+```
+ept                           ★ 0444  arch/x86/kvm/vmx/vmx.c:99
+eptad                         ★ 0444  arch/x86/kvm/vmx/vmx.c:106
+vpid                          ★ 0444  arch/x86/kvm/vmx/vmx.c:90
+enable_apicv                  ★ 0444  arch/x86/kvm/vmx/vmx.c:114
+enable_ipiv                   ★ 0444  arch/x86/kvm/vmx/vmx.c:117
+flexpriority                  ★ 0444  arch/x86/kvm/vmx/vmx.c:96
+fasteoi                       ★ 0444  arch/x86/kvm/vmx/vmx.c:112
+nested                        ★ 0444  arch/x86/kvm/vmx/vmx.c:125
+pml                           ★ 0444  arch/x86/kvm/vmx/vmx.c:128
+ple_gap                       ★ 0444  arch/x86/kvm/vmx/vmx.c:204
+ple_window                    ★ 0444  arch/x86/kvm/vmx/vmx.c:207
+ple_window_grow               ★ 0444  arch/x86/kvm/vmx/vmx.c:211
+ple_window_shrink             ★ 0444  arch/x86/kvm/vmx/vmx.c:215
+ple_window_max                ★ 0444  arch/x86/kvm/vmx/vmx.c:219
+enlightened_vmcs              ★ 0444  arch/x86/kvm/vmx/vmx.c:536
+emulate_invalid_guest_state   ★ 0444  arch/x86/kvm/vmx/vmx.c:109
+dump_invalid_vmcs               0644  arch/x86/kvm/vmx/vmx.c:134
+allow_smaller_maxphyaddr      ★ 只读  arch/x86/kvm/vmx/vmx.c:149  （S_IRUGO）
+enable_shadow_vmcs            ★ 只读  arch/x86/kvm/vmx/nested.c:24（S_IRUGO）
+```
+
+**结论：想改 `kvm_intel` 那一组，只有 insmod 传参或内核启动参数一条路，改完要重启 VM。**
+运行时真能写的只有 `halt_poll_ns` 一族、`eager_page_split`、`min_timer_period_us`、
+`pi_inject_timer`、`tsc_tolerance_ppm`、`nx_huge_pages*`、`dump_invalid_vmcs`。
 
 ### 3.2 debugfs 接口 (`/sys/kernel/debug/kvm/`)
 
@@ -536,7 +578,8 @@ echo 0 > $TRACEFS/tracing_on
 TRACEFS=/sys/kernel/debug/tracing
 
 # 同时跟踪 trace events 和函数
-echo kvm:kvm_entry > $TRACEFS/set_event
+: > $TRACEFS/set_event                      # 显式清场（O_TRUNC 会清掉全部事件，§1.1 那条 ★）
+echo kvm:kvm_entry >> $TRACEFS/set_event
 echo kvm:kvm_exit >> $TRACEFS/set_event
 echo kvm:kvm_page_fault >> $TRACEFS/set_event
 
@@ -588,7 +631,8 @@ TRACEFS=/sys/kernel/debug/tracing
 echo > $TRACEFS/trace
 
 # 生命周期 tracepoints
-echo kvm:kvm_vcpu_wakeup > $TRACEFS/set_event      # include/trace/events/kvm.h:43
+: > $TRACEFS/set_event                             # 显式清场（见 §1.1 那条 ★）
+echo kvm:kvm_vcpu_wakeup >> $TRACEFS/set_event     # include/trace/events/kvm.h:43
 echo kvm:kvm_entry >> $TRACEFS/set_event           # arch/x86/kvm/trace.h:17
 echo kvm:kvm_exit >> $TRACEFS/set_event
 echo kvm:kvm_userspace_exit >> $TRACEFS/set_event  # include/trace/events/kvm.h:22
@@ -870,8 +914,12 @@ sudo bpftrace trace-vmexit-latency.bt
 sudo bpftrace -e 'tracepoint:kvm:kvm_exit { @exits[args->exit_reason] = count(); }'
 
 # 输出统计
+# ★ 只能聚合**数字** args->exit_reason：内核那套符号名是 TP_printk 里
+#   kvm_print_exit_reason() 用 __print_symbolic() 现译的（arch/x86/kvm/trace.h:289-295），
+#   BPF 侧拿不到；要名字就照 arch/x86/include/uapi/asm/vmx.h:32-95 自己映射，
+#   或者直接读 trace 文本里的 `reason <NAME>`。
 sudo bpftrace -e '
-tracepoint:kvm:kvm_exit { @reasons[args->exit_reason_full] = count(); }
+tracepoint:kvm:kvm_exit { @reasons[args->exit_reason] = count(); }
 interval:s:5 { print(@reasons, 10); clear(@reasons); }
 '
 ```

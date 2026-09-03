@@ -47,7 +47,12 @@ J10(a′)、J11(6)）。本脚本核对三件事：
 11000 行那份；反过来 `vmx.c:500` 两份都容得下，就停在本目录。所以想指名内核那一
 份必须写全路径（`arch/x86/kvm/vmx/vmx.c:3199`）；脚本把这类"落到非首选同名文件"
 的条数打进汇总（不判错），核对时扫一眼即可。写成绝对路径的引用（`/root/code/qemu…/x86-common.c:633`
-指 QEMU/DPDK 那几棵树）原样取文件，不拼本目录也不拼内核树。
+指 QEMU/DPDK 那几棵树）原样取文件，不拼本目录也不拼内核树。**带斜杠**的名字还会多试
+两个位置：当前文档自己的目录、以及本仓根目录（`ple-load/ple_load.c:48-51` 这种兄弟文件
+写法靠它）。裸名不补这两级，免得凭空多出一批同名候选打乱上面的择定顺序。
+函数名核对的写法约定：`foo()` 这种带空括号的形式**只留给内核函数**。脚本自带的
+shell helper 一律不带括号写（`event_on` / `filter_add`），否则 `--fn-strict` 会把它们
+当成对 6.12.93 的断言而判错。
 """
 
 import argparse
@@ -115,15 +120,21 @@ def module_sources():
 
 
 REPO_PREFIX = "practice/mini-kvm/"
+REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+DOC_DIR = HERE   # 正在扫的那份文档自己的目录，main() 每份文档重设
 # 内核树里文档常用的前缀（"vmx/vmx.c" 这种相对 arch/x86/kvm 的写法靠它兜住）
 KERNEL_DIRS = ("", "arch/x86/kvm/", "arch/x86/kvm/vmx/", "arch/x86/kvm/mmu/",
+               "arch/x86/kvm/svm/",
                "arch/x86/include/", "arch/x86/include/asm/",
                "arch/x86/include/uapi/asm/", "include/uapi/asm-generic/",
                "arch/x86/kernel/", "arch/x86/kernel/apic/", "arch/x86/kernel/cpu/",
                "include/linux/", "include/uapi/linux/",
-               "virt/kvm/", "kernel/", "mm/", "drivers/iommu/",
-               "drivers/iommu/intel/", "drivers/pci/", "drivers/pci/msi/",
-               "drivers/vfio/pci/", "drivers/tty/serial/", "drivers/tty/serial/8250/")
+               "virt/kvm/", "kernel/", "kernel/trace/", "mm/", "drivers/iommu/",
+               "drivers/iommu/intel/", "drivers/iommu/iommufd/",
+               "drivers/iommu/arm/arm-smmu-v3/", "drivers/irqchip/",
+               "drivers/pci/", "drivers/pci/msi/",
+               "drivers/vfio/", "drivers/vfio/pci/",
+               "drivers/tty/serial/", "drivers/tty/serial/8250/")
 
 
 def candidates(name):
@@ -149,6 +160,10 @@ def candidates(name):
         return out
     add(os.path.join(HERE, name), False)
     add(os.path.join(HERE, tail), False)
+    if "/" in name:
+        # 兄弟文件的写法（`ple-load/ple_load.c:48-51`）相对文档自己或仓根
+        add(os.path.join(DOC_DIR, name), False)
+        add(os.path.join(REPO_ROOT, name), False)
     for d in KERNEL_DIRS:
         add(os.path.join(KERNEL, d, name), True)
     if "/" in name:                          # 带目录的写法才去 QEMU/DPDK 那几棵树找
@@ -301,6 +316,28 @@ def doc_defs(doc):
     return names
 
 
+DIR_DEFS = {}
+
+
+def dir_defs():
+    """文档**同目录**的 C 源码里定义的名字。
+
+    工程代码通常就放在讲它的那份文档旁边（`phase8-capstone/practice/minivmm.c`
+    与 `practice/README.md`）。README 里 `service_vq()`、`build_mptable()` 这种
+    是自己 VMM 的函数，去内核树找定义只会产出"函数名不存在"的假错。
+    """
+    names = DIR_DEFS.get(DOC_DIR)
+    if names is None:
+        names = set()
+        if os.path.isdir(DOC_DIR):
+            for f in sorted(os.listdir(DOC_DIR)):
+                path = os.path.join(DOC_DIR, f)
+                if f.endswith((".c", ".h", ".S")) and os.path.isfile(path):
+                    names |= set(def_index(path))
+        DIR_DEFS[DOC_DIR] = names
+    return names
+
+
 def gap_to_ref(pos, refs):
     """同一行里，函数名与最近一条引用之间隔了多少个字符。"""
     a, b = pos
@@ -351,7 +388,7 @@ def check_fn_name(doc, lineno, pos, ident, line_refs, para_refs, bad_list,
                   suspect_list, strict, table=False, others=()):
     """核对 `ident()`：本段被引文件里得出现这个名字，且被引行得离它够近。"""
     if not any(ident in occurrences(r["path"]) for r in para_refs):
-        if ident in module_defs() or ident in doc_defs(doc):
+        if ident in module_defs() or ident in doc_defs(doc) or ident in dir_defs():
             return
         kind, hits = tree_find_definition(ident)
         where = ", ".join(f"{p}:{n}" for p, n in hits[:2])
@@ -386,6 +423,7 @@ def check_fn_name(doc, lineno, pos, ident, line_refs, para_refs, bad_list,
 
 
 def main():
+    global DOC_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", action="store_true",
                     help="把指向内核树的引用也打印出来（文件与行号照常核对）")
@@ -410,6 +448,7 @@ def main():
             print(f"!! 文档不存在: {doc}")
             bad += 1
             continue
+        DOC_DIR = os.path.dirname(os.path.abspath(doc_path))
         cache = {}
         para_file = None
         para = []            # 当前段落：[(行号, 原文, 本行解析出的引用)]

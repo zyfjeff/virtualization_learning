@@ -142,7 +142,8 @@ IOMMU 保证隔离性。
 启动时读 `/sys/kernel/iommu_groups/`，无法改变分组。
 
 ```c
-/* 来源: drivers/iommu/iommu.c:427 —— __iommu_probe_device() */
+/* 来源: drivers/iommu/iommu.c:427 —— iommu_init_device()（定义 :402）
+ * 调用关系: __iommu_probe_device()（:513）在 :544 调 iommu_init_device(dev, ops) */
 	group = ops->device_group(dev);
 ```
 
@@ -231,18 +232,18 @@ for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
 > —— `drivers/pci/pci.c:3612-3618`
 
 所以 `lspci` 里某一跳**完全没有** ACS capability，并不等于隔离不成立。但要看准是哪个条件在起作用：
-**决定「跳到 `:3681` 返回 true」的是 header type 的 multifunction 位**（`:3671`，
+**决定「跳到 `pci.c:3681` 返回 true」的是 header type 的 multifunction 位**（`pci.c:3671`，
 由 `drivers/pci/probe.c:1940` 从配置空间 `0x0e` bit7 读出），**PCIe 类型决定的是另一件事**
 —— 这一支到底读不读设备自己的 ACS 位。桥类即使在单功能下也照样 false，因为
-`:3649-3651` 在读 `multifunction` 之前就 return 了。所以不能简写成「单功能 ⇒ true」。
+`drivers/pci/pci.c:3649-3651` 在读 `multifunction` 之前就 return 了。所以不能简写成「单功能 ⇒ true」。
 
 第 2' 类为什么要读设备自己的位？因为**多功能设备内部的 func↔func 通路在 PCI 拓扑上是隐形的**
 —— 内核从 bus/slot 根本看不见第二个口，只能靠设备在配置空间自己声明
 （`PCI_ACS_DT`，"Direct Translated P2P"，`include/uapi/linux/pci_regs.h:997`）。
 这正是 [1.4.4 ②](#144-三种真正会并组的情形) 归并同 slot function 的前提。
 而单功能设备没有第二个口，问它 ACS 问不出任何信息 —— 它的横向转发决策点在上游的
-Downstream Port，那里由 `:3657-3659` 单独查。`return true` 的含义是**「本跳不提供信息」**，
-不是「本跳没有风险」；隔离性由 `pci_acs_path_enabled()`（`:3693`）逐跳问上去共同保证。
+Downstream Port，那里由 `drivers/pci/pci.c:3657-3659` 单独查。`return true` 的含义是**「本跳不提供信息」**，
+不是「本跳没有风险」；隔离性由 `pci_acs_path_enabled()`（`drivers/pci/pci.c:3693`）逐跳问上去共同保证。
 
 第 1 类也不是「四个 flag 必须全在 `ACSCtl` 里置位」那么简单。校验前先按设备**声明**的
 `ACSCap` 做一次掩码：
@@ -999,20 +1000,20 @@ Enabling and Disabling ATS"，两个小节都是 "Recommended Software Sequence"
 全部用 "should"（`intel-vtd.pdf` Section 4.5 / 4.5.1 / 4.5.2）；开头一句是
 "It is **strongly recommended** that software quiesce DMA operations from the device
 before programming the required bits."，而 Linux 侧
-`device_block_translation()`（`iommu.c:3394`）的真实顺序是：
+`device_block_translation()`（`drivers/iommu/intel/iommu.c:3394`）的真实顺序是：
 
 | 步骤 | 规范 §4.5.2 | Linux 6.12.93 实际 |
 |---|---|---|
 | 1 quiesce DMA | 由软件负责 | **不在这个函数里**，`device_block_translation()` 只做 2/3/4 |
-| 2 清 `E` 位 | 第 2 步 | `iommu_disable_pci_caps()`（`:3407` → 定义 `:1300`）→ `pci_disable_ats()` |
-| 4 改 context entry | **第 4 步** | `domain_context_clear()`（`:3413`）—— **排在第 3 步之前** |
+| 2 清 `E` 位 | 第 2 步 | `iommu_disable_pci_caps()`（调用点 `intel/iommu.c:3407` → 定义 `:1300`）→ `pci_disable_ats()` |
+| 4 改 context entry | **第 4 步** | `domain_context_clear()`（`:3413`）—— **排在第 3 步之前**；★ 这是 `:3409-3413` 那个 `if (sm_supported(iommu)) … else …` 的 **else** 分支，scalable mode 下走的是 `intel_pasid_tear_down_entry()`（`:3410`） |
 | 3 global DevTLB Invalidate + Wait | 第 3 步 | 在 `intel_context_flush_present()` 末尾的 `__context_flush_dev_iotlb()`（`pasid.c:971` → 定义 `:885`，实际下发 `qi_flush_dev_iotlb()` @ `:898`）|
 
 也就是说，Linux 把「先失效设备缓存、再关 context」倒成了「先关 context，再走一遍
 统一的 context 失效路径」。跟在这个倒置后面的是一个更要命的细节：
 `__context_flush_dev_iotlb()` 开头有道门控 —— `if (!info->ats_enabled) return;`
 （`pasid.c:887-888`），而 `info->ats_enabled` 在第 2 步里已经被
-`iommu_disable_pci_caps()` 清成了 0（`iommu.c:1311`）。**这条 Device-TLB 失效在
+`iommu_disable_pci_caps()` 清成了 0（`intel/iommu.c:1311`，函数定义 `:1300`）。**这条 Device-TLB 失效在
 detach 路径上是否会真的下发，取决于走到这里时那个标志的状态；源码注释没有解释这一层，
 本节也不推断。** 想确认的话，只能在 `qi_flush_dev_iotlb()` 上挂 kprobe 实测。
 
@@ -1765,12 +1766,12 @@ Guest 侧中断计数 +629，而宿主 `/proc/interrupts` 上对应的三个 IRQ
 | `pci_enable_pasid()` | `drivers/pci/ats.c:395` | 前置 `pci_acs_path_enabled(RR+UF)` 判断在 `ats.c:419` |
 | `cache_tag_flush_devtlb_psi()` | `drivers/iommu/intel/cache.c:390` | 把 Device-TLB 失效排进 qi batch |
 | `iommu_group_claim_dma_owner()` | `drivers/iommu/iommu.c:3214` | 认领组的 DMA ownership，组内有普通驱动则 `-EPERM`（判断在 `:3222`） |
-| `vfio_file_iommu_group()` | `vfio_main.c` | 获取文件的 IOMMU 组 |
+| `vfio_file_iommu_group()` | `drivers/vfio/group.c:839` | 获取文件的 IOMMU 组（声明在 `include/linux/vfio.h:300`；★ 不在 `vfio_main.c`） |
 | `vfio_dma_do_map()` | `vfio_iommu_type1.c` | DMA 映射操作 |
 | `vfio_pin_pages_remote()` | `vfio_iommu_type1.c` | 固定用户页面 |
 | `vfio_pci_core_enable()` | `vfio_pci_core.c` | 启用 PCI 设备直通 |
-| `vfio_pci_mmap()` | `vfio_pci_core.c` | 映射设备 MMIO |
-| `kvm_vfio_group_add()` | `virt/kvm/vfio.c` | 添加 VFIO 组到 KVM |
+| `vfio_pci_core_mmap()` | `drivers/vfio/pci/vfio_pci_core.c:1752` | 映射设备 MMIO（ops 挂在 `drivers/vfio/pci/vfio_pci.c:140`；★ 6.12.93 里没有 `vfio_pci_mmap` 这个函数，同前缀的只有 `vfio_pci_mmap_ops` `vfio_pci_core.c:1745` 与 `vfio_pci_mmap_{page,huge}_fault` `vfio_pci_core.c:1740`/`:1685`） |
+| `kvm_vfio_file_add()` | `virt/kvm/vfio.c:143` | 把 VFIO **file** 加进 KVM（dispatch `virt/kvm/vfio.c:277`；★ 不叫 `kvm_vfio_group_add` —— 6.12 起属性名是 `KVM_DEV_VFIO_FILE_ADD`，`KVM_DEV_VFIO_GROUP_ADD` 只是 uapi 兼容别名，`include/uapi/linux/kvm.h:1133`、`:1136-1140`） |
 | `kvm_vfio_update_coherency()` | `virt/kvm/vfio.c` | 更新 DMA 一致性 |
 | `vfio_pci_set_msi_trigger()` | `vfio_pci_intrs.c` | `SET_IRQS` 的 MSI/MSI-X 入口 |
 | `vfio_msi_set_vector_signal()` | `vfio_pci_intrs.c:447` | 单向量装配：`request_irq` + 注册 producer |
@@ -1820,9 +1821,27 @@ echo "8086 1533" > /sys/bus/pci/drivers/vfio-pci/new_id
 
 ```bash
 # 跟踪 IOMMU DMA 映射操作
-echo iommu_map > /sys/kernel/debug/tracing/set_event
-echo iommu_unmap >> /sys/kernel/debug/tracing/set_event
-echo vfio_iommu_type1 >> /sys/kernel/debug/tracing/set_event
+# ★ set_event 里写的是 **system:event**：iommu 的事件名就是 `map` / `unmap`
+#   （include/trace/events/iommu.h:79、:103；宿主 `events/iommu/` 下的目录名同名）。
+#   `iommu_map` 这种拼法在内核里不存在，写进去直接失败。
+# ★ 清场要**显式**：带 O_TRUNC 的写（`echo x > file`、不带 -a 的 tee）会先把
+#   **全部**已启用事件清掉，只想加事件一律 `>>`
+#   （../phase9-performance/measurement.md §5 第 3 条）。
+: > /sys/kernel/debug/tracing/set_event
+echo iommu:map   >> /sys/kernel/debug/tracing/set_event
+echo iommu:unmap >> /sys/kernel/debug/tracing/set_event
+
+# ★ `vfio_iommu_type1` **不是 trace system**：6.12.93 的 include/trace/events/ 下
+#   没有 vfio.h，宿主 events/ 里也没有 vfio 目录 —— 那一行以前是写不进去的。
+#   要看 VFIO 侧的 DMA map/unmap，走 function tracer（四个函数名均在
+#   drivers/vfio/vfio_iommu_type1.c，宿主 available_filter_functions 实测存在）：
+echo function > /sys/kernel/debug/tracing/current_tracer
+: > /sys/kernel/debug/tracing/set_ftrace_filter
+# 一个名字一次 `>>`：一次写多个时，第一个匹配不上的会中止本次 write，后面的连带丢失
+echo vfio_dma_do_map        >> /sys/kernel/debug/tracing/set_ftrace_filter  # :1548
+echo vfio_dma_do_unmap      >> /sys/kernel/debug/tracing/set_ftrace_filter  # :1270
+echo vfio_pin_map_dma       >> /sys/kernel/debug/tracing/set_ftrace_filter  # :1448
+echo vfio_iommu_type1_ioctl >> /sys/kernel/debug/tracing/set_ftrace_filter  # :2991
 
 echo 1 > /sys/kernel/debug/tracing/tracing_on
 
@@ -1831,6 +1850,11 @@ echo 1 > /sys/kernel/debug/tracing/tracing_on
 
 echo 0 > /sys/kernel/debug/tracing/tracing_on
 cat /sys/kernel/debug/tracing/trace
+
+# 收尾：tracefs 是全局状态，四个出口分别清
+echo nop > /sys/kernel/debug/tracing/current_tracer
+: > /sys/kernel/debug/tracing/set_ftrace_filter
+: > /sys/kernel/debug/tracing/set_event
 ```
 
 ### 练习 3：分析 IOMMU 域

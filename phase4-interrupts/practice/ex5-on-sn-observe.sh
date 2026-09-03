@@ -85,10 +85,17 @@ echo 0 > "$TRACE_DIR/tracing_on"
 TRACE_OUTPUT=$(cat "$TRACE_DIR/trace")
 
 # 分析结果
-APICV_COUNT=$(echo "$TRACE_OUTPUT" | grep -c "kvm_apicv_accept_irq" 2>/dev/null || echo "0")
-ENTRY_COUNT=$(echo "$TRACE_OUTPUT" | grep -c "kvm_entry" 2>/dev/null || echo "0")
-EXIT_COUNT=$(echo "$TRACE_OUTPUT" | grep -c "kvm_exit" 2>/dev/null || echo "0")
-EXT_INTR_COUNT=$(echo "$TRACE_OUTPUT" | grep "kvm_exit" | grep -c "exit_reason=1" 2>/dev/null || echo "0")
+# ★ 用 `|| true` 而不是 `|| echo "0"`：grep -c 计数为 0 时**照样打印 0**、只是退出码为 1，
+#   再 echo 一个 0 会让变量捕到两行 "0\n0"，下面的 [ -gt ] 与 bc 都会因此报错。
+APICV_COUNT=$(echo "$TRACE_OUTPUT" | grep -c "kvm_apicv_accept_irq" 2>/dev/null || true)
+ENTRY_COUNT=$(echo "$TRACE_OUTPUT" | grep -c "kvm_entry" 2>/dev/null || true)
+EXIT_COUNT=$(echo "$TRACE_OUTPUT" | grep -c "kvm_exit" 2>/dev/null || true)
+# ★ trace 文本里**没有** `exit_reason=1` 这种形式：kvm_exit 的 TP_printk 是
+#   "vcpu %u reason %s%s%s rip 0x%lx ..."（arch/x86/kvm/trace.h:325-330），reason 打的是
+#   符号名，外部中断那一行是 `reason EXTERNAL_INTERRUPT`（名字 arch/x86/include/uapi/asm/vmx.h:98，
+#   码 1 见 :33）。按 `exit_reason=1` 抓恒为 0，下面那个比值也就恒为 N/A。
+#   数字只在 BPF 侧成立（args->exit_reason）。详见 ../../phase9-performance/corrections.md D11。
+EXT_INTR_COUNT=$(echo "$TRACE_OUTPUT" | grep "kvm_exit" | grep -c "reason EXTERNAL_INTERRUPT" 2>/dev/null || true)
 
 echo "  追踪结果:"
 echo "    APICv 中断投递: $APICV_COUNT 次"

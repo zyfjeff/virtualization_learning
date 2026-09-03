@@ -4,9 +4,11 @@
 > Firecracker/Cloud Hypervisor）对比启动延迟、VM-Exit 分布与
 > halt-polling 行为，用数据解释架构差异。
 
-**前置**：项目 1-3；阅读 `../phase9-performance/README.md`
-（halt-polling/PLE/VPID）、`../phase10-debugging/README.md`
-（trace 方法）、`../phase11-microvm/README.md`（MicroVM 启动路径）。
+**前置**：项目 1-3；阅读 `../phase9-performance/measurement.md`（测量纪律，**先读**）、
+`../phase9-performance/parameters.md` §1（halt-polling 参数默认值与权限）、
+`../phase0-kvm-framework/annotations.md` §9（halt-polling 机制）、
+`../phase1-vtx-basics/README.md` §1（VPID 机制）、`../phase10-debugging/README.md`
+（trace 工具）、`../phase11-microvm/README.md`（MicroVM 启动路径）。
 
 ---
 
@@ -43,24 +45,43 @@ perf record -e kvm:kvm_exit -a -- sleep 10
 
 ## M3：halt-polling 调参实验
 
-KVM 在 vCPU halt 时先忙等再真正睡眠，窗口由模块参数控制
-（`virt/kvm/kvm_main.c:78-95`）：
+KVM 在 vCPU halt 时先忙等再真正睡眠，窗口由四个模块参数控制
+（`virt/kvm/kvm_main.c:78-95`，声明 + `module_param` 一整块）：
 
-| 参数 | 默认值 | 含义 |
-|------|--------|------|
-| `halt_poll_ns` | `KVM_HALT_POLL_NS_DEFAULT` | 忙等窗口上限 |
-| `halt_poll_ns_grow` | 2 | 命中时窗口倍增系数 |
-| `halt_poll_ns_grow_start` | 10000 (10μs) | 增长起点 |
-| `halt_poll_ns_shrink` | 2 | 未命中时缩减系数 |
+| 参数 | 含义 |
+|------|------|
+| `halt_poll_ns` | 忙等窗口上限（默认值 = `KVM_HALT_POLL_NS_DEFAULT`） |
+| `halt_poll_ns_grow` | 命中时窗口倍增系数 |
+| `halt_poll_ns_grow_start` | 增长起点 |
+| `halt_poll_ns_shrink` | 未命中时缩减系数 |
+
+**默认值与权限的单一来源是 `../phase9-performance/parameters.md` §1，本表不抄数字。**
+本实验只需要知道两件事：
+
+- 四个参数**都是 `0644`**（`:79`/`:84`/`:89`/`:94`），运行时可直接 `echo` 改，
+  这点和 `kvm_intel` 那一堆 `0444` 只读参数不同 —— 所以能在一轮实验里连续扫档。
+- 生效的**上限**由 `kvm_vcpu_max_halt_poll_ns()`（`virt/kvm/kvm_main.c:3787-3802`）决定：
+  只有当用户态用 `KVM_CAP_HALT_POLL` 设过 cap 才轮到它 —— 这条路径在
+  `kvm_vm_ioctl_enable_cap_generic()`（`virt/kvm/kvm_main.c:5035`）的
+  `case KVM_CAP_HALT_POLL`（`virt/kvm/kvm_main.c:5052`）：`:5056` 写
+  `kvm->max_halt_poll_ns`，`:5064` 置 `kvm->override_halt_poll_ns`。
+  只有 `override_halt_poll_ns` 置了，`kvm_vcpu_max_halt_poll_ns()` 才返回 per-VM 值
+  （`virt/kvm/kvm_main.c:3791`），否则读模块参数 `halt_poll_ns`
+  （`virt/kvm/kvm_main.c:3802`）。所以测出"改了模块参数却没反应"时，
+  先查 VMM 有没有设这个 cap（`../phase9-performance/measurement.md` §6 归因纪律）。
 
 实验：
 
 1. `echo 0 > /sys/module/kvm/parameters/halt_poll_ns` 与默认值对比：
    空转功耗（`halt` 退出计数、宿主 CPU 占用）与唤醒延迟
    （guest 内定时器/网络 ping 延迟）的此消彼长
+   ★ 写之前先记下原值、`trap ... EXIT` 恢复（`../phase9-performance/measurement.md`
+   §5 第 4 条）：这是**全局**参数，同宿主上所有 VM 一起受影响
 2. 用 `kvm:kvm_halt_poll_ns` tracepoint 观察窗口增长/缩减轨迹
-   （方法见 `../phase9-performance/README.md` 与
-   `../phase10-debugging/` 的 trace 章节）
+   （事件定义 `include/trace/events/kvm.h:347`，两个打印点
+   `virt/kvm/kvm_main.c:3686` grow / `:3705` shrink；
+   采样与清场方法见 `../phase9-performance/measurement.md` §4、§5，
+   工具用法见 `../phase10-debugging/README.md`）
 3. 结论写进报告：什么负载该开/关、窗口该多大
 
 ## M4：报告
@@ -95,8 +116,10 @@ KVM 在 vCPU halt 时先忙等再真正睡眠，窗口由模块参数控制
 
 ## 参考资料
 
-- `../phase9-performance/README.md`、`../phase10-debugging/README.md`、
-  `../phase11-microvm/README.md`
+- `../phase9-performance/measurement.md`（测量纪律与扰动预算）、
+  `../phase9-performance/parameters.md`（参数默认值/权限唯一来源）、
+  `../phase9-performance/index.md`（本仓已实测结论索引，含 halt-polling 收益曲线）、
+  `../phase10-debugging/README.md`、`../phase11-microvm/README.md`
 - `perf kvm` 用法：`man perf-kvm`；tracepoint 目录
   `/sys/kernel/tracing/events/kvm/`
 - QEMU microvm：`/root/code/qemu-10.1.0-rc2/hw/i386/microvm.c`

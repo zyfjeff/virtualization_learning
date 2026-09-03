@@ -21,6 +21,25 @@ echo ""
 
 TRACE_DIR="/sys/kernel/debug/tracing"
 
+# 读某个线程当前所在的物理 CPU（/proc/<pid>/task/<tid>/stat 的 processor 字段）。
+# ★ 这一件小事原来在本脚本里写错了三遍，两个坑：
+#   ① `awk '{print $39}'` 对 QEMU vCPU 线程**数错字段**。/proc/<pid>/stat 的第 2 项是
+#      comm，QEMU 给 vCPU 线程起的名字是 "CPU %d/KVM"（accel/kvm/kvm-accel-ops.c:70），
+#      于是 comm 展开成 "(CPU 0/KVM)" —— **里面有一个空格**。awk 按空白切分时 comm 占了
+#      两个字段，后面所有字段号整体右移 1：$39 读到的是 exit_signal（内核输出顺序
+#      fs/proc/array.c:641）而不是 processor（:642 的 task_cpu()）。exit_signal 对 QEMU
+#      线程通常是 17(SIGCHLD)，看着像个合理的 CPU 号，所以错得毫无痕迹。
+#      正确做法：先贪婪剥掉最后一个 ") "，剥完 processor 落在第 37 个字段。
+#   ② `... || echo "?"` **兜不住**：awk 读空输入时不打印任何东西、但退出码是 0，
+#      `||` 因此不触发，调用方拿到的是空串，一旦进 `[ -eq ]` 就报
+#      "integer expression expected"。兜底要用 ${VAR:-?}。
+#   出处：../../phase9-performance/corrections.md D13。
+task_cpu_of() {   # $1 = qemu pid, $2 = tid；取不到时输出 "?"
+    local v
+    v=$(sed 's/.*) //' "/proc/$1/task/$2/stat" 2>/dev/null | awk '{print $37}' || true)
+    printf '%s' "${v:-?}"
+}
+
 # --------------------------------------------------
 # 理论知识展示函数
 # --------------------------------------------------
@@ -153,7 +172,7 @@ echo ""
 if [ -n "$VCPU_THREADS" ]; then
     echo "$VCPU_THREADS" | while read tid name; do
         AFFINITY=$(taskset -p "$tid" 2>/dev/null | awk -F: '{print $2}' || echo "unknown")
-        CURRENT_CPU=$(cat /proc/$QEMU_PID/task/$tid/stat 2>/dev/null | awk '{print $39}' || echo "?")
+        CURRENT_CPU=$(task_cpu_of "$QEMU_PID" "$tid")
         echo "    $name (TID=$tid): 当前 CPU=$CURRENT_CPU, 亲和性=$AFFINITY"
     done
 fi
@@ -175,8 +194,9 @@ if [ -n "$FIRST_VCPU_TID" ]; then
     echo "  选择 vCPU 线程 TID=$FIRST_VCPU_TID 进行迁移测试"
     echo ""
 
-    # 获取当前 CPU
-    ORIG_CPU=$(cat /proc/$QEMU_PID/task/$FIRST_VCPU_TID/stat 2>/dev/null | awk '{print $39}' || echo "0")
+    # 获取当前 CPU（解析的两个坑见文件开头 task_cpu_of() 的注释）
+    ORIG_CPU=$(task_cpu_of "$QEMU_PID" "$FIRST_VCPU_TID")
+    [ "$ORIG_CPU" = "?" ] && ORIG_CPU=0
     echo "  原始 CPU: $ORIG_CPU"
 
     # 计算目标 CPU（选择一个不同的 CPU）
@@ -229,7 +249,7 @@ if [ -n "$FIRST_VCPU_TID" ]; then
         fi
 
         # 显示迁移后 vCPU 所在 CPU
-        NEW_CPU=$(cat /proc/$QEMU_PID/task/$FIRST_VCPU_TID/stat 2>/dev/null | awk '{print $39}' || echo "?")
+        NEW_CPU=$(task_cpu_of "$QEMU_PID" "$FIRST_VCPU_TID")
         echo ""
         echo "  迁移后 vCPU 所在 CPU: $NEW_CPU"
 

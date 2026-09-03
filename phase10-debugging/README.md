@@ -33,31 +33,56 @@
 
 ## 🔍 调试场景速查表
 
+> **下面所有场景共用的两条前提**
+>
+> 1. **`>` 与 `>>` 在 `set_event` 上不等价**。带 `O_TRUNC` 的写打开会先把**所有**已启用
+>    事件清掉（`tee` 默认就是 `O_TRUNC`），所以 `echo evt > set_event` 会顺手关掉别人挂的
+>    探针；只想加就用 `>>`，要清空就显式写 `: > set_event`。源码链路见
+>    `../phase9-performance/measurement.md` §5 第 3 条。
+> 2. **tracefs 是全局状态**，收尾要**四个出口分别清**：`current_tracer`、
+>    `set_ftrace_filter`、`set_event`、`tracing_on`（`kprobe_events` 另有其一，共五条），
+>    它们互相独立，只清一个不算清干净。另注意 `tracing_on=0` **不等于零开销**
+>    （probe 仍注册着，只是不写 buffer）。完整清理与判据见
+>    `../phase9-performance/measurement.md` §5 与
+>    `../phase9-performance/practice/bench-observer-cost.md` §2.5 / §6。
+
 ### 场景 1: VM-Exit 频率过高
 
 ```bash
 # Step 1: 使用 perf kvm stat 分析 VM-Exit 分布
-sudo perf kvm stat record -p $QEMU_PID -- sleep 10
+#   ★ 必须 system-wide（-a）。用 `-p $QEMU_PID` 只跟踪被包裹的那个进程，
+#     vCPU 线程的退出**全丢**：tools/perf/builtin-kvm.c:1959-1960 里
+#     `if (target__none(&kvm->opts.target)) … system_wide = true;` ——
+#     只有**不给 target** 时才自动 system-wide。判据与实测见
+#     ../phase9-performance/measurement.md §7
+sudo perf kvm stat record -a -- sleep 10
 sudo perf kvm stat report
 
-# Step 2: 针对性处理
+# Step 2: 针对性处理（去处按重写后的章节分工，phase9 已经没有这些机制章）
 # 如果是 EPT_VIOLATION 多:
-#   → 参考 phase9 EPT 优化章节，启用大页、A/D 位
+#   → 机制在 ../phase2-mem-virt/（EPT/TDP MMU）；大页 vs 4K 的**代价**怎么量，
+#     见 ../phase9-performance/practice/bench-huge-dirty.md（E2）
 # 如果是 EXTERNAL_INTERRUPT 多:
-#   → 参考 phase9 APICv/Posted Interrupts
+#   → APICv / Posted Interrupts 在 ../phase4-interrupts/（含 posted-interrupts.md）；
+#     PI 的"零 VM-Exit"是硬件行为，规范依据 SDM 30.6 / VT-d 5.2.5
 # 如果是 IO_INSTRUCTION 多:
 #   → 参考 phase5 vhost 优化
 # 如果是 CPUID 多:
 #   → 使用 KVM_SET_CPUID2 预填充 CPUID 缓存
 # 如果是 PAUSE 多:
-#   → 调整 PLE 参数或启用 PV 自旋锁
+#   → PV 自旋锁（guest 侧 kvm spinlock，见 ../phase0-kvm-framework/）；
+#     PLE 参数 ple_gap / ple_window / ple_window_grow / ple_window_shrink /
+#     ple_window_max **全部 0444 只读**（arch/x86/kvm/vmx/vmx.c:204-219），
+#     运行时改不了，只能 insmod/内核启动参数传 + 重启 VM。
+#     机制走读 ../phase9-performance/annotations.md §1，
+#     "到底值多少钱"的测量设计 ../phase9-performance/practice/bench-ple.md（E1）
 ```
 
 ### 场景 2: 中断延迟异常
 
 ```bash
 # Step 1: 跟踪中断路径
-echo kvm:kvm_entry > /sys/kernel/debug/tracing/set_event
+echo kvm:kvm_entry >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_inj_virq >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_apic_accept_irq >> /sys/kernel/debug/tracing/set_event
@@ -72,16 +97,16 @@ kretprobe:vmx_vcpu_run {
 interval:s:5 { print(@latency); clear(@latency); }
 '
 
-# Step 3: 检查 APICv/PI 是否启用
-cat /sys/module/kvm_intel/parameters/enable_apicv
-cat /sys/module/kvm_intel/parameters/enable_apicv
+# Step 3: 检查 APICv/PI 是否启用（两者都是 0444 只读，运行时改不了）
+cat /sys/module/kvm_intel/parameters/enable_apicv   # arch/x86/kvm/vmx/vmx.c:114
+cat /sys/module/kvm_intel/parameters/enable_ipiv    # arch/x86/kvm/vmx/vmx.c:117
 ```
 
 ### 场景 3: 内存性能差
 
 ```bash
 # Step 1: 跟踪 EPT 缺页
-echo kvm:kvm_page_fault > /sys/kernel/debug/tracing/set_event
+echo kvm:kvm_page_fault >> /sys/kernel/debug/tracing/set_event
 
 # Step 2: 分析缺页分布
 sudo bpftrace -e '
@@ -94,7 +119,10 @@ interval:s:5 { print(@gpa, 20); clear(@gpa); }
 # Step 3: 检查是否启用大页
 echo always > /sys/kernel/mm/transparent_hugepage/enabled
 
-# Step 4: 参考 phase9-performance/practice/ept-bench.md 的方法
+# Step 4: 大页/脏页开销的测量方法见 phase9-performance/practice/bench-huge-dirty.md（E2）
+#   ★ 别照旧版 ept-bench.md 的实验 1 做：那条用 function tracer 跟踪缺页路径，
+#     而缺页热点函数本身就在 µs 量级，观测开销与被测量同级 → 测到的是 tracer。
+#     E2 改成只用 kvm:kvm_page_fault 事件 + 按 fault_address>>21 去重判级别。
 sudo ./scripts/trace/trace-page-fault.sh -p $QEMU_PID -d 10
 ```
 
@@ -102,7 +130,7 @@ sudo ./scripts/trace/trace-page-fault.sh -p $QEMU_PID -d 10
 
 ```bash
 # Step 1: 跟踪 vCPU 调度
-echo sched:sched_switch > /sys/kernel/debug/tracing/set_event
+echo sched:sched_switch >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_entry >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
 
@@ -127,11 +155,25 @@ interval:s:5 { print(@preempt_us); clear(@preempt_us); }
 
 ```bash
 # Step 1: 跟踪 TSC 同步
-echo kvm:kvm_track_tsc > /sys/kernel/debug/tracing/set_event
+echo kvm:kvm_track_tsc >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_write_tsc_offset >> /sys/kernel/debug/tracing/set_event
 
 # Step 2: 检查主时钟状态
-cat /sys/kernel/debug/kvm/*/stats | grep -i clock
+#   ★ `cat /sys/kernel/debug/kvm/*/stats` 是**无效命令**：6.12.93 的 KVM 统计
+#     每项一个文本文件（`debugfs_create_file(pdesc->name, …)` 逐项注册，
+#     virt/kvm/kvm_main.c:6352），那个叫 `stats` 的文件是**二进制**的头描述符，
+#     grep 不出东西；而且统计项里**没有 clock 类**条目。
+#     主时钟状态看 tracepoint（Step 1 那两条之外再加这一条）：
+echo kvm:kvm_update_master_clock >> /sys/kernel/debug/tracing/set_event
+grep kvm_update_master_clock /sys/kernel/debug/tracing/trace | tail
+#   行里 masterclock 是**本次重算的新决定**：赋值与打印都在
+#   `pvclock_update_vm_gtod_copy()`（arch/x86/kvm/x86.c:3015）里，
+#   赋值在 x86.c:3034、`trace_kvm_update_master_clock()` 在 x86.c:3042。
+#   ★ 别拿 kvm_track_tsc 那行的 masterclock 判翻转方向 —— 它打的是**翻转前的旧值**：
+#   `kvm_track_tsc_matching()`（arch/x86/kvm/x86.c:2515）只算一个**局部变量**
+#   （x86.c:2526）再发请求，`ka->use_master_clock` 全树只有 x86.c:3034 一处写。
+#   照着读会稳定慢一拍。机制见 ../phase9-performance/annotations.md §3.1.1，
+#   完整判据见 ../phase9-performance/practice/bench-clock-master.md（E4）
 
 # Step 3: 验证 invariant TSC
 grep "constant_tsc\|tsc_reliable" /proc/cpuinfo
@@ -152,12 +194,22 @@ dmesg | grep -i 'tsc.*unstable'
 
 # Step 4: 宿主侧查时钟相关 tracepoint（6.12.93 均存在）
 ls /sys/kernel/debug/tracing/events/kvm/ | grep -E 'clock|time|tsc'
-echo kvm:kvm_track_tsc > /sys/kernel/debug/tracing/set_event
+#   用 `>>` 而不是 `>`，理由见本节开头第 1 条
+echo kvm:kvm_track_tsc >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_write_tsc_offset >> /sys/kernel/debug/tracing/set_event
 ```
 
-方法学（读取延迟 / cyclictest / TSC 同步基准）见
-`../phase9-performance/practice/timer-bench.md`。
+方法学指针：
+
+- **测量纪律与扰动预算**（任何对比前先读）：`../phase9-performance/measurement.md`。
+- `../phase9-performance/practice/timer-bench.md` 里 guest 侧 clocksource / cyclictest
+  的**手法**仍可用，但其 **实验 6（调 `lapic_timer_advance_ns`）在 6.12.93 上根本不可执行**
+  —— 该参数已不是模块参数，只剩 `lapic_timer_advance` 这个 bool
+  （`arch/x86/kvm/lapic.c:70-71`），提前量变成**每 vCPU 的只读 debugfs 文件**
+  （`arch/x86/kvm/debugfs.c:67`）。详见 `../phase9-performance/corrections.md` D1。
+- 可执行的继任实验（masterclock 翻转判据）：
+  `../phase9-performance/practice/bench-clock-master.md`（E4）。
+- 时钟虚拟化机制与结论归 **phase7**，本章只留指针。
 
 ---
 
@@ -207,7 +259,10 @@ echo kvm:kvm_write_tsc_offset >> /sys/kernel/debug/tracing/set_event
 本阶段工具在各 phase 中的应用:
 
 phase0-8 的源码学习 → 用 ftrace 验证理解
-phase9 性能优化      → 用 perf/bpftrace 测量优化效果
+phase9 性能优化      → 测量纪律与观测扰动预算看 measurement.md，
+                       五个独占实验看 practice/：PLE(E1) / 大页与脏页(E2) /
+                       vCPU 迁移(E3) / 主时钟(E4) / 观测者成本(E5)；
+                       本章提供的是它们的工具
 phase11 MicroVM     → 用 selftests 测试 MicroVM 功能
 ```
 
