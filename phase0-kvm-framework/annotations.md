@@ -942,12 +942,22 @@ Guest执行HLT
 ```
 
 **自适应halt-polling参数**：
-- `halt_poll_ns`：每个vCPU独立维护，动态调整
-- `halt_poll_ns`（全局默认400000ns = 400μs）：上限
-- 增大策略：`vcpu->halt_poll_ns *= 2`（不超过全局上限）
-- 缩小策略：`vcpu->halt_poll_ns /= 2`
-- 增大条件：上次唤醒时间 < halt_poll_ns（说明poll有效但窗口太小）
-- 缩小条件：上次唤醒时间 > halt_poll_ns（说明poll浪费时间）
+- `vcpu->halt_poll_ns`：每个 vCPU 独立维护，动态调整（下面两条改的就是它）
+- 上限：模块参数 `halt_poll_ns`，6.12.93 默认 **200000 ns = 200 μs**
+  （`KVM_HALT_POLL_NS_DEFAULT`，`arch/x86/include/asm/kvm_host.h:71`）。
+  ★ 截断点在 `kvm_vcpu_halt()`（`virt/kvm/kvm_main.c:3820-3821`），而真正用的上限由
+  `kvm_vcpu_max_halt_poll_ns()`（`:3787-3802`）给出：**per-VM 的
+  `kvm->max_halt_poll_ns` 优先于模块参数**（VMM 用 `KVM_CAP_HALT_POLL` 设）
+- 增大：`grow_halt_poll_ns()`（`:3670-3687`）`val *= halt_poll_ns_grow`（默认 2），
+  再用 `halt_poll_ns_grow_start`（默认 10 μs）**兜住下限**；`grow == 0` 直接不增长
+- 缩小：`shrink_halt_poll_ns()`（`:3689-3706`）`val /= halt_poll_ns_shrink`（默认 2），
+  但 **`shrink == 0` 表示立刻归零**；结果低于 `grow_start` 同样归零
+- 增大条件：唤醒发生在窗口内（poll 有效但窗口太小）
+- 缩小条件：窗口跑完仍未唤醒（poll 白烧 CPU）
+
+参数默认值/权限的单一来源见 [`../phase9-performance/parameters.md`](../phase9-performance/parameters.md) §1；
+"这样调到底值多少钱"的实测见
+[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2。
 
 ---
 

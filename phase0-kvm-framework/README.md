@@ -311,9 +311,9 @@ struct kvm_vcpu_arch {
 QEMU: ioctl(kvm_fd, KVM_CREATE_VM, 0)
     │
     ▼
-kvm_dev_ioctl() [kvm_main.c:4666]
+kvm_dev_ioctl() [kvm_main.c:5535]
     │
-    ├── case KVM_CREATE_VM:
+    ├── case KVM_CREATE_VM:            [kvm_main.c:5546]
     │       └── kvm_create_vm()
     │           │
     │           ├── kvm = kzalloc(sizeof(struct kvm))
@@ -346,10 +346,10 @@ kvm_dev_ioctl() [kvm_main.c:4666]
 QEMU: ioctl(vm_fd, KVM_CREATE_VCPU, vcpu_id)
     │
     ▼
-kvm_vcpu_ioctl() [kvm_main.c:4352]
+kvm_vm_ioctl() [kvm_main.c:5160]      ← ★ 建 vCPU 走的是 **VM fd**，不是 vcpu fd
     │
-    ├── case KVM_CREATE_VCPU:
-    │       └── kvm_vm_ioctl_create_vcpu(kvm, vcpu_id)
+    ├── case KVM_CREATE_VCPU:          [kvm_main.c:5170]
+    │       └── kvm_vm_ioctl_create_vcpu(kvm, vcpu_id)   [kvm_main.c:4217]
     │           │
     │           ├── vcpu = kvm_arch_vcpu_create(kvm, vcpu_id)
     │           │   └── kvm_vcpu_init(vcpu, kvm, vcpu_id)
@@ -388,10 +388,11 @@ kvm_vcpu_ioctl() [kvm_main.c:4352]
 QEMU: ioctl(vcpu_fd, KVM_RUN, 0)
     │
     ▼
-kvm_vcpu_ioctl() [kvm_main.c:4352]
+kvm_vcpu_ioctl() [kvm_main.c:4445]
     │
-    ├── case KVM_RUN:
-    │       └── kvm_arch_vcpu_ioctl_run(vcpu, run)
+    ├── case KVM_RUN:                  [kvm_main.c:4471]
+    │       └── kvm_arch_vcpu_ioctl_run(vcpu)   ← 6.12 起**只有一个参数**，
+    │               [x86.c:11579]                  `struct kvm_run *` 已从签名里去掉
     │           │
     │           ├── vcpu_load(vcpu)
     │           │   └── 绑定vCPU到当前pCPU
@@ -447,7 +448,7 @@ kvm_vcpu_ioctl() [kvm_main.c:4352]
     │           │   │       │   └── return r
     │           │   │       │
     │           │   │       ├── if (r <= 0) break
-    │           │   │       │   └── 需要返回用户空间（MMIO、HLT等）
+    │           │   │       │   └── 需要返回用户空间（MMIO等，HLT默认不返回）
     │           │   │       │
     │           │   │       ├── signal_pending(current)?
     │           │   │       │   └── break (有信号需要处理)
@@ -514,13 +515,17 @@ vcpu_run()循环
 ```
 
 **调优参数**：
-- `halt_poll_ns`（默认400000ns = 400μs）：轮询时间
+- `halt_poll_ns`（默认 200000 ns = 200 μs，`KVM_HALT_POLL_NS_DEFAULT`，
+  `arch/x86/include/asm/kvm_host.h:71`）：轮询窗口上限
 - 增大：降低中断延迟，但增加CPU占用
 - 减小：降低CPU占用，但增加中断延迟
 
+★ 这对权衡在本机上**没有传说的那么灵**，实测结论（含"什么时候完全零收益"）见
+[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2。
+
 **VMM视角对比**：
-- 用户态VMM：ioctl返回KVM_EXIT_HLT，QEMU调用select/poll等待
-- KVM内核态：halt-polling + 内核态阻塞，无需返回用户空间
+- 用户态VMM（特殊配置，如 `-kernel-irqchip off`）：ioctl返回KVM_EXIT_HLT，QEMU处理唤醒
+- KVM内核态（默认，`lapic_in_kernel()` 返回 true）：halt-polling + 内核态阻塞，完全在内核态处理，无需返回用户空间
 
 ### 2. vCPU阻塞和唤醒
 
@@ -658,7 +663,7 @@ Host内核中断处理 → kvm_set_irq(irq)
 | **寄存器管理** | 通过ioctl(KVM_SET_REGS)等间接设置 | 直接vmcs_write()，零开销 |
 | **内存映射** | mmap共享内存 + ioctl设置memslot | EPT直接映射，支持并发页错误 |
 | **中断注入** | ioctl(KVM_INTERRUPT)返回到用户态 | 直接写VMCS，或Posted Interrupts零VM-Exit |
-| **halt处理** | ioctl返回KVM_EXIT_HLT，QEMU调用poll | halt-polling + 内核态阻塞 |
+| **halt处理** | 特殊配置：ioctl返回KVM_EXIT_HLT | halt-polling + 内核态阻塞，默认不返回用户态 |
 | **MMIO处理** | ioctl返回KVM_EXIT_MMIO，QEMU模拟 | 快速路径内核态处理，复杂MMIO返回用户态 |
 
 ### 为什么KVM要这样设计？
@@ -738,16 +743,21 @@ Host内核中断处理 → kvm_set_irq(irq)
 ```bash
 # 查看当前值
 cat /sys/module/kvm/parameters/halt_poll_ns
-# 默认: 400000 (400μs)
+# 默认: 200000 (200μs) —— KVM_HALT_POLL_NS_DEFAULT，arch/x86/include/asm/kvm_host.h:71
 
-# 调整
-echo 200000 > /sys/module/kvm/parameters/halt_poll_ns
+# 调整（6.12.93 四个 halt-polling 参数都是 0644，可直接写）
+echo 400000 > /sys/module/kvm/parameters/halt_poll_ns
 ```
 
-**调优建议**：
-- 高吞吐负载：增大到500μs-1ms，降低中断延迟
-- 低延迟负载：减小到100μs-200μs，减少CPU浪费
-- 空闲VM：设置为0，禁用halt-polling
+**调优建议**：★ 这件事本仓已经实测过，结论与"按负载类型调窗口"的流传说法方向相反：
+**空闲场景零收益、flood 场景买不到延迟反而多付 CPU，且收益曲线在"窗口刚够盖住典型
+halt"处就饱和** —— 具体数值、样本量与实验条件只有一份，见
+[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2（本仓规则：
+别处只写指针，不复制数字）。
+
+机制侧的判据：只有"唤醒源随机且大概率落在 polling 窗口内"才有收益；唤醒事件早于
+窗口起点时 polling 无法让它更早。四个参数各自的作用域、默认值与自适应算法见
+[`../phase9-performance/parameters.md`](../phase9-performance/parameters.md) §1。
 
 ### 2. vCPU亲和性
 
@@ -851,20 +861,24 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep kvm
 ### 练习4：性能对比
 
 ```bash
-# 测试1：默认halt_poll_ns
-echo 400000 > /sys/module/kvm/parameters/halt_poll_ns
-# 运行工作负载，测量延迟
+# 先读回原值存档（6.12.93 的默认是 200000 = 200μs，不是 400000）
+ORIG=$(cat /sys/module/kvm/parameters/halt_poll_ns)
 
-# 测试2：禁用halt_poll_ns
-echo 0 > /sys/module/kvm/parameters/halt_poll_ns
-# 运行工作负载，测量延迟
+# 四档对比：禁用 / 原值 / 拉大一倍 / 再拉大
+for v in 0 "$ORIG" 400000 1000000; do
+    echo "$v" > /sys/module/kvm/parameters/halt_poll_ns
+    # 运行同一个工作负载，测量延迟；每档重复若干次取中位数
+done
 
-# 测试3：增大halt_poll_ns
-echo 1000000 > /sys/module/kvm/parameters/halt_poll_ns
-# 运行工作负载，测量延迟
-
-# 对比结果，分析最佳值
+# 收尾恢复原值 —— 模块参数是全局的，不恢复会污染下一轮
+echo "$ORIG" > /sys/module/kvm/parameters/halt_poll_ns
 ```
+
+★ 这个 A/B 本仓已经做过，结论比"调大就更快"复杂，见
+[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2。
+自己做时要满足 [`../phase9-performance/measurement.md`](../phase9-performance/measurement.md)
+的三条纪律：**有对照组、每档重复取中位数、两组同一观测档位**（一边开 trace 一边不开
+直接比耗时，测到的是 tracer 自己）。
 
 ---
 

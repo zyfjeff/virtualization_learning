@@ -104,11 +104,12 @@
 │         case KVM_EXIT_IO:                                    │
 │             模拟IO操作                                       │
 │             break;                                           │
-│         case KVM_EXIT_HLT:                                   │
-│             poll等待中断                                     │
-│             break;                                           │
 │         case KVM_EXIT_MMIO:                                  │
 │             模拟MMIO操作                                     │
+│             break;                                           │
+│         case KVM_EXIT_HLT:                                   │
+│             仅特殊配置（如-kernel-irqchip off）才会到达     │
+│             默认情况下HLT在内核态处理，不返回用户态         │
 │             break;                                           │
 │     }                                                        │
 │                                                               │
@@ -124,7 +125,7 @@
   ├── 用户态 → 内核态 (ioctl再次调用)
   └── 内核态 → Guest (VMENTER)
 
-总开销: 4次模式切换!
+总开销: 4次模式切换! (仅慢速路径：MMIO/CPUID等)
 ```
 
 ```
@@ -511,7 +512,7 @@
 ### 5.1 halt-polling机制
 
 ```
-┌─ 用户态VMM ──────────────────────────────────────────────┐
+┌─ 用户态VMM（特殊配置，如-kernel-irqchip off）──────────────┐
 │                                                            │
 │  Guest执行HLT指令                                          │
 │    │                                                        │
