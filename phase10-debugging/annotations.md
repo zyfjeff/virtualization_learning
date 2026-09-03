@@ -923,3 +923,209 @@ tracepoint:kvm:kvm_exit { @reasons[args->exit_reason] = count(); }
 interval:s:5 { print(@reasons, 10); clear(@reasons); }
 '
 ```
+
+### 6.6 MSR 热点统计
+
+```bash
+#!/usr/bin/bpftrace
+# trace-msr-hotspot.bt
+
+/* 按 MSR 号统计访问频率 */
+
+tracepoint:kvm:kvm_msr
+{
+    @msr[args->ecx] = count();
+}
+
+interval:s:10
+{
+    printf("=== MSR 访问热点（top 20）===\n");
+    print(@msr, 20);
+    clear(@msr);
+}
+```
+
+### 6.7 嵌套虚拟化分析
+
+```bash
+#!/usr/bin/bpftrace
+# trace-nested-virt.bt
+
+/* 跟踪 L1→L2 VM-Entry 和 L2→L1 VM-Exit */
+
+tracepoint:kvm:kvm_nested_vmenter
+{
+    @l1_to_l2 = count();
+}
+
+tracepoint:kvm:kvm_nested_vmexit
+{
+    @l2_to_l1 = count();
+    @exit_reasons[args->exit_reason] = count();
+}
+
+interval:s:10
+{
+    printf("=== 嵌套虚拟化统计 ===\n");
+    printf("L1→L2 VM-Entry: %d\n", @l1_to_l2);
+    printf("L2→L1 VM-Exit:  %d\n", @l2_to_l1);
+    printf("L2 Exit 原因分布:\n");
+    print(@exit_reasons, 10);
+    clear(@l1_to_l2);
+    clear(@l2_to_l1);
+    clear(@exit_reasons);
+}
+```
+
+### 6.8 MMU notifier 跟踪
+
+```bash
+#!/usr/bin/bpftrace
+# trace-mmu-notifier.bt
+
+/* 跟踪 mmu_notifier 事件（宿主内存管理通知 KVM 失效映射） */
+
+tracepoint:kvm:kvm_unmap_hva_range
+{
+    @unmap_count = count();
+    @unmap_ranges = hist(args->end - args->start);
+}
+
+tracepoint:kvm:kvm_age_hva
+{
+    @age_count = count();
+}
+
+interval:s:10
+{
+    printf("=== MMU notifier 统计 ===\n");
+    printf("unmap 次数: %d\n", @unmap_count);
+    printf("unmap 范围分布:\n");
+    print(@unmap_ranges);
+    printf("age 次数: %d\n", @age_count);
+    clear(@unmap_count);
+    clear(@unmap_ranges);
+    clear(@age_count);
+}
+```
+
+### 6.9 中断注入延迟
+
+```bash
+#!/usr/bin/bpftrace
+# trace-irq-inject-latency.bt
+
+/* 测量从中断接受到注入的延迟 */
+
+tracepoint:kvm:kvm_apic_accept_irq
+{
+    @accept_time[args->vcpu_id, args->vector] = nsecs;
+}
+
+tracepoint:kvm:kvm_inj_virq /@accept_time[args->vcpu_id, args->irq]/
+{
+    $delta = nsecs - @accept_time[args->vcpu_id, args->irq];
+    @inject_delay = hist($delta / 1000);  // μs
+    delete(@accept_time[args->vcpu_id, args->irq]);
+}
+
+interval:s:10
+{
+    printf("=== 中断注入延迟（μs）===\n");
+    print(@inject_delay);
+    clear(@inject_delay);
+}
+```
+
+### 6.10 vCPU 唤醒原因分析
+
+```bash
+#!/usr/bin/bpftrace
+# trace-vcpu-wakeup.bt
+
+/* 分析 vCPU 唤醒原因（halt-polling 超时 vs 中断唤醒） */
+
+tracepoint:kvm:kvm_vcpu_wakeup
+{
+    if (args->waited)
+        @blocked = count();
+    else
+        @polling = count();
+
+    @wakeup_ns = hist(args->ns / 1000);  // μs
+}
+
+interval:s:10
+{
+    printf("=== vCPU 唤醒统计 ===\n");
+    printf("阻塞等待: %d\n", @blocked);
+    printf("轮询唤醒: %d\n", @polling);
+    printf("唤醒延迟分布（μs）:\n");
+    print(@wakeup_ns);
+    clear(@blocked);
+    clear(@polling);
+    clear(@wakeup_ns);
+}
+```
+
+### 6.11 内存带宽监控
+
+```bash
+#!/usr/bin/bpftrace
+# trace-mem-bandwidth.bt
+
+/* 监控 KVM 内存操作（缺页 + MMIO）的频率 */
+
+tracepoint:kvm:kvm_page_fault
+{
+    @pf_count = count();
+    @pf_by_vcpu[args->vcpu_id] = count();
+}
+
+tracepoint:kvm:kvm_mmio
+{
+    @mmio_count = count();
+}
+
+interval:s:5
+{
+    printf("=== 内存操作统计（5 秒）===\n");
+    printf("EPT 缺页: %d\n", @pf_count);
+    printf("MMIO 操作: %d\n", @mmio_count);
+    printf("按 vCPU 分布:\n");
+    print(@pf_by_vcpu, 10);
+    clear(@pf_count);
+    clear(@pf_by_vcpu);
+    clear(@mmio_count);
+}
+```
+
+### 6.12 中断风暴检测
+
+```bash
+#!/usr/bin/bpftrace
+# trace-irq-storm.bt
+
+/* 检测 EXTERNAL_INTERRUPT 风暴 */
+
+tracepoint:kvm:kvm_exit
+{
+    @total = count();
+    if (args->exit_reason == 1) {  // 1 = EXTERNAL_INTERRUPT
+        @ext_int = count();
+    }
+}
+
+interval:s:5
+{
+    if (@total > 0) {
+        $pct = 100.0 * @ext_int / @total;
+        printf("EXTERNAL_INTERRUPT: %d (%.1f%%)\n", @ext_int, $pct);
+        if ($pct > 40) {
+            printf("⚠ 中断退出比例过高，考虑启用 APICv/PI\n");
+        }
+    }
+    clear(@total);
+    clear(@ext_int);
+}
+```
