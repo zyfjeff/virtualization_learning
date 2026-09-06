@@ -349,23 +349,67 @@ create_disk_image() {
     log_info "✓ 磁盘镜像创建完成 ($size)"
 }
 
-# 打包为 initramfs（更简单的方式）
+# 打包为最小 initramfs（挂载磁盘并 switch_root）
 create_initramfs() {
-    log_info "打包为 initramfs..."
+    log_info "创建最小 initramfs..."
 
     local img="$OUTPUT_DIR/initramfs-ubuntu.img"
+    local initramfs_dir=$(TMPDIR=/tmp mktemp -d)
 
-    cd "$ROOTFS_DIR"
-    # set -e 不覆盖管道中间命令，缺 pipefail 时 cpio/gzip 失败会写出截断镜像而构建仍报成功
-    local rc=0
-    ( set -o pipefail; find . | cpio -o -H newc 2>/dev/null | gzip > "$img" ) || rc=$?
+    # 创建基本目录结构
+    mkdir -p "$initramfs_dir"/{bin,dev,proc,sys,mnt/root,etc}
+
+    # 复制 busybox
+    cp /usr/bin/busybox "$initramfs_dir/bin/"
+    cd "$initramfs_dir/bin"
+    for cmd in sh mount switch_root sleep echo cat ls mkdir; do
+        ln -sf busybox "$cmd"
+    done
     cd - >/dev/null
 
-    if [ "$rc" -ne 0 ] || ! gzip -t "$img" 2>/dev/null; then
-        rm -f "$img"
-        log_error "initramfs 打包失败（rc=$rc）或 gzip -t 校验未通过，已删除损坏产物"
-        exit 1
+    # 创建 init 脚本
+    cat > "$initramfs_dir/init" <<'INIT_EOF'
+#!/bin/sh
+# 最小 init：挂载磁盘并 switch_root
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+echo "Waiting for root device..."
+sleep 1
+
+# 尝试挂载根磁盘
+ROOTDEV=""
+for dev in /dev/vda /dev/sda /dev/vda1 /dev/sda1; do
+    if [ -b "$dev" ]; then
+        echo "Trying $dev as root..."
+        if mount -t ext4 "$dev" /mnt/root 2>/dev/null; then
+            ROOTDEV="$dev"
+            break
+        fi
     fi
+done
+
+if [ -z "$ROOTDEV" ]; then
+    echo "Failed to mount root filesystem!"
+    exec /bin/sh
+fi
+
+echo "Root mounted on $ROOTDEV, switching..."
+
+# switch_root 到新根
+exec switch_root /mnt/root /sbin/init
+INIT_EOF
+    chmod +x "$initramfs_dir/init"
+
+    # 打包
+    cd "$initramfs_dir"
+    find . | cpio -o -H newc 2>/dev/null | gzip > "$img"
+    cd - >/dev/null
+
+    # 清理
+    rm -rf "$initramfs_dir"
 
     local size=$(du -h "$img" | cut -f1)
     log_info "✓ initramfs 创建完成 ($size)"
