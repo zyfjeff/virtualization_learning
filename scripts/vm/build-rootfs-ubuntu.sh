@@ -86,6 +86,7 @@ configure_system() {
 EOF
 
     # 配置网络（使用 DHCP）
+    mkdir -p "$ROOTFS_DIR/etc/netplan"
     cat > "$ROOTFS_DIR/etc/netplan/01-dhcp.yaml" <<EOF
 network:
   version: 2
@@ -100,6 +101,7 @@ EOF
     chroot "$ROOTFS_DIR" /usr/sbin/usermod -p '' root
 
     # 配置 serial console
+    mkdir -p "$ROOTFS_DIR/etc/systemd/system"
     cat > "$ROOTFS_DIR/etc/systemd/system/serial-getty@ttyS0.service" <<EOF
 [Unit]
 Description=Serial Console getty
