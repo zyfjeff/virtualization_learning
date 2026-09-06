@@ -140,6 +140,14 @@ install_test_tools() {
     mount --bind /proc "$ROOTFS_DIR/proc" || true
     mount --bind /sys "$ROOTFS_DIR/sys" || true
 
+    # 确保退出时清理 bind mount
+    cleanup_mounts() {
+        umount "$ROOTFS_DIR/dev" 2>/dev/null || true
+        umount "$ROOTFS_DIR/proc" 2>/dev/null || true
+        umount "$ROOTFS_DIR/sys" 2>/dev/null || true
+    }
+    trap cleanup_mounts EXIT
+
     # 添加 universe 仓库（minbase 只有 main）
     if [ -f "$ROOTFS_DIR/etc/apt/sources.list" ]; then
         sed -i 's/main$/main universe/' "$ROOTFS_DIR/etc/apt/sources.list"
@@ -179,10 +187,8 @@ EOF
     chroot "$ROOTFS_DIR" apt-get clean
     chroot "$ROOTFS_DIR" rm -rf /var/lib/apt/lists/*
 
-    # 卸载文件系统
-    umount "$ROOTFS_DIR/dev" || true
-    umount "$ROOTFS_DIR/proc" || true
-    umount "$ROOTFS_DIR/sys" || true
+    # 移除 trap（正常完成，不需要特殊清理）
+    trap - EXIT
 
     log_info "✓ 测试工具安装完成"
 }
