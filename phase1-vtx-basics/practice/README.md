@@ -21,7 +21,7 @@
 
 ```bash
 # 宿主机上执行
-cd /root/code/kvm-study/scripts/vm
+cd ../../scripts/vm
 ./boot-vm.sh minimal
 ```
 

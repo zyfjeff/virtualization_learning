@@ -14,7 +14,7 @@
 
 ```bash
 # 编译
-cd /root/code/kvm-study/examples/kvm-api-demo/
+cd .
 make
 
 # 运行完整演示 (需要 root 或 kvm 组权限)
@@ -260,7 +260,7 @@ echo > /sys/kernel/debug/tracing/set_ftrace_filter
 
 ```bash
 # Phase 1 提供的 ftrace 脚本
-/root/code/kvm-study/scripts/trace/trace-vmexit.sh
+../../scripts/trace/trace-vmexit.sh
 ```
 
 ### 方法四：perf 事件分析
@@ -419,7 +419,7 @@ struct kvm_run {                    ← 通过 mmap(vcpu_fd) 映射
 
 ## 参考资料
 
-- **内核源码**: `/root/code/linux-6.12.93/`
+- **内核源码**: `linux-6.12.93/`
   - `include/uapi/linux/kvm.h` — 用户空间 API
   - `virt/kvm/kvm_main.c` — 框架核心
   - `arch/x86/kvm/vmx/vmx.c` — VMX 实现

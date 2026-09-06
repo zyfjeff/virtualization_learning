@@ -24,7 +24,7 @@
 ```bash
 # 所有练习都需要一个运行中的 VM
 # 使用统一测试环境启动（前台运行，建议单独开一个终端）
-cd /root/code/kvm-study/scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
+cd ../../scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
 
 # 回到本目录，按「练习详情」逐个执行
 # 清理：在 Guest 内执行 poweroff
@@ -133,7 +133,7 @@ perf stat -e kvm:kvm_exit -e kvm:kvm_entry sleep 10
 
 - **构建脚本**: `scripts/vm/build-kernel.sh` + `scripts/vm/build-rootfs-ubuntu.sh`
 - **启动脚本**: `scripts/vm/boot-vm.sh`（前台运行 QEMU）
-- **详细说明**: 参见 `/root/code/kvm-study/scripts/README.md`
+- **详细说明**: 参见 `../../scripts/README.md`
 
 ---
 
@@ -167,6 +167,6 @@ ls /sys/kernel/debug/kvm/
 
 ## 参考资料
 
-- Phase 0 README: `/root/code/kvm-study/phase0-kvm-framework/README.md`
-- KVM 源码: `/root/code/linux-6.12.93/arch/x86/kvm/`
-- KVM 文档: `/root/code/linux-6.12.93/Documentation/virt/kvm/`
+- Phase 0 README: `../README.md`
+- Linux 内核源码: `arch/x86/kvm/`
+- KVM 文档: `Documentation/virt/kvm/`

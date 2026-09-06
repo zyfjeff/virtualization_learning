@@ -46,7 +46,7 @@ echo 1 > /sys/kernel/debug/tracing/tracing_on
 
 ```bash
 # 启动一个简单的虚拟机
-cd /root/code/kvm-study/scripts/testing
+cd scripts/testing
 ./boot-vm.sh
 
 # 在虚拟机中执行内存密集操作

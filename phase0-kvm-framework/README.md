@@ -802,13 +802,13 @@ qemu-system-x86_64 -mem-path /dev/hugepages -mem-prealloc ...
 
 ```bash
 # 进入实践目录
-cd /root/code/kvm-study/phase0-kvm-framework/practice/
+cd practice/
 
 # 查看详细指南
 cat README.md
 
 # 启动 VM（所有练习都需要，前台运行，建议单独开一个终端）
-cd /root/code/kvm-study/scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
+cd ../../scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
 
 # Phase 0 的练习为手工步骤形式（无封装脚本），按 practice/README.md 的
 # 「练习详情」依次执行 ftrace / perf / QEMU trace 命令

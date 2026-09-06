@@ -329,7 +329,7 @@ VM-Resume
 ### 练习 1: 内存类型分析
 
 ```bash
-cd /root/code/kvm-study/phase2-mem-virt/practice
+cd phase2-mem-virt/practice
 ./memtype_analysis
 ```
 
@@ -341,7 +341,7 @@ cd /root/code/kvm-study/phase2-mem-virt/practice
 ### 练习 2: EPT Violation 可视化
 
 ```bash
-cd /root/code/kvm-study/phase2-mem-virt/practice
+cd phase2-mem-virt/practice
 ./ept_violation_demo
 ```
 

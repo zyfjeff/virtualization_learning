@@ -157,7 +157,7 @@ VMCS 布局 (6.12.93 arch/x86/include/asm/vmx.h):
 
 ```bash
 # 进入实践目录
-cd /root/code/kvm-study/phase1-vtx-basics/practice/
+cd practice/
 
 # 查看详细指南
 cat README.md
@@ -171,7 +171,7 @@ sudo ./ex2-cpuid-fault       # CPUID Faulting 测试
 sudo ./ex3-msr-test          # MSR 测试
 
 # 运行需要 VM 的实验：先在另一个终端启动 VM
-cd /root/code/kvm-study/scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
+cd ../../scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
 # 回到 practice 目录测量
 sudo ./ex5-vmexit-overhead   # VM-Exit 开销测量
 # 清理：在 Guest 内执行 poweroff
@@ -259,7 +259,7 @@ echo 0 > /sys/kernel/debug/tracing/tracing_on
 ### 示例1: VMX能力检测 (安全入门)
 
 ```bash
-cd /root/code/kvm-study/examples/minimal-vmx/vmx-info/
+cd ../../examples/minimal-vmx/vmx-info/
 make
 sudo insmod vmx-info.ko
 dmesg | tail -30    # 查看CPU虚拟化能力
@@ -272,7 +272,7 @@ sudo rmmod vmx-info
 ### 示例2: KVM API完整演示
 
 ```bash
-cd /root/code/kvm-study/examples/kvm-api-demo/
+cd ../../examples/kvm-api-demo/
 make
 sudo ./kvm-demo     # 创建VM、设置vCPU、运行Guest代码
 ```

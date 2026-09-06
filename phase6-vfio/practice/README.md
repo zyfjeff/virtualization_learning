@@ -77,7 +77,7 @@ echo $BDF | sudo tee /sys/bus/pci/drivers_probe
 ### 5. 编译
 
 ```bash
-cd /root/code/kvm-study/phase6-vfio/practice
+cd .
 make
 ```
 
@@ -449,7 +449,7 @@ alloc 阶段中断还没 activate，先用它占位（`arch/x86/kernel/apic/vect
 仓库里有专为本实验准备的脚本（内置 `DEVICE="0000:4b:00.0"`，`stop` 会自动恢复原驱动）：
 
 ```bash
-cd /root/code/kvm-study/scripts/vm
+cd ../../scripts/vm
 sudo ./setup-vfio-vm.sh start        # tmux 会话 pi-test-vm
 sudo ./setup-vfio-vm.sh status
 ```
@@ -597,7 +597,7 @@ Guest 收了 629 个中断，宿主一个都没收到。中断走的是
 #### 收尾（务必执行）
 
 ```bash
-cd /root/code/kvm-study/scripts/vm
+cd ../../scripts/vm
 sudo ./setup-vfio-vm.sh stop         # 同时把设备恢复到原驱动
 
 # ftrace 状态全清 —— 注意不只是 kprobe_events
@@ -713,16 +713,16 @@ dmesg | grep -i "Posted-Interrupt\|posting"          # 硬件 PI 能力
 
 ## 参考资料
 
-- Phase 6 README：`/root/code/kvm-study/phase6-vfio/README.md`
-- 本 phase 勘误：`/root/code/kvm-study/phase6-vfio/corrections.md`
-- Phase 4（中断虚拟化 + VT-d IR）：`/root/code/kvm-study/phase4-interrupts/`
-- 实验 VM 环境：`/root/code/kvm-study/scripts/README.md`
-- VFIO 内核源码：`/root/code/linux-6.12.93/drivers/vfio/`
-- VFIO PCI 中断：`/root/code/linux-6.12.93/drivers/vfio/pci/vfio_pci_intrs.c`
-- IOMMU 核心：`/root/code/linux-6.12.93/drivers/iommu/iommu.c`
-- Intel IOMMU 驱动：`/root/code/linux-6.12.93/drivers/iommu/intel/`
-- Intel 中断重映射：`/root/code/linux-6.12.93/drivers/iommu/intel/irq_remapping.c`
-- `struct irte` 定义：`/root/code/linux-6.12.93/include/linux/dmar.h:201`
-- irq_bypass 管理器：`/root/code/linux-6.12.93/virt/lib/irqbypass.c`
-- KVM irqfd：`/root/code/linux-6.12.93/virt/kvm/eventfd.c`
+- Phase 6 README：`../README.md`
+- 本 phase 勘误：`../corrections.md`
+- Phase 4（中断虚拟化 + VT-d IR）：`../../phase4-interrupts/`
+- 实验 VM 环境：`../../scripts/README.md`
+- VFIO 内核源码：`drivers/vfio/`
+- VFIO PCI 中断：`drivers/vfio/pci/vfio_pci_intrs.c`
+- IOMMU 核心：`drivers/iommu/iommu.c`
+- Intel IOMMU 驱动：`drivers/iommu/intel/`
+- Intel 中断重映射：`drivers/iommu/intel/irq_remapping.c`
+- `struct irte` 定义：`include/linux/dmar.h:201`
+- irq_bypass 管理器：`virt/lib/irqbypass.c`
+- KVM irqfd：`virt/kvm/eventfd.c`
 - 规范：intel-vtd.pdf（IRTE 格式见 9.10）；intel-vmx.pdf（Posted-Interrupt 处理见 30.6）

@@ -14,7 +14,7 @@
 ### 步骤1: VMX能力检测 (安全入门)
 
 ```bash
-cd /root/code/kvm-study/examples/minimal-vmx/vmx-info/
+cd vmx-info/
 
 # 编译和加载
 make
@@ -64,7 +64,7 @@ sudo rmmod kvm_intel 2>/dev/null
 sudo rmmod kvm 2>/dev/null
 
 # 编译 (在主目录)
-cd /root/code/kvm-study/examples/minimal-vmx/
+cd examples/minimal-vmx
 make
 
 # 加载

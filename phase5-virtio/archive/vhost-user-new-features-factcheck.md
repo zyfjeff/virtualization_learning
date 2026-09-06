@@ -378,9 +378,9 @@ grep -rn "VHOST_USER_PROTOCOL_F_SHMEM_MAP" hw/virtio/
 
 ## 📚 参考
 
-- QEMU 10.1.0-rc2 源码: `/root/code/qemu-10.1.0-rc2/`
+- QEMU 10.1.0-rc2 源码
 - vhost-user 协议文档: `vhost-user-protocol-latest.md`
-- VT-d 规范: `/root/code/kvm-study/intel-vtd.pdf`
+- VT-d 规范: `../../../intel-vtd.pdf`
 
 ---
 

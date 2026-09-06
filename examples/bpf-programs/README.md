@@ -33,7 +33,7 @@ zcat /proc/config.gz | grep CONFIG_BPF
 ### 5 分钟上手
 
 ```bash
-cd /root/code/kvm-study/examples/bpf-programs
+cd examples/bpf-programs
 
 # 方法1: KVM 全局概览 (推荐首先运行)
 sudo bpftrace kvm-overview.bpf

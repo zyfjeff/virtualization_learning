@@ -457,7 +457,7 @@ SPTE = 0x0000F00000000005
 
 ```bash
 # 进入实践目录
-cd /root/code/kvm-study/phase2-mem-virt/practice/
+cd practice/
 
 # 查看详细指南
 cat README.md
@@ -466,7 +466,7 @@ cat README.md
 make
 
 # 启动 VM（所有练习都需要，前台运行，建议单独开一个终端）
-cd /root/code/kvm-study/scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
+cd ../../scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
 
 # 运行练习
 sudo ./ept_violation_demo      # EPT Violation 演示

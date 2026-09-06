@@ -9,7 +9,7 @@
 ## 快速开始
 
 ```bash
-cd /root/code/kvm-study/phase5-virtio/practice/
+cd phase5-virtio/practice/
 
 # 1. 启动 VM (vhost=on)
 sudo bash vhost-perf-test.sh setup
@@ -38,10 +38,10 @@ apt-get install iperf3
 ip tuntap list
 
 # 确认内核和 initramfs 存在
-ls /root/code/kvm-study/scripts/images/
+ls ../../scripts/images/
 
 # 确认内核启用了 virtio-net
-grep -E "VIRTIO_NET|NETDEVICES" /root/code/linux-6.12.93/.config
+grep -E "VIRTIO_NET|NETDEVICES" .config
 
 # Guest 内: 确认 feature 协商结果（sysfs 属性 features
 # 定义于 drivers/virtio/virtio.c:62；位含义对照
@@ -115,7 +115,7 @@ vhost_iotlb 的作用:
   CONFIG_INET=y
 
 构建 initramfs:
-  bash /root/code/kvm-study/scripts/vm/build-rootfs-iperf.sh
+  bash ../../scripts/vm/build-rootfs-iperf.sh
 ```
 
 ---

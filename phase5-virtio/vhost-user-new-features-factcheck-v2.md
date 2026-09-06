@@ -459,10 +459,10 @@ grep -rn "VHOST_USER_PROTOCOL_F_SHMEM_MAP\|22" lib/vhost/
 
 ## 📚 参考
 
-- QEMU 11.1.0 源码: `/root/code/qemu-11.1.0/`
-- DPDK 源码: `/root/code/dpdk/`
+- QEMU 11.1.0 源码
+- DPDK 源码
 - vhost-user 协议文档: `vhost-user-protocol-latest.md`
-- VT-d 规范: `/root/code/kvm-study/intel-vtd.pdf`
+- VT-d 规范: `intel-vtd.pdf`
 
 ---
 

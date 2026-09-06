@@ -186,7 +186,7 @@ Step 4: 页面分配与回收
 ### 练习 1: 内存类型分析
 
 ```bash
-cd /root/code/kvm-study/phase2-mem-virt/practice
+cd phase2-mem-virt/practice
 gcc -o memtype_analysis memtype_analysis.c
 ./memtype_analysis
 ```
@@ -205,7 +205,7 @@ gcc -o memtype_analysis memtype_analysis.c
 ### 练习 2: EPT Violation 可视化
 
 ```bash
-cd /root/code/kvm-study/phase2-mem-virt/practice
+cd phase2-mem-virt/practice
 gcc -o ept_violation_demo ept_violation_demo.c
 ./ept_violation_demo
 ```

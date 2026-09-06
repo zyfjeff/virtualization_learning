@@ -2,7 +2,7 @@
 
 ## 核查概述
 
-对 `/root/code/kvm-study/phase2-mem-virt/mmio-identification.md` 文档进行代码级别的事实核查。
+对 `phase2-mem-virt/mmio-identification.md` 文档进行代码级别的事实核查。
 
 ---
 
@@ -243,7 +243,7 @@ return !is_zero_pfn(pfn) && PageReserved(pfn_to_page(pfn)) &&
 
 ## 核查依据
 
-- 内核源码：`/root/code/linux-bak/arch/x86/kvm/mmu/spte.c`
-- 内核源码：`/root/code/linux-bak/arch/x86/kvm/vmx/vmx.c`
-- 内核源码：`/root/code/linux-bak/virt/kvm/vfio.c`
+- 内核源码：`arch/x86/kvm/mmu/spte.c`
+- 内核源码：`arch/x86/kvm/vmx/vmx.c`
+- 内核源码：`virt/kvm/vfio.c`
 - 核查时间：2026-07-03
