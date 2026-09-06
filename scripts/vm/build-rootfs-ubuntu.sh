@@ -150,7 +150,6 @@ Types: deb
 URIs: http://archive.ubuntu.com/ubuntu/
 Suites: ${UBUNTU_VERSION} ${UBUNTU_VERSION}-updates ${UBUNTU_VERSION}-security
 Components: main universe
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
     fi
 
