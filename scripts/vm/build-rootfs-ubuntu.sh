@@ -62,8 +62,15 @@ check_dependencies() {
 build_base_system() {
     log_info "使用 debootstrap 构建 Ubuntu $UBUNTU_VERSION 基础系统..."
 
+    # 清理上次运行可能残留的 bind mount
+    if [ -d "$ROOTFS_DIR" ]; then
+        umount "$ROOTFS_DIR/dev" 2>/dev/null || true
+        umount "$ROOTFS_DIR/proc" 2>/dev/null || true
+        umount "$ROOTFS_DIR/sys" 2>/dev/null || true
+    fi
+
     rm -rf "$ROOTFS_DIR"
-    
+
     # 使用 debootstrap 构建最小系统
     debootstrap --arch=amd64 --variant=minbase \
         "$UBUNTU_VERSION" "$ROOTFS_DIR" \
@@ -136,17 +143,25 @@ install_test_tools() {
     log_info "安装测试工具..."
 
     # 挂载必要的文件系统
-    mount --bind /dev "$ROOTFS_DIR/dev" || true
     mount --bind /proc "$ROOTFS_DIR/proc" || true
     mount --bind /sys "$ROOTFS_DIR/sys" || true
 
     # 确保退出时清理 bind mount
     cleanup_mounts() {
-        umount "$ROOTFS_DIR/dev" 2>/dev/null || true
         umount "$ROOTFS_DIR/proc" 2>/dev/null || true
         umount "$ROOTFS_DIR/sys" 2>/dev/null || true
     }
     trap cleanup_mounts EXIT
+
+    # 创建设备节点（debootstrap minbase 不创建，不 bind mount /dev 以避免权限问题）
+    mkdir -p "$ROOTFS_DIR/dev"
+    [ -e "$ROOTFS_DIR/dev/null" ] || mknod -m 666 "$ROOTFS_DIR/dev/null" c 1 3
+    [ -e "$ROOTFS_DIR/dev/zero" ] || mknod -m 666 "$ROOTFS_DIR/dev/zero" c 1 5
+    [ -e "$ROOTFS_DIR/dev/random" ] || mknod -m 666 "$ROOTFS_DIR/dev/random" c 1 8
+    [ -e "$ROOTFS_DIR/dev/urandom" ] || mknod -m 666 "$ROOTFS_DIR/dev/urandom" c 1 9
+    [ -e "$ROOTFS_DIR/dev/console" ] || mknod -m 600 "$ROOTFS_DIR/dev/console" c 5 1
+    # apt 需要 /dev/fd
+    [ -e "$ROOTFS_DIR/dev/fd" ] || ln -sf /proc/self/fd "$ROOTFS_DIR/dev/fd"
 
     # 添加 universe 仓库（minbase 只有 main）
     if [ -f "$ROOTFS_DIR/etc/apt/sources.list" ]; then
@@ -325,32 +340,44 @@ EOF
     log_info "✓ 启动信息创建完成"
 }
 
-# 打包为磁盘镜像
+# 打包为磁盘镜像（使用 loop device，避免 qemu-nbd daemonize 问题）
 create_disk_image() {
     log_info "打包为磁盘镜像..."
 
     local disk_img="$OUTPUT_DIR/disk-ubuntu.img"
-    
-    # 创建 10G 磁盘镜像
-    qemu-img create -f qcow2 "$disk_img" 10G
-    
+    local raw_img="$OUTPUT_DIR/disk-ubuntu.raw"
+
     # 创建临时目录
     local mnt_dir=$(TMPDIR=/tmp mktemp -d)
-    
-    # 挂载镜像
-    modprobe nbd max_part=8 || true
-    qemu-nbd --connect=/dev/nbd0 "$disk_img"
-    mkfs.ext4 /dev/nbd0
-    mount /dev/nbd0 "$mnt_dir"
-    
+
+    # 创建 10G raw 镜像
+    dd if=/dev/zero of="$raw_img" bs=1M count=10240 status=progress 2>/dev/null || \
+        fallocate -l 10G "$raw_img"
+
+    # 用 loop device 挂载
+    local loop_dev
+    loop_dev=$(losetup --find --show "$raw_img")
+
+    mkfs.ext4 -F "$loop_dev"
+    mount "$loop_dev" "$mnt_dir"
+
+    # 确保 ROOTFS_DIR 内的虚拟文件系统已卸载（避免复制 /proc /sys 内容）
+    umount "$ROOTFS_DIR/proc" 2>/dev/null || true
+    umount "$ROOTFS_DIR/sys" 2>/dev/null || true
+    umount "$ROOTFS_DIR/dev" 2>/dev/null || true
+
     # 复制 rootfs
     cp -a "$ROOTFS_DIR"/* "$mnt_dir"/
 
     # 卸载
     umount "$mnt_dir"
-    qemu-nbd --disconnect /dev/nbd0
+    losetup --detach "$loop_dev"
     rmdir "$mnt_dir"
-    
+
+    # 转换为 qcow2（节省空间）
+    qemu-img convert -f raw -O qcow2 "$raw_img" "$disk_img"
+    rm -f "$raw_img"
+
     local size=$(du -h "$disk_img" | cut -f1)
     log_info "✓ 磁盘镜像创建完成 ($size)"
 }

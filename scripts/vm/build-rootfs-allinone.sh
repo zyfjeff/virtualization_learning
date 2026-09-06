@@ -229,7 +229,10 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
 # 挂载 9p 共享目录（如果可用）
 mkdir -p /mnt/shared
-mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/shared 2>/dev/null || true
+# busybox mount 语法：先检查是否支持 9p
+if grep -q "9p" /proc/filesystems 2>/dev/null; then
+    mount -t 9p -o "trans=virtio,version=9p2000.L" hostshare /mnt/shared 2>/dev/null || true
+fi
 
 # 配置网络（如果有 eth0）
 if ip link show eth0 &>/dev/null; then

@@ -78,7 +78,10 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 
 # 9p 共享目录只有 QEMU (-virtfs) 才有；自研 VMM (phase8) 里必然失败，忽略
 mkdir -p /mnt/shared
-mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/shared 2>/dev/null || true
+# busybox mount 语法：先检查是否支持 9p
+if grep -q "9p" /proc/filesystems 2>/dev/null; then
+    mount -t 9p -o "trans=virtio,version=9p2000.L" hostshare /mnt/shared 2>/dev/null || true
+fi
 
 echo "---- initramfs ----"
 echo "kernel       : $(uname -r)"
