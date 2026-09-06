@@ -174,8 +174,8 @@ check_accel() {
 
 check_accel
 
-# 设置内核路径
-KERNEL="/root/code/linux-6.12.93/arch/x86_64/boot/bzImage"
+# 设置内核路径（使用 build-kernel.sh 输出的 bzImage）
+KERNEL="$IMAGES_DIR/bzImage"
 if [ ! -f "$KERNEL" ]; then
     log_error "内核不存在: $KERNEL"
     log_error "请先运行: $SCRIPT_DIR/build-kernel.sh"

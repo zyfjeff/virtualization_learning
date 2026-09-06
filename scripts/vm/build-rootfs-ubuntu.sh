@@ -118,11 +118,15 @@ StandardOutput=tty
 WantedBy=getty.target
 EOF
 
-    # 启用 serial console
-    chroot "$ROOTFS_DIR" systemctl enable serial-getty@ttyS0.service
+    # 启用 serial console（minbase 无 systemctl，手动建符号链接）
+    mkdir -p "$ROOTFS_DIR/etc/systemd/system/getty.target.wants"
+    ln -sf /lib/systemd/system/serial-getty@.service \
+        "$ROOTFS_DIR/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
 
     # 配置默认 target
-    chroot "$ROOTFS_DIR" systemctl set-default multi-user.target
+    mkdir -p "$ROOTFS_DIR/etc/systemd/system"
+    ln -sf /lib/systemd/system/multi-user.target \
+        "$ROOTFS_DIR/etc/systemd/system/default.target"
 
     log_info "✓ 系统配置完成"
 }
@@ -136,7 +140,21 @@ install_test_tools() {
     mount --bind /proc "$ROOTFS_DIR/proc" || true
     mount --bind /sys "$ROOTFS_DIR/sys" || true
 
-    # 安装测试工具
+    # 添加 universe 仓库（minbase 只有 main）
+    if [ -f "$ROOTFS_DIR/etc/apt/sources.list" ]; then
+        sed -i 's/main$/main universe/' "$ROOTFS_DIR/etc/apt/sources.list"
+    elif [ -d "$ROOTFS_DIR/etc/apt/sources.list.d" ]; then
+        # Ubuntu 24.04+ 使用 deb822 格式
+        cat > "$ROOTFS_DIR/etc/apt/sources.list.d/ubuntu.sources" <<EOF
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: ${UBUNTU_VERSION} ${UBUNTU_VERSION}-updates ${UBUNTU_VERSION}-security
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+    fi
+
+    # 更新并安装测试工具
     chroot "$ROOTFS_DIR" apt-get update
     chroot "$ROOTFS_DIR" apt-get install -y --no-install-recommends \
         iperf3 \
@@ -152,8 +170,11 @@ install_test_tools() {
         procps \
         sysstat \
         strace \
-        linux-tools-generic \
-        bpftrace
+        linux-tools-generic || true
+
+    # bpftrace 可能需要额外源，单独处理
+    chroot "$ROOTFS_DIR" apt-get install -y --no-install-recommends bpftrace || \
+        log_warn "bpftrace 安装失败，跳过"
 
     # 清理
     chroot "$ROOTFS_DIR" apt-get clean
@@ -309,7 +330,7 @@ create_disk_image() {
     qemu-img create -f qcow2 "$disk_img" 10G
     
     # 创建临时目录
-    local mnt_dir=$(mktemp -d)
+    local mnt_dir=$(TMPDIR=/tmp mktemp -d)
     
     # 挂载镜像
     modprobe nbd max_part=8 || true
@@ -319,23 +340,6 @@ create_disk_image() {
     
     # 复制 rootfs
     cp -a "$ROOTFS_DIR"/* "$mnt_dir"/
-    
-    # 安装 GRUB
-    cat > "$mnt_dir/boot/grub/grub.cfg" <<EOF
-set timeout=0
-set default=0
-
-menuentry "KVM Study Ubuntu" {
-    linux /boot/vmlinuz root=/dev/vda ro console=ttyS0
-    initrd /boot/initrd.img
-}
-EOF
-
-    # 复制内核和 initrd
-    cp /boot/vmlinuz-$(uname -r) "$mnt_dir/boot/vmlinuz" 2>/dev/null || \
-        cp /boot/vmlinuz "$mnt_dir/boot/vmlinuz" 2>/dev/null || true
-    cp /boot/initrd.img-$(uname -r) "$mnt_dir/boot/initrd.img" 2>/dev/null || \
-        cp /boot/initrd.img "$mnt_dir/boot/initrd.img" 2>/dev/null || true
 
     # 卸载
     umount "$mnt_dir"
