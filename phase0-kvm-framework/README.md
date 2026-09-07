@@ -943,60 +943,7 @@ Host内核中断处理 → kvm_set_irq(irq)
 
 ## ⚠️ 常见陷阱
 
-### 陷阱1（debug）：静默回退到软件模拟
-
-**场景**：VMM 调用 `open("/dev/kvm")` 成功，但未正确走 `ioctl(KVM_RUN)` 路径
-
-**症状**：
-- 所有 `kvm_exit` tracepoint 为零事件
-- Guest 运行极慢（比硬件虚拟化慢 10-100 倍）
-- `/proc/<qemu-pid>/fd` 中没有指向 `/dev/kvm` 的文件描述符
-
-**原因**：某些 VMM（如 QEMU）在未显式启用 KVM 时，会**静默回退**到纯软件模拟（TCG），不报错但性能极差
-
-**诊断**：
-```bash
-# 检查 QEMU 进程是否真的在使用 KVM
-ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm
-# 返回 >0 表示走 KVM，=0 表示走 TCG
-```
-
-**解决**：启动 VM 时必须显式传 `-enable-kvm`（QEMU）或调用 `ioctl(KVM_CREATE_VM)` + `ioctl(KVM_CREATE_VCPU)` + `ioctl(KVM_RUN)`（通用 VMM）
-
-**验证**：`scripts/vm/boot-vm.sh` 默认带上 `-enable-kvm -cpu host` 并在启动前自检
-
-### 陷阱2（debug）：tracefs 的 `echo >` 会清掉所有已有配置
-
-**场景**：调试 VM 时，先配置好 `kvm_exit` 的 filter，再用 `echo` 添加 `kvm_entry`
-
-**症状**：
-- `kvm_exit` 事件突然消失
-- 只看到 `kvm_entry` 事件
-
-**原因**：`set_event`、`set_ftrace_filter`、`set_event_pid` 三个文件上**带 `O_TRUNC` 的写**（`echo x > file`、不带 `-a` 的 `tee`）会**先清掉全部已有配置**，再写入本次内容
-
-**示例**：
-```bash
-# 错误做法：第二次 echo 会清掉 kvm_exit
-echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
-echo kvm:kvm_entry > /sys/kernel/debug/tracing/set_event  # ← kvm_exit 被清掉！
-
-# 正确做法：用 >> 追加，或一次性写入多个事件
-echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
-echo kvm:kvm_entry >> /sys/kernel/debug/tracing/set_event
-
-# 或者一次性写入
-echo 'kvm:kvm_exit kvm:kvm_entry' > /sys/kernel/debug/tracing/set_event
-```
-
-**解决**：
-- 添加事件时用 `>>`（追加）而非 `>`（覆盖）
-- 清场时显式写 `: > set_event` 并注明
-- `set_ftrace_filter` 和 `set_event_pid` 同理
-
-**源码位置**：`kernel/trace/trace_events.c:2411-2423`（`set_event` 清空逻辑）
-
-### 陷阱3（性能调优）：halt-polling 调大不是万能的
+### 陷阱1（性能调优）：halt-polling 调大不是万能的
 
 **场景**：为了降低中断延迟，将 `halt_poll_ns` 从默认 200μs 调到 1ms 甚至 10ms
 
@@ -1019,7 +966,7 @@ echo 'kvm:kvm_exit kvm:kvm_entry' > /sys/kernel/debug/tracing/set_event
 
 **源码位置**：`arch/x86/kvm/x86.c` → `kvm_vcpu_halt()` → halt-polling 循环
 
-### 陷阱4（VMM）：`KVM_EXIT_SHUTDOWN` 与 `KVM_EXIT_SYSTEM_EVENT` 的区别
+### 陷阱2（VMM）：`KVM_EXIT_SHUTDOWN` 与 `KVM_EXIT_SYSTEM_EVENT` 的区别
 
 **场景**：VMM 收到 `kvm_run->exit_reason`，未区分 `KVM_EXIT_SHUTDOWN` 和 `KVM_EXIT_SYSTEM_EVENT`
 
@@ -1208,9 +1155,8 @@ echo "$ORIG" > /sys/module/kvm/parameters/halt_poll_ns
 - [ ] 解释为什么KVM要在内核态处理部分VM-Exit
 - [ ] 列举至少5种常见的VM-Exit原因，并说明哪些走快速路径、哪些走慢速路径
 - [ ] 使用ftrace观察VM-Exit，能识别EXTERNAL_INTERRUPT、EPT_VIOLATION、CPUID等常见类型
-- [ ] 说明如何判断一次 VM 运行是否真的走了 KVM（而非静默回退到软件模拟）
 - [ ] 区分 `KVM_EXIT_SHUTDOWN` 与 `KVM_EXIT_SYSTEM_EVENT` 的触发场景和处理方式
-- [ ] 列举至少3个调试 VM 时常见的陷阱（tracefs 配置、静默回退、halt-polling 误区）
+- [ ] 说明 halt-polling 的适用条件和常见误区
 
 ---
 
