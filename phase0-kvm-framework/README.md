@@ -473,6 +473,266 @@ kvm_vcpu_ioctl() [kvm_main.c:4445]
 
 ---
 
+## 🔍 VM-Exit 原因详解
+
+VM-Exit 是 KVM 虚拟化的核心机制。当 Guest 执行某些敏感操作或触发特定事件时，CPU 硬件会从 Guest 模式切换回 Host 模式，并将控制权交给 KVM。理解常见的 VM-Exit 原因对性能调优和问题诊断至关重要。
+
+### 1. Intel VM-Exit 硬件原因（Exit Reason）
+
+Intel VT-x 定义了硬件级别的 VM-Exit 原因，存储在 VMCS 的 `VM_EXIT_REASON` 字段中。以下是 KVM 实际处理的最常见原因：
+
+| Exit Reason | 数值 | 描述 | KVM 处理方式 | 是否返回用户态 |
+|------------|------|------|-------------|---------------|
+| `EXIT_REASON_EXCEPTION_NMI` | 0 | 异常或 NMI | `handle_exception_nmi()` | 视异常类型而定 |
+| `EXIT_REASON_EXTERNAL_INTERRUPT` | 1 | **外部中断** | `handle_external_interrupt()` | ❌ 内核态处理 |
+| `EXIT_REASON_TRIPLE_FAULT` | 2 | 三重错误（崩溃） | `handle_triple_fault()` | ❌ 注入关机事件 |
+| `EXIT_REASON_INTERRUPT_WINDOW` | 7 | 中断窗口打开 | `handle_interrupt_window()` | ❌ 内核态处理 |
+| `EXIT_REASON_CPUID` | 10 | CPUID 指令 | `kvm_emulate_cpuid()` | ❌ 内核态处理 |
+| `EXIT_REASON_HLT` | 12 | HLT 指令 | `kvm_emulate_halt()` | ❌ 内核态处理 |
+| `EXIT_REASON_CR_ACCESS` | 28 | 控制寄存器访问 | `handle_cr()` | ❌ 内核态处理 |
+| `EXIT_REASON_IO_INSTRUCTION` | 30 | I/O 指令（IN/OUT） | `handle_io()` | 视端口而定 |
+| `EXIT_REASON_MSR_READ` | 31 | RDMSR 指令 | `kvm_emulate_rdmsr()` | 部分返回用户态 |
+| `EXIT_REASON_MSR_WRITE` | 32 | WRMSR 指令 | `kvm_emulate_wrmsr()` | 部分返回用户态 |
+| `EXIT_REASON_EPT_VIOLATION` | 48 | **EPT 页错误** | `handle_ept_violation()` | ❌ 内核态处理 |
+| `EXIT_REASON_EPT_MISCONFIG` | 49 | **MMIO 访问** | `handle_ept_misconfig()` | 快速路径内核态，慢速路径返回用户态 |
+
+**源码引用**: `arch/x86/include/uapi/asm/vmx.h:32-92`（完整定义），`arch/x86/kvm/vmx/vmx.c:6095-6147`（处理函数表）
+
+### 2. 常见 VM-Exit 场景分析
+
+#### 快速路径（内核态处理，不返回用户态）
+
+```
+① 外部中断（EXIT_REASON_EXTERNAL_INTERRUPT）
+   Guest 执行中 ← 硬件中断到达（网卡/定时器/键盘）
+       │
+       ▼
+   vmx_handle_exit() → handle_external_interrupt()
+       │
+       ├── 更新虚拟 LAPIC 状态
+       ├── 不修改 kvm_run 结构
+       └── return 1 → 继续 vcpu_run() 循环，重新进入 Guest
+   
+   耗时：~1-2 μs（无上下文切换）
+
+② CPUID 指令（EXIT_REASON_CPUID）
+   Guest 执行 CPUID ← 查询 CPU 特性
+       │
+       ▼
+   vmx_handle_exit() → kvm_emulate_cpuid()
+       │
+       ├── 调用 kvm_cpuid() 从 vCPU 的 CPUID 表查询结果
+       │   └── 表在初始化时由 QEMU 通过 KVM_SET_CPUID2 设置
+       ├── 直接写入 vCPU 寄存器（eax/ebx/ecx/edx）
+       ├── 调用 kvm_skip_emulated_instruction() 跳过 CPUID 指令
+       └── return 1 → 继续 vcpu_run() 循环，重新进入 Guest
+   
+   耗时：~1-3 μs（无用户态/内核态切换）
+
+③ HLT 指令（EXIT_REASON_HLT）
+   Guest 执行 HLT ← 空闲等待中断
+       │
+       ▼
+   vmx_handle_exit() → kvm_emulate_halt()
+       │
+       ├── 设置 mp_state = KVM_MP_STATE_HALTED
+       └── return 1 → vcpu_run() 进入 halt-polling
+   
+   耗时：~0.5 μs（加上 halt-polling 延迟）
+
+④ EPT Violation（EXIT_REASON_EPT_VIOLATION）
+   Guest 访问 GPA ← EPT 页表缺失或权限不足
+       │
+       ▼
+   vmx_handle_exit() → handle_ept_violation()
+       │
+       ├── kvm_mmu_page_fault()
+       │   ├── 查找 memslot → gfn_to_hva()
+       │   ├── 获取物理页 → hva_to_pfn()
+       │   └── 更新 EPT 页表 → kvm_tdp_mmu_map()
+       │
+       └── return 1 → 重新进入 Guest，EPT 命中
+   
+   耗时：~5-20 μs（取决于是否分配新页）
+
+⑤ EPT Misconfig（EXIT_REASON_EPT_MISCONFIG）— MMIO 访问
+   Guest 访问 MMIO 区域的 GPA ← EPT 页表项是特殊的 MMIO SPTE
+       │
+       ▼
+   vmx_handle_exit() → handle_ept_misconfig()
+       │
+       ├── 检查是否是 MMIO SPTE（权限位 W+X = 110b）
+       ├── kvm_mmu_page_fault() → handle_mmio_page_fault()
+       │   ├── 识别为 MMIO 访问
+       │   ├── 尝试快速 MMIO 路径（kvm_io_bus_write）
+       │   │   └── 成功 → return，继续 Guest
+       │   └── 慢速路径 → x86_emulate_instruction()
+       │       ├── 解码 MMIO 指令，提取地址和数据
+       │       ├── 设置 kvm_run->exit_reason = KVM_EXIT_MMIO
+       │       ├── 填充 kvm_run->mmio 结构（phys_addr, data, len, is_write）
+       │       ├── 设置 complete_userspace_io = complete_emulated_mmio
+       │       └── return 0 → ioctl(KVM_RUN) 返回到 VMM
+       │
+       └── VMM 处理：
+           - 根据 kvm_run->mmio.phys_addr 查找注册的 MMIO 处理函数
+           - 支持 data match 规则（如 KVM_IOEVENTFD 的 datamatch 参数）
+           - 模拟设备行为，填写返回值到 kvm_run->mmio.data
+           - 再次 ioctl(KVM_RUN) 进入 Guest
+       
+       KVM 完成仿真：
+           - 调用 complete_emulated_mmio() 完成剩余的 MMIO 片段
+           - 继续 Guest 执行
+   
+   耗时：~10-50 μs（包含用户态/内核态切换）
+
+**EPT Misconfig 的巧妙设计**：
+- KVM 为 MMIO 区域的 GPA 在 EPT 中设置特殊的页表项（SPTE）
+- 这个 SPTE 的权限位故意设置为 `W+X`（bits 2:0 = 110b），这是 Intel SDM 规定的非法组合
+- Guest 访问时，硬件检测到无效 EPT 配置，自动触发 `EXIT_REASON_EPT_MISCONFIG`
+- 这是一种利用硬件验证机制来拦截 MMIO 访问的优化，避免额外的页表遍历
+
+**MMIO 的两条路径**：
+1. **快速路径**：`kvm_io_bus_write()` 直接完成（已注册的 ioeventfd 等）→ 继续 Guest
+2. **慢速路径**：`x86_emulate_instruction()` 解码指令 → 返回用户态 → VMM 分发处理
+
+**VMM 的 MMIO 分发**：
+- VMM 通过 `KVM_SET_USER_MEMORY_REGION` 注册 MMIO 区域（无 memslot 的 GPA）
+- VMM 可通过 `KVM_IOEVENTFD` 注册带 data match 的规则（如 virtio 的 notify 端口）
+- KVM 解析出 MMIO 的地址和数据后，VMM 根据这些规则分发到对应的处理函数
+```
+
+#### 慢速路径（返回用户态，由 VMM 处理）
+
+```
+① 被 MSR 过滤器拦截的 MSR（EXIT_REASON_MSR_READ/WRITE）
+   Guest 执行 RDMSR/WRMSR ← 访问被 VMM 过滤器拦截的 MSR
+       │
+       ▼
+   vmx_handle_exit() → kvm_emulate_rdmsr/wrmsr()
+       │
+       ├── 第一层：检查 VMM 设置的 MSR 过滤器（KVM_X86_SET_MSR_FILTER）
+       │   ├── MSR 在过滤器中且需要拦截 → 进入第三层
+       │   └── MSR 不在过滤器中 → 进入第二层
+       │
+       ├── 第二层：检查 KVM 内置白名单
+       │   ├── MSR 在白名单中（如 TSC、APIC_BASE）→ 内核态处理，return 1
+       │   └── MSR 不在白名单中 → 进入第三层
+       │
+       └── 第三层：调用 kvm_msr_user_space()
+           ├── 设置 kvm_run->exit_reason = KVM_EXIT_X86_RDMSR/WRMSR
+           ├── 填充 kvm_run->msr 结构（index, data, reason）
+           └── return 0 → ioctl(KVM_RUN) 返回到 VMM
+   
+   VMM 处理（以 QEMU 为例）：
+   - 遍历 msr_handlers 数组，查找匹配的 MSR
+   - 调用对应的 handler（如 kvm_rdmsr_pkg_power_limit）
+   - 填写返回值到 kvm_run->msr.data
+   - 设置 kvm_run->msr.error（0=成功，1=失败）
+   - 再次 ioctl(KVM_RUN) 进入 Guest
+   
+   耗时：~20-100 μs（包含用户态/内核态切换）
+
+**QEMU 实际拦截的 MSR**（电源管理相关）：
+- `MSR_CORE_THREAD_COUNT` — CPU 核心/线程计数
+- `MSR_RAPL_POWER_UNIT` — RAPL 功率单位
+- `MSR_PKG_POWER_LIMIT` — 封装功率限制
+- `MSR_PKG_POWER_INFO` — 封装功率信息
+- `MSR_PKG_ENERGY_STATUS` — 封装能量状态
+
+源码引用：`target/i386/kvm/kvm.c:3182-3227`（过滤器注册），`:5930-5967`（处理逻辑）
+
+**"部分返回"的准确含义**：
+- **大部分 MSR**（TSC、APIC_BASE、MTRR 等）→ KVM 内置白名单，内核态处理
+- **特定 MSR**（电源管理等）→ VMM 通过过滤器拦截，返回用户态
+- **未知 MSR** → 注入 #GP 异常（或根据配置返回用户态）
+
+**关键**：VMM 必须通过 `KVM_X86_SET_MSR_FILTER` 明确告诉 KVM 哪些 MSR 需要拦截。
+如果没有设置过滤器，或 MSR 不在过滤器中，KVM 会尝试在内核态处理或注入 #GP。
+
+② 特定 I/O 端口（EXIT_REASON_IO_INSTRUCTION）
+   Guest 执行 IN/OUT ← 访问未映射的 I/O 端口
+       │
+       ▼
+   vmx_handle_exit() → handle_io()
+       │
+       ├── kvm_fast_pio_out/in() → 快速路径（已知端口）
+       │   └── 内核态处理，return 1
+       │
+       └── 慢速路径 → 设置 kvm_run->exit_reason = KVM_EXIT_IO
+           └── return 0 → ioctl(KVM_RUN) 返回到 VMM
+       
+   VMM 处理：
+   - 查找 I/O 端口处理函数
+   - 模拟设备行为（如 PIT、RTC）
+   - 再次 ioctl(KVM_RUN) 进入 Guest
+   
+   耗时：~15-80 μs（取决于设备复杂度）
+
+**注意**：MMIO 访问（如 PCI 配置空间）走的是 `EXIT_REASON_EPT_MISCONFIG`，
+通过 EPT 页表项的特殊标记（W+X = 110b）触发 VM-Exit，然后在内核态仿真或返回用户态。
+详见"快速路径"部分的第⑤项。
+```
+
+### 3. KVM 返回给用户态的 Exit Reason
+
+KVM 在内核态处理完 VM-Exit 后，可能需要返回用户态由 QEMU 处理。此时 `kvm_run->exit_reason` 设置为以下值之一：
+
+| Exit Reason | 数值 | 触发场景 | QEMU 处理方式 |
+|------------|------|---------|--------------|
+| `KVM_EXIT_IO` | 2 | I/O 端口访问 | 调用 `kvm_handle_io()` 模拟 |
+| `KVM_EXIT_HLT` | 5 | HLT 指令（特殊配置） | 通常内核态处理，仅 `lapic_in_kernel=false` 时返回 |
+| `KVM_EXIT_MMIO` | 6 | 未映射的 MMIO 访问 | 查找 MMIO 处理函数，模拟设备 |
+| `KVM_EXIT_SHUTDOWN` | 8 | 三重错误（Guest 崩溃） | 重置或终止 VM |
+| `KVM_EXIT_INTR` | 10 | Host 信号中断 | 处理信号或终止 vCPU |
+| `KVM_EXIT_X86_RDMSR` | 29 | 未处理 MSR 读取 | 返回值或注入 #GP |
+| `KVM_EXIT_X86_WRMSR` | 30 | 未处理 MSR 写入 | 接受或注入 #GP |
+| `KVM_EXIT_MEMORY_FAULT` | 39 | 内存访问错误 | 检查并修复映射 |
+
+**源码引用**: `include/uapi/linux/kvm.h:146-185`（完整定义）
+
+### 4. 使用 ftrace 观察 VM-Exit
+
+```bash
+# 启用 KVM tracepoints
+echo 1 > /sys/kernel/debug/tracing/events/kvm/enable
+
+# 启动 VM
+cd /root/code/kvm-study/scripts/vm
+./boot-vm.sh ubuntu --memory 4G --cpus 4
+
+# 实时观察 VM-Exit（新终端）
+cat /sys/kernel/debug/tracing/trace_pipe | grep kvm_exit
+
+# 典型输出：
+# qemu-system-x86-12345 [001] .... 12345.678901: kvm_exit: reason EXTERNAL_INTERRUPT rip 0xffffffff810000a0 info 0 0
+# qemu-system-x86-12345 [001] .... 12345.678902: kvm_entry: vcpu 0 rip 0xffffffff810000a0
+# qemu-system-x86-12345 [001] .... 12345.678903: kvm_exit: reason EPT_VIOLATION rip 0xffffffff810000a5 info 0x1234 0x0
+# qemu-system-x86-12345 [001] .... 12345.678904: kvm_page_fault: address 0x1234 error_code 0x0
+# qemu-system-x86-12345 [001] .... 12345.678905: kvm_entry: vcpu 0 rip 0xffffffff810000a5
+
+# 统计 VM-Exit 频率
+perf record -e kvm:kvm_exit -a -g -- sleep 10
+perf report --stdio
+```
+
+### 5. VM-Exit 性能影响
+
+| VM-Exit 类型 | 典型频率 | 单次开销 | 优化建议 |
+|-------------|---------|---------|---------|
+| 外部中断 | 高（~10k/s） | ~1-2 μs | 使用 Posted Interrupts 减少 VM-Exit |
+| EPT Violation | 中（首次访问时） | ~5-20 μs | 使用大页（2MB/1GB）减少页错误 |
+| CPUID | 低（~1k/s） | ~10-50 μs | 缓存结果，减少调用次数 |
+| MSR 访问 | 中（~5k/s） | ~20-100 μs | 启用 MSR 位图，减少未处理 MSR |
+| I/O 端口 | 低（~500/s） | ~15-80 μs | 使用 MMIO 替代 PIO，virtio 设备 |
+
+**关键洞察**：
+- **高频 VM-Exit**（外部中断、EPT Violation）是性能瓶颈的主要来源
+- **快速路径**（内核态处理）比**慢速路径**（返回用户态）快 5-10 倍
+- **Posted Interrupts**（phase4 详解）可以将外部中断的 VM-Exit 次数降为 0
+- **EPT 大页**（phase2 详解）可以将页错误次数降低 512 倍（2MB 页 vs 4KB 页）
+
+---
+
 ## 🧵 vCPU调度模型
 
 ### 1. halt-polling机制
@@ -683,53 +943,107 @@ Host内核中断处理 → kvm_set_irq(irq)
 
 ## ⚠️ 常见陷阱
 
-### 陷阱1：vCPU未绑定到pCPU
+### 陷阱1（debug）：静默回退到软件模拟
 
-**场景**：调用`ioctl(KVM_RUN)`前忘记调用`vcpu_load()`
+**场景**：VMM 调用 `open("/dev/kvm")` 成功，但未正确走 `ioctl(KVM_RUN)` 路径
 
-**症状**：vmx_vcpu_run()中访问`vmx->loaded_vmcs`时崩溃
+**症状**：
+- 所有 `kvm_exit` tracepoint 为零事件
+- Guest 运行极慢（比硬件虚拟化慢 10-100 倍）
+- `/proc/<qemu-pid>/fd` 中没有指向 `/dev/kvm` 的文件描述符
 
-**原因**：vCPU必须绑定到pCPU才能访问VMCS
+**原因**：某些 VMM（如 QEMU）在未显式启用 KVM 时，会**静默回退**到纯软件模拟（TCG），不报错但性能极差
 
-**解决**：确保在`kvm_arch_vcpu_ioctl_run()`中调用`vcpu_load(vcpu)`
+**诊断**：
+```bash
+# 检查 QEMU 进程是否真的在使用 KVM
+ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm
+# 返回 >0 表示走 KVM，=0 表示走 TCG
+```
 
-**源码位置**：`kvm_arch_vcpu_ioctl_run()` → `vcpu_load(vcpu)`
+**解决**：启动 VM 时必须显式传 `-enable-kvm`（QEMU）或调用 `ioctl(KVM_CREATE_VM)` + `ioctl(KVM_CREATE_VCPU)` + `ioctl(KVM_RUN)`（通用 VMM）
 
-### 陷阱2：memslot更新未刷新EPT
+**验证**：`scripts/vm/boot-vm.sh` 默认带上 `-enable-kvm -cpu host` 并在启动前自检
 
-**场景**：修改memslot后立即运行Guest，访问旧的GPA
+### 陷阱2（debug）：tracefs 的 `echo >` 会清掉所有已有配置
 
-**症状**：EPT Violation，但映射到错误的HPA
+**场景**：调试 VM 时，先配置好 `kvm_exit` 的 filter，再用 `echo` 添加 `kvm_entry`
 
-**原因**：memslot更新后需要刷新EPT页表和TLB
+**症状**：
+- `kvm_exit` 事件突然消失
+- 只看到 `kvm_entry` 事件
 
-**解决**：在`kvm_commit_memory_region()`中调用`kvm_arch_flush_shadow_memslot()`
+**原因**：`set_event`、`set_ftrace_filter`、`set_event_pid` 三个文件上**带 `O_TRUNC` 的写**（`echo x > file`、不带 `-a` 的 `tee`）会**先清掉全部已有配置**，再写入本次内容
 
-**源码位置**：`kvm_commit_memory_region()` → `kvm_arch_commit_memory_region()`
+**示例**：
+```bash
+# 错误做法：第二次 echo 会清掉 kvm_exit
+echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
+echo kvm:kvm_entry > /sys/kernel/debug/tracing/set_event  # ← kvm_exit 被清掉！
 
-### 陷阱3：中断路由表RCU保护
+# 正确做法：用 >> 追加，或一次性写入多个事件
+echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
+echo kvm:kvm_entry >> /sys/kernel/debug/tracing/set_event
 
-**场景**：直接访问`kvm->irq_routing`而未使用RCU
+# 或者一次性写入
+echo 'kvm:kvm_exit kvm:kvm_entry' > /sys/kernel/debug/tracing/set_event
+```
 
-**症状**：并发更新路由表时崩溃
+**解决**：
+- 添加事件时用 `>>`（追加）而非 `>`（覆盖）
+- 清场时显式写 `: > set_event` 并注明
+- `set_ftrace_filter` 和 `set_event_pid` 同理
 
-**原因**：`irq_routing`使用RCU保护，需要使用`rcu_dereference()`访问
+**源码位置**：`kernel/trace/trace_events.c:2411-2423`（`set_event` 清空逻辑）
 
-**解决**：使用`srcu_read_lock()` + `rcu_dereference()`访问路由表
+### 陷阱3（性能调优）：halt-polling 调大不是万能的
 
-**源码位置**：`kvm_set_irq()` → `rcu_dereference(kvm->irq_routing)`
+**场景**：为了降低中断延迟，将 `halt_poll_ns` 从默认 200μs 调到 1ms 甚至 10ms
 
-### 陷阱4：halt-polling参数设置不当
+**症状**：
+- CPU 占用率显著上升（idle 时也高达 30-50%）
+- 中断延迟并未明显降低
+- 整体性能反而下降
 
-**场景**：halt_poll_ns设置过大（如10ms）
+**原因**：halt-polling 的收益**只在"唤醒源随机且大概率落在 polling 窗口内"时成立**。如果唤醒事件早于窗口起点（如定时器到期时间确定），polling 无法让它更早，反而白白消耗 CPU
 
-**症状**：CPU占用率高，但性能无明显提升
+**实测结论**：
+- 空闲场景：零收益，纯浪费 CPU
+- flood 场景：买不到延迟，反而多付 CPU
+- 收益曲线在"窗口刚够盖住典型 halt"处就饱和
 
-**原因**：轮询时间过长，浪费CPU周期
+**正确做法**：
+- 默认 200μs 通常是合理起点
+- 根据工作负载实测：只有"唤醒间隔 < polling 窗口"时才有收益
+- 详细实测数据见 [`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2
 
-**解决**：根据工作负载调优，通常200μs-500μs较合适
+**源码位置**：`arch/x86/kvm/x86.c` → `kvm_vcpu_halt()` → halt-polling 循环
 
-**源码位置**：`kvm_vcpu_halt()` → halt-polling循环
+### 陷阱4（VMM）：`KVM_EXIT_SHUTDOWN` 与 `KVM_EXIT_SYSTEM_EVENT` 的区别
+
+**场景**：VMM 收到 `kvm_run->exit_reason`，未区分 `KVM_EXIT_SHUTDOWN` 和 `KVM_EXIT_SYSTEM_EVENT`
+
+**症状**：
+- Guest 三重错误（Triple Fault）后，VMM 不知道是崩溃还是正常关机
+- Guest 主动调用 `poweroff` 时，VMM 误以为是崩溃而重启
+
+**原因**：KVM 返回两种不同的关机/重启通知：
+
+| Exit Reason | 触发场景 | 含义 | VMM 应如何处理 |
+|------------|---------|------|---------------|
+| `KVM_EXIT_SHUTDOWN` (8) | 三重错误（Guest 代码崩溃） | Guest 异常终止 | 重置或终止 VM |
+| `KVM_EXIT_SYSTEM_EVENT` (24) | Guest 主动关机/重启/崩溃 | 根据 `system_event.type` 区分 | 按 type 字段处理 |
+
+`KVM_EXIT_SYSTEM_EVENT` 的 `type` 字段：
+- `KVM_SYSTEM_EVENT_SHUTDOWN` (1) — Guest 正常关机（如 `poweroff`）
+- `KVM_SYSTEM_EVENT_RESET` (2) — Guest 请求重启（如 `reboot`）
+- `KVM_SYSTEM_EVENT_CRASH` (3) — Guest 内核崩溃（如 kernel panic）
+
+**QEMU 参考实现**：`accel/kvm/kvm-all.c:3265-3319`
+
+**解决**：VMM 必须分别处理这两种 exit reason，并根据 `system_event.type` 执行对应动作（关机、重启、记录崩溃日志）
+
+**源码位置**：`include/uapi/linux/kvm.h:155,174`（定义），`arch/x86/kvm/x86.c:10855-10907`（触发逻辑）
 
 ---
 
@@ -892,7 +1206,11 @@ echo "$ORIG" > /sys/module/kvm/parameters/halt_poll_ns
 - [ ] 分析GPA→HVA→HPA的转换流程
 - [ ] 对比用户态VMM和KVM内核态的实现差异
 - [ ] 解释为什么KVM要在内核态处理部分VM-Exit
-- [ ] 列出至少3个常见的KVM开发陷阱
+- [ ] 列举至少5种常见的VM-Exit原因，并说明哪些走快速路径、哪些走慢速路径
+- [ ] 使用ftrace观察VM-Exit，能识别EXTERNAL_INTERRUPT、EPT_VIOLATION、CPUID等常见类型
+- [ ] 说明如何判断一次 VM 运行是否真的走了 KVM（而非静默回退到软件模拟）
+- [ ] 区分 `KVM_EXIT_SHUTDOWN` 与 `KVM_EXIT_SYSTEM_EVENT` 的触发场景和处理方式
+- [ ] 列举至少3个调试 VM 时常见的陷阱（tracefs 配置、静默回退、halt-polling 误区）
 
 ---
 

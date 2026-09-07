@@ -43,7 +43,7 @@ kvm-study/
 │   ├── annotations.md           ← kvm_dev_ioctl→vcpu_enter_guest 全链路注释
 │   ├── kvm-framework.md         ← VMM视角对比分析
 │   └── practice/                ← 实战练习（手工步骤形式）
-├── phase1-vtx-basics/           ← 第一阶段：VT-x + CPU虚拟化
+├── phase1-cpu-virt/           ← 第一阶段：VT-x + CPU虚拟化
 │   ├── README.md                ← 学习指南 + VMM对比 + 性能优化 + 常见陷阱
 │   ├── annotations.md           ← VT-x源码精读注释
 │   ├── cpu-virtualization.md    ← ★ CPUID/MSR/指令虚拟化
@@ -255,7 +255,7 @@ for f in /sys/module/kvm_intel/parameters/*; do
 done
 
 # 3. 开始第一阶段学习
-cd phase1-vtx-basics/
+cd phase1-cpu-virt/
 cat README.md
 
 # 4. 运行第一个示例

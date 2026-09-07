@@ -1,6 +1,6 @@
 # E3 · vCPU 迁移：一次"换了个核跑"到底付多少钱
 
-> 机制侧的 `vmx_vcpu_load()` 全链在 `../../phase1-vtx-basics/` 只讲到 VMCS 加载，
+> 机制侧的 `vmx_vcpu_load()` 全链在 `../../phase1-cpu-virt/` 只讲到 VMCS 加载，
 > 本文只量**代价**，不重讲机制。测量规范见 [`../measurement.md`](../measurement.md)。
 > **本轮不上机**，数字全部待实测。
 

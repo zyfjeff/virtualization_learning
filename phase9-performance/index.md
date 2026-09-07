@@ -101,7 +101,7 @@
 | 项 | 内容 |
 |---|---|
 | 数字 | CPUID 约 **1522 ns**、RDTSC 约 **10 ns**（`clock_gettime` 包裹的 ns-per-op 微基准） |
-| 出处 | `../shared/ex5-vmexit-overhead.c`；结论记录在 `../phase1-vtx-basics/practice/SUMMARY.md` |
+| 出处 | `../shared/ex5-vmexit-overhead.c`；结论记录在 `../phase1-cpu-virt/practice/SUMMARY.md` |
 | 评级说明 | 真跑过，但**无对照组、单次运行、无离散度**，且把"VM-Exit 往返"与"指令本身开销"混在一个数里 → 只可引用量级 |
 
 ---

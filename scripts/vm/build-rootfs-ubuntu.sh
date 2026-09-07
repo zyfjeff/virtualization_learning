@@ -176,9 +176,11 @@ Components: main universe
 EOF
     fi
 
-    # 更新并安装测试工具
+    # 更新并安装测试工具和 systemd
     chroot "$ROOTFS_DIR" apt-get update
     chroot "$ROOTFS_DIR" apt-get install -y --no-install-recommends \
+        systemd \
+        systemd-sysv \
         iperf3 \
         ethtool \
         iproute2 \

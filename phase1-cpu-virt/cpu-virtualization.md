@@ -557,6 +557,73 @@ MSR Bitmap 布局 (4KB = 4096 bits):
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+### 2.2.1 讨论：哪些 MSR 真的需要拦截？
+
+**问题**：CPUID 已经提供了完整的 CPU 拓扑信息，QEMU 为什么还要拦截 `MSR_CORE_THREAD_COUNT` (0x35)？
+
+**分析**：
+
+```
+┌─ CPUID vs MSR_CORE_THREAD_COUNT ──────────────────────────────────┐
+│                                                                      │
+│  CPUID 提供的拓扑信息:                                             │
+│    - Leaf 0x0B: Extended Topology Enumeration                      │
+│    - Leaf 0x1F: V2 Extended Topology (multi-die 支持)             │
+│    - Leaf 0x04: Deterministic Cache Parameters                     │
+│    → 可以报告: 核心数、线程数、APIC ID 拓扑                       │
+│                                                                      │
+│  MSR_CORE_THREAD_COUNT (0x35):                                     │
+│    - bits 15..0:  每个 package 的线程数                            │
+│    - bits 31..16: 每个 package 的核心数                            │
+│    → 信息与 CPUID 重叠                                              │
+│                                                                      │
+│  Linux 内核的选择:                                                  │
+│    - 不使用 MSR_CORE_THREAD_COUNT                                  │
+│    - 通过 CPUID leaf 0x0B/0x1F 获取拓扑                           │
+│    - grep 结果: arch/x86/ 中没有 rdmsr(0x35)                      │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ QEMU 为什么还要拦截? ──────────────────────────────────────────────┐
+│                                                                      │
+│  可能的原因:                                                        │
+│    1. 兼容性考虑                                                    │
+│       - 某些旧的 Guest OS (Windows 早期版本) 可能使用这个 MSR     │
+│       - 某些应用程序 (性能分析工具) 可能直接读取                  │
+│                                                                      │
+│    2. 防御性编程                                                    │
+│       - 避免 Guest 读到物理 CPU 的真实值                          │
+│       - 即使 Guest 不使用，拦截也比不拦截安全                     │
+│       - 防止信息泄露                                                │
+│                                                                      │
+│    3. 历史遗留                                                      │
+│       - 早期 QEMU 实现的遗留                                      │
+│       - 当时 CPUID 拓扑模拟不够完善                               │
+│                                                                      │
+│  结论:                                                              │
+│    - 对于现代 Guest OS: 不必要 (它们使用 CPUID)                   │
+│    - 对于旧版 Guest OS: 可能有必要                                 │
+│    - 对于安全隔离: 有防御价值                                      │
+│                                                                      │
+│  源码: target/i386/kvm/kvm.c:3182                                  │
+│    ret = kvm_filter_msr(s, MSR_CORE_THREAD_COUNT,                  │
+│                         kvm_rdmsr_core_thread_count, NULL);        │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**实际拦截的 MSR 列表**（QEMU 10.1.0-rc2）：
+
+| MSR | 地址 | 用途 | 必要性 |
+|-----|------|------|--------|
+| `MSR_CORE_THREAD_COUNT` | 0x35 | CPU 拓扑 | ⚠️ 可能不必要（CPUID 已覆盖） |
+| `MSR_RAPL_POWER_UNIT` | 0x606 | RAPL 功率单位 | ✅ 必要（避免泄露物理功耗） |
+| `MSR_PKG_POWER_LIMIT` | 0x610 | 封装功率限制 | ✅ 必要（虚拟化功率管理） |
+| `MSR_PKG_ENERGY_STATUS` | 0x611 | 封装能量状态 | ✅ 必要（避免泄露物理功耗） |
+| `MSR_PKG_POWER_INFO` | 0x614 | 封装功率信息 | ✅ 必要（虚拟化功率管理） |
+
+**源码引用**：`target/i386/kvm/kvm.c:3182-3227`
+
 ### 2.3 MSR 访问代码路径
 
 ```c

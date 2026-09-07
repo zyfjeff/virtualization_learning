@@ -718,7 +718,7 @@ static inline void adjust_lapic_timer_advance(struct kvm_vcpu *vcpu,
 | 旧版章节 | 现在归 | 原因 |
 |---|---|---|
 | §1 halt-polling 自适应算法 | `../phase0-kvm-framework/annotations.md` §9（`:824-950`，`kvm_vcpu_halt()` 完整走读）；调参实测 `../phase8-capstone/practice/README.md` M3；参数表 [parameters.md](parameters.md) §1 | 机制归框架章，实测归毕业章，本章不该有第三份 |
-| §2.1 VPID | `../phase1-vtx-basics/`（VMCS 字段权威） | 旧版三个控制位宏名不实 |
+| §2.1 VPID | `../phase1-cpu-virt/`（VMCS 字段权威） | 旧版三个控制位宏名不实 |
 | §2.2 APICv | `../phase4-interrupts/` | 旧版宏名与"~500 ns/次"均无据 |
 | §2.3 Posted Interrupts | `../phase4-interrupts/posted-interrupts.md`；零退出结论有规范支撑（SDM 30.6 / VT-d 5.2.5），但收益倍数无实测 → [index.md](index.md) §3 | 机制在 phase4 讲得更深 |
 | §3.1 4 级/3 级/2 级 EPT 遍历 | `../phase2-mem-virt/` | 机制章 |

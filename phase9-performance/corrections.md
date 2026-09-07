@@ -169,7 +169,7 @@ TSC 一致的宿主上正常迁移**不改 offset**；若迁移后观测到变�
 `VIRTUALIZE_EOI_EXIT` 三个宏名与真实写法不符（真实宏见
 `arch/x86/kvm/vmx/vmx.h` 的 `SECONDARY_EXEC_*`，且 VPID 的赋值路径与 `vpid02`
 的用法被旧版简化错了）。这两节整节删除，机制归
-`../phase1-vtx-basics/`（VMCS 字段）与 `../phase4-interrupts/`（APICv/PI）。
+`../phase1-cpu-virt/`（VMCS 字段）与 `../phase4-interrupts/`（APICv/PI）。
 
 ### C11 旧 §4 没有任何可观测出口，害得重设计初稿抓错统计量
 

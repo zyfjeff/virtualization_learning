@@ -8,7 +8,7 @@
 
 ```
 phase0-kvm-framework/   KVM 框架层
-phase1-vtx-basics/      VT-x + CPU 虚拟化
+phase1-cpu-virt/        VT-x 硬件基础 + CPU 虚拟化 (CPUID/MSR/指令)
 phase2-mem-virt/        内存虚拟化 (EPT/TDP MMU)
 phase3-iommu/           IOMMU 层 (phase6 VFIO 的地基)
 phase4-interrupts/      中断虚拟化 + VT-d IR

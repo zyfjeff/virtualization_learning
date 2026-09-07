@@ -275,7 +275,7 @@ KVM 检查: CPUID Faulting 启用?
 
 ## 📚 相关文档
 
-- [Phase 1: CPUID 虚拟化](../../phase1-vtx-basics/cpu-virtualization.md#111-cpuid-faulting-机制补充)
+- [Phase 1: CPUID 虚拟化](../../phase1-cpu-virt/cpu-virtualization.md#111-cpuid-faulting-机制补充)
 - [Intel SDM Vol.3: CPUID Faulting](https://software.intel.com/content/www/us/en/develop/download/intel-64-and-ia-32-architectures-sdm-volume-3.html)
 - [Linux Kernel: arch_prctl](https://man7.org/linux/man-pages/man2/arch_prctl.2.html)
 

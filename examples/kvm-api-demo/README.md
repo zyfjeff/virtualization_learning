@@ -310,7 +310,7 @@ done
 
 ## 与 Phase 1 学习材料的关联
 
-本演示程序直接对应 Phase 1 (`phase1-vtx-basics/`) 的学习内容:
+本演示程序直接对应 Phase 1 (`phase1-cpu-virt/`) 的学习内容:
 
 | Phase 1 主题 | 本演示对应 |
 |---|---|
@@ -424,7 +424,7 @@ struct kvm_run {                    ← 通过 mmap(vcpu_fd) 映射
   - `virt/kvm/kvm_main.c` — 框架核心
   - `arch/x86/kvm/vmx/vmx.c` — VMX 实现
 - **本项目**:
-  - `phase1-vtx-basics/README.md` — VT-x 基础学习指南
+  - `phase1-cpu-virt/README.md` — VT-x 基础学习指南
   - `notes/source-navigation.md` — 源码导航图
 - **外部**:
   - [KVM API 文档](https://www.kernel.org/doc/html/latest/virt/kvm/)

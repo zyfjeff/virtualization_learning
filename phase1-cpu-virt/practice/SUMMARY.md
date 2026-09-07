@@ -81,7 +81,7 @@ kvm-study/
 │   ├── kvm-framework.md           # 框架详解
 │   └── annotations.md             # 源码注释
 │
-├── phase1-vtx-basics/             # Phase 1: VT-x 基础
+├── phase1-cpu-virt/             # Phase 1: VT-x 基础
 │   ├── README.md                  # 学习指南 (已更新)
 │   ├── cpu-virtualization.md      # CPU 虚拟化详解
 │   ├── annotations.md             # 源码注释
@@ -152,7 +152,7 @@ CPU:     1 核 (host 透传)
 内存:    512 MB
 内核:    Linux 6.12.93-kvm-study (自定义)
 Rootfs:  Busybox (initramfs, 1.1 MB)
-共享:    9p 文件系统 (phase1-vtx-basics/practice/)
+共享:    9p 文件系统 (phase1-cpu-virt/practice/)
 ```
 
 ---

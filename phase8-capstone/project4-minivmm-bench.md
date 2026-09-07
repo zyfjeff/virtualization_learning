@@ -7,7 +7,7 @@
 **前置**：项目 1-3；阅读 `../phase9-performance/measurement.md`（测量纪律，**先读**）、
 `../phase9-performance/parameters.md` §1（halt-polling 参数默认值与权限）、
 `../phase0-kvm-framework/annotations.md` §9（halt-polling 机制）、
-`../phase1-vtx-basics/README.md` §1（VPID 机制）、`../phase10-debugging/README.md`
+`../phase1-cpu-virt/README.md` §1（VPID 机制）、`../phase10-debugging/README.md`
 （trace 工具）、`../phase11-microvm/README.md`（MicroVM 启动路径）。
 
 ---

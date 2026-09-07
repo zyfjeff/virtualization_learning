@@ -189,8 +189,8 @@ sudo ./build-rootfs-ubuntu.sh
 ### 源码注释
 
 - `phase0-kvm-framework/annotations.md` - KVM 框架层注释
-- `phase1-vtx-basics/annotations.md` - VT-x 基础注释
-- `phase1-vtx-basics/cpu-virtualization.md` - CPU 虚拟化详解
+- `phase1-cpu-virt/annotations.md` - VT-x 基础注释
+- `phase1-cpu-virt/cpu-virtualization.md` - CPU 虚拟化详解
 
 ### 学习笔记
 
