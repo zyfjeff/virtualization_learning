@@ -1975,6 +1975,478 @@ VM 快照/迁移时, 必须一起处理的四件套:
                    灌到 5.10 KVM 上会直接 -EINVAL
 ```
 
+### 墙上时间的完整生态：RTC、hwclock、QGA 与 ptp_kvm
+
+前面 §4 讲了 kvmclock 的 pvclock 协议、masterclock 和 rating 让位机制，§4.5 讲了 ptp_kvm
+的 hypercall 原理。但这些机制之间怎么配合？Guest 里的 `hwclock`、`date`、`chrony` 分别走
+哪条链路？VMM 没有 RTC 时怎么办？本节从源码层面把墙上时间的完整生态讲清楚。
+
+#### 1. 两条独立的墙上时间获取路径
+
+Guest 里有两条完全独立的路径获取宿主墙上时间，精度和开销截然不同：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ 路径 A：kvmclock（纳秒精度，内核级）                               │
+│                                                                  │
+│   Guest 读 CLOCK_REALTIME                                        │
+│     → timekeeper → clocksource_read → kvmclock                   │
+│     → pvclock_wall_clock(wall_clock) + pvclock_vcpu_time_info    │
+│     → 数据来自 KVM 内核模块，不经过 QEMU                            │
+│                                                                  │
+│   精度：纳秒    VM-Exit：零（纯内存读）                              │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 路径 B：RTC / hwclock（秒精度，IO port 级）                        │
+│                                                                  │
+│   Guest 执行 hwclock                                             │
+│     → 读 /dev/rtc0 → in 0x71 → VM-Exit                          │
+│     → QEMU cmos_ioport_read() → rtc_update_time()                │
+│     → qemu_clock_get_ns(QEMU_CLOCK_HOST) → 宿主实时时间            │
+│     → 写入 cmos_data[] → 返回给 Guest                             │
+│                                                                  │
+│   精度：秒      VM-Exit：每次 IO 都触发                             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+两条路径最终都源自宿主时间，但互相独立、互不干涉。
+
+#### 2. RTC 虚拟化：QEMU 实时跟踪宿主时间
+
+##### 2.1 rtc_clock 的默认值
+
+**源码引用**: `system/rtc.c:146`（QEMU 11.1.0）
+
+```c
+/* configure_rtc() 中的默认设置 */
+rtc_clock = QEMU_CLOCK_HOST;
+```
+
+`QEMU_CLOCK_HOST` 是 QEMU 的内部时钟类型，跟踪宿主机的实时时钟。这意味着 MC146818 RTC
+模拟**不是**一个静态的初始值，而是**实时跟踪宿主时间**。
+
+##### 2.2 每次 IO 读都查宿主时钟
+
+**源码引用**: `hw/rtc/mc146818rtc.c:84-87`
+
+```c
+static uint64_t get_rtc_ns_since_last_update(MC146818RtcState *s)
+{
+    return qemu_clock_get_ns(rtc_clock) - s->last_update + s->offset;
+}
+```
+
+**源码引用**: `hw/rtc/mc146818rtc.c:623-635`
+
+```c
+static void rtc_update_time(MC146818RtcState *s)
+{
+    struct tm ret;
+    time_t guest_sec;
+
+    guest_sec = s->base_rtc +
+        get_rtc_ns_since_last_update(s) / NANOSECONDS_PER_SECOND;
+    gmtime_r(&guest_sec, &ret);
+
+    if ((s->cmos_data[RTC_REG_B] & REG_B_SET) == 0) {
+        rtc_set_cmos(s, &ret);    /* 刷新 cmos_data[] */
+    }
+}
+```
+
+**源码引用**: `hw/rtc/mc146818rtc.c:683-688` — IO port 读入口
+
+```c
+/* Guest 读秒/分/时/日/月/年时，先调 rtc_update_time 刷新 */
+case RTC_SECONDS:
+case RTC_MINUTES:
+case RTC_HOURS:
+    ...
+    if (rtc_running(s)) {
+        rtc_update_time(s);       /* 从宿主时钟实时刷新 cmos_data */
+    }
+    ret = s->cmos_data[s->cmos_index];
+```
+
+**关键结论**：Guest 每次读 RTC 寄存器，QEMU 都调用 `qemu_clock_get_ns(QEMU_CLOCK_HOST)`
+实时查询宿主时间，更新 CMOS 寄存器后再返回。Guest 的 `hwclock` 读到的就是宿主的墙上时间
+（精度秒级）。
+
+##### 2.3 初始化：一次性快照
+
+**源码引用**: `hw/rtc/mc146818rtc.c:738-751`
+
+```c
+static void rtc_set_date_from_host(ISADevice *dev)
+{
+    MC146818RtcState *s = MC146818_RTC(dev);
+    struct tm tm;
+
+    qemu_get_timedate(&tm, 0);   /* 读宿主当前时间 */
+
+    s->base_rtc = mktimegm(&tm);
+    s->last_update = qemu_clock_get_ns(rtc_clock);
+    s->offset = 0;
+
+    rtc_set_cmos(s, &tm);        /* 写入 CMOS */
+}
+```
+
+VM 启动时做一次快照（`base_rtc`），之后靠 `get_rtc_ns_since_last_update()` 递增。
+
+#### 3. hwclock 源码分析：只认 RTC，不走 kvmclock
+
+##### 3.1 hwclock 的时钟源搜索
+
+**源码引用**: `sys-utils/hwclock.c:972-1001`（util-linux 2.39.3）
+
+```c
+static void determine_clock_access_method(const struct hwclock_control *ctl)
+{
+    ur = NULL;
+
+#ifdef USE_HWCLOCK_CMOS
+    if (ctl->directisa)
+        ur = probe_for_cmos_clock();      /* 1. 直接读 CMOS IO port */
+#endif
+#ifdef __linux__
+    if (!ur)
+        ur = probe_for_rtc_clock(ctl);    /* 2. 打开 /dev/rtc* */
+#endif
+    if (ur) {
+        /* 找到了，继续 */
+    } else {
+        warnx(_("Cannot access the Hardware Clock via any known method."));
+        hwclock_exit(ctl, EXIT_FAILURE);  /* 全部失败 → 退出 */
+    }
+}
+```
+
+**源码引用**: `sys-utils/hwclock-rtc.c:78-118`
+
+```c
+static int open_rtc(const struct hwclock_control *ctl)
+{
+    static const char * const fls[] = {
+        "/dev/rtc0",
+        "/dev/rtc",
+        "/dev/misc/rtc"
+    };
+    /* 依次尝试打开，全部失败 → 返回 -1 */
+    ...
+}
+```
+
+hwclock 的搜索路径：
+1. **CMOS 直接 IO**（仅 `--directisa`，需 root + ioperm，现代内核通常禁用）
+2. **`/dev/rtc0`、`/dev/rtc`、`/dev/misc/rtc`**
+
+全部失败直接退出。**不尝试 `/dev/ptp0`，不读 sysfs，不碰 kvmclock。**
+
+##### 3.2 hwclock 读写的 ioctl
+
+**源码引用**: `sys-utils/hwclock-rtc.c:132-156`
+
+```c
+static int do_rtc_read_ioctl(int rtc_fd, struct tm *tm)
+{
+    struct rtc_time rtc_tm = { 0 };
+    rc = ioctl(rtc_fd, RTC_RD_TIME, &rtc_tm);   /* 读时间 */
+    ...
+}
+```
+
+**源码引用**: `sys-utils/hwclock-rtc.c:280-312`
+
+```c
+static int set_hardware_clock_rtc(const struct hwclock_control *ctl,
+                                   const struct tm *new_broken_time)
+{
+    struct rtc_time rtc_tm = { 0 };
+    ...
+    rc = ioctl(rtc_fd, RTC_SET_TIME, &rtc_tm);  /* 写时间 */
+    ...
+}
+```
+
+hwclock 通过 `RTC_RD_TIME` / `RTC_SET_TIME` ioctl 读写 `/dev/rtc0`。在 KVM Guest 里，
+这些 ioctl 触发 VM-Exit，由 QEMU 的 `cmos_ioport_read` / `cmos_ioport_write` 处理。
+
+##### 3.3 为什么 hwclock 不能用 kvmclock
+
+hwclock 和 kvmclock 是**不同抽象层**的东西：
+
+| | RTC（hwclock 的目标） | kvmclock |
+|---|---|---|
+| **断电后** | ✅ 电池供电继续走 | ❌ 不存在了 |
+| **内核未启动** | ✅ IO port 直读 | ❌ 需 KVM 模块运行 |
+| **用户态可访问** | ✅ `/dev/rtc0` | ❌ 只是内核 clocksource |
+| **设计用途** | 持久保存墙上时间 | 运行时高精度计时 |
+
+hwclock 的 `--systohc`（系统时间 → 硬件时钟）需要写到**断电不丢失**的存储。kvmclock 没有
+持久存储语义 —— VM 关机后 pvclock 共享页就不存在了。hwclock 的 `--hctosys`（硬件时钟 → 系
+统时间）需要从一个**断电期间一直在走**的时钟读时间。kvmclock 关机期间不存在，无法记录关机
+期间的时间流逝。
+
+在 KVM Guest 里，hwclock 的角色已被 kvmclock（启动初始化）和 ptp_kvm + chrony（运行时同
+步）完全替代。
+
+#### 4. Guest 墙上时间修正的四条路径
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                 Guest 墙上时间修正路径全景                              │
+│                                                                    │
+│  ① kvmclock pvclock（自动，零开销）                                  │
+│     宿主 CLOCK_REALTIME → KVM kvm_write_wall_clock()               │
+│       → pvclock_wall_clock 共享页                                   │
+│       → Guest timekeeper → CLOCK_REALTIME                          │
+│     精度：纳秒    修改 timekeeper：否（它自己就是基准）                  │
+│                                                                    │
+│  ② hwclock --hctosys（RTC → 系统时间）                               │
+│     Guest RTC → ioctl(RTC_RD_TIME) → settimeofday()                │
+│     精度：秒      修改 timekeeper：是（wall_to_monotonic 偏移）        │
+│               修改 kvmclock：否                                     │
+│                                                                    │
+│  ③ QGA guest-set-time（宿主推送）                                    │
+│     宿主 QMP 命令 → Guest qemu-ga 进程                              │
+│       → settimeofday() + /sbin/hwclock                             │
+│     精度：毫秒~秒  修改 timekeeper：是                                 │
+│               修改 kvmclock：否                                     │
+│                                                                    │
+│  ④ ptp_kvm + chrony（hypercall + step/slew）                       │
+│     chrony → ioctl(/dev/ptp0, PTP_SYS_OFFSET_PRECISE)              │
+│       → KVM_HC_CLOCK_PAIRING hypercall                             │
+│       → 宿主返回 (sec, nsec, tsc) 原子三元组                         │
+│       → chrony 计算 offset → step 或 slew                          │
+│     精度：亚微秒  修改 timekeeper：是                                  │
+│               修改 kvmclock：否                                     │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**所有四条路径都不修改 kvmclock 本身**。kvmclock 的 `wall_clock` 基准和 `kvmclock_offset`
+由 KVM 内核模块独占管理，只能通过 `KVM_SET_CLOCK` ioctl（从宿主用户态）修改。Guest 内的
+任何操作（`settimeofday`、`hwclock`、QGA、chrony）都只修改内核 `timekeeper` 里的偏移量。
+
+##### 4.1 各路径适用场景
+
+| 场景 | 推荐路径 | 原因 |
+|------|---------|------|
+| VM 正常运行 | ① kvmclock（自动） | 零开销，纳秒精度 |
+| VM 暂停/恢复后快速修正 | ③ QGA 或 ④ chrony | 偏移大，需要 step |
+| 持续精确同步 | ④ ptp_kvm + chrony | 亚微秒精度，持续跟踪频率漂移 |
+| 精简环境（无 chrony） | ② hwclock --hctosys | 秒级精度，一次性 |
+| 网络可达 | NTP | 通用方案，不依赖 KVM 特性 |
+
+#### 5. QGA guest-set-time 实现分析
+
+**源码引用**: `qga/commands-posix.c:293-335`（QEMU 11.1.0）
+
+```c
+void qmp_guest_set_time(bool has_time, int64_t time_ns, Error **errp)
+{
+    const char *argv[] = {"/sbin/hwclock", has_time ? "-w" : "-s", NULL};
+
+    if (has_time) {
+        /* 宿主指定了时间 → 设 Guest CLOCK_REALTIME */
+        tv.tv_sec  = time_ns / 1000000000;
+        tv.tv_usec = (time_ns % 1000000000) / 1000;
+        ret = settimeofday(&tv, NULL);
+    }
+
+    /* has_time=true:  hwclock -w → 系统时间写入 RTC */
+    /* has_time=false: hwclock -s → RTC 读入系统时间 */
+    ga_run_command(argv, NULL, "set hardware clock to system time", ...);
+}
+```
+
+两种调用模式：
+
+| 调用方式 | 行为 | 数据流 |
+|---------|------|--------|
+| `guest-set-time {"time": N}` | `settimeofday(N)` + `hwclock -w` | 宿主时间 → Guest CLOCK_REALTIME → RTC |
+| `guest-set-time {}` | `hwclock -s` | RTC（= 宿主时间）→ Guest CLOCK_REALTIME |
+
+**源码引用**: `qga/commands.c:635-638`（QEMU 11.1.0）
+
+```c
+int64_t qmp_guest_get_time(Error **errp)
+{
+    return g_get_real_time() * 1000;   /* 读 Guest 当前 CLOCK_REALTIME */
+}
+```
+
+QGA 的本质是在 Guest 里执行 `settimeofday` + `hwclock`，不修改 kvmclock。它的价值在于
+VM 暂停/恢复后，NTP 需要几秒到几分钟才能收敛，QGA 可以立即把正确时间推给 Guest。
+
+#### 6. 没有 RTC 时的启动流程
+
+当 VMM 不提供 RTC 设备（如精简 VMM），Guest 内核如何获取初始墙上时间？
+
+##### 6.1 默认值与 KVM 替换
+
+**源码引用**: `arch/x86/kernel/x86_init.c:146-149`
+
+```c
+struct x86_platform_ops x86_platform __ro_after_init = {
+    .get_wallclock = mach_get_cmos_time,   /* 默认：读 CMOS RTC */
+    .set_wallclock = mach_set_cmos_time,
+};
+```
+
+**源码引用**: `arch/x86/kernel/kvmclock.c:325-326`
+
+```c
+/* kvmclock_init() 中替换 */
+x86_platform.get_wallclock = kvm_get_wallclock;
+x86_platform.set_wallclock = kvm_set_wallclock;   /* 返回 -ENODEV */
+```
+
+KVM Guest 在早期启动时（`setup_arch` → `kvm_init_platform` → `kvmclock_init`）就把
+`get_wallclock` 从 CMOS RTC 替换为 pvclock。
+
+##### 6.2 完整启动链路
+
+```
+setup_arch()
+  → x86_init.oem.arch_setup()
+    → kvm_init_platform()
+      → kvmclock_init()                              [kvmclock.c:288]
+        ├─ kvm_register_clock()
+        │   → wrmsrl(MSR_KVM_SYSTEM_TIME_NEW, gpa)
+        │   → KVM 填充 pvclock_vcpu_time_info
+        ├─ x86_platform.get_wallclock = kvm_get_wallclock  [kvmclock.c:325]
+        └─ x86_platform.set_wallclock = kvm_set_wallclock  [kvmclock.c:326]
+
+timekeeping_init()                                   [timekeeping.c:1663]
+  → read_persistent_wall_and_boot_offset()            [timekeeping.c:1670]
+    → read_persistent_clock64()                       [rtc.c:108]
+      → x86_platform.get_wallclock(ts)
+        → kvm_get_wallclock()                         [kvmclock.c:61]
+          ├─ wrmsrl(msr_kvm_wall_clock, gpa)
+          │   → KVM kvm_write_wall_clock()            [x86.c:2313]
+          │     宿主 CLOCK_REALTIME → pvclock_wall_clock
+          └─ pvclock_read_wallclock()                 [pvclock.c:123]
+              wall_clock(sec,nsec) + kvmclock elapsed
+              → wall_time = 当前 UTC 时间
+
+  → tk_set_xfile = wall_time                          [timekeeping.c:1697]
+    → CLOCK_REALTIME 初始值 = 宿主当前时间
+  → tk_set_wall_to_mono(wall_to_mono)                 [timekeeping.c:1700]
+    → REALTIME 与 MONOTONIC 的偏移
+```
+
+**关键**：整个流程不依赖 RTC 硬件。pvclock `wall_clock` 结构由 KVM 从宿主 `CLOCK_REALTIME`
+直接写入 Guest 内存，通过 `MSR_KVM_WALL_CLOCK` 的 GPA 注册触发。
+
+##### 6.3 kvm_set_wallclock 返回 -ENODEV
+
+**源码引用**: `arch/x86/kernel/kvmclock.c:69-72`
+
+```c
+static int kvm_set_wallclock(const struct timespec64 *now)
+{
+    return -ENODEV;
+}
+```
+
+Guest **无法**通过 `set_wallclock` 回写时间到 KVM。这是单向的：宿主 → Guest。内核的
+`update_persistent_clock64()`（通常由 `hwclock --systohc` 触发的 NTP 同步调用）在 KVM
+Guest 里会静默失败。
+
+##### 6.4 没有 RTC 也没有 kvmclock
+
+如果 VMM 既不提供 RTC 也不支持 kvmclock：
+
+- `x86_platform.get_wallclock` 保持默认的 `mach_get_cmos_time`
+- 读 CMOS IO port `0x70/0x71` → 没有设备 → 读到垃圾值或全 `0xFF`
+- `timekeeping_init` 检查 `timespec64_valid_settod()` 失败
+- `wall_time` 清零 → **`CLOCK_REALTIME` 初始化为 0（1970-01-01 00:00:00 UTC）**
+
+这就是为什么精简 VMM 至少要做一件事：实现最小 RTC，或确保 kvmclock 可用。
+
+#### 7. ptp_kvm + chrony 调整行为详解
+
+ptp_kvm + chrony 是 Guest 墙上时间同步的最佳方案。chrony 的调整行为取决于配置和偏移大小。
+
+##### 7.1 chrony 的两种调整模式
+
+| 模式 | 行为 | 系统调用 |
+|------|------|---------|
+| **Step** | 立即跳到正确时间 | `settimeofday()` |
+| **Slew** | 调整时钟频率，渐进收敛 | `clock_adjtime()` |
+
+##### 7.2 makestep 指令控制
+
+典型 `/etc/chrony.conf`：
+
+```
+refclock PHC /dev/ptp0 poll 2 dpoll -2 offset 0
+makestep 0.1 3
+```
+
+`makestep 0.1 3`：前 3 次更新中，偏移 > 0.1 秒 → step；之后 → slew。
+
+##### 7.3 典型场景
+
+| 场景 | 偏移 | chrony 行为 |
+|------|------|------------|
+| VM 刚启动（kvmclock 已同步） | 微秒级 | slew，几秒内收敛 |
+| VM 从暂停恢复 | 分钟级 | 前 3 次 step，立即修正 |
+| 迁移到时钟有偏差的目标宿主 | 毫秒级 | slew |
+
+##### 7.4 chrony 修改什么，不修改什么
+
+```
+chrony step/slew
+  │
+  ├── 修改 Guest timekeeper（wall_to_monotonic 偏移）
+  │   → CLOCK_REALTIME 被修正
+  │
+  └── 不修改 kvmclock
+      ├── wall_clock 基准不变（KVM 维护）
+      ├── system_time 继续按宿主单调时钟走
+      ├── kvmclock_offset 不变
+      └── CLOCK_MONOTONIC 不受影响
+```
+
+#### 8. 小结：Guest 墙上时间的层次结构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Guest 墙上时间层次                             │
+│                                                                 │
+│  用户态                                                          │
+│  ├── date / CLOCK_REALTIME → timekeeper → clocksource           │
+│  ├── hwclock → /dev/rtc0 → QEMU RTC → 宿主时间（秒级）           │
+│  ├── chrony → /dev/ptp0 → hypercall → 宿主时间（亚微秒级）        │
+│  └── qemu-ga → settimeofday → timekeeper                       │
+│                                                                 │
+│  内核态                                                          │
+│  ├── timekeeper                                                  │
+│  │   ├── CLOCK_REALTIME = xtime + clocksource + wall_to_mono    │
+│  │   └── CLOCK_MONOTONIC = xtime + clocksource                 │
+│  │                                                              │
+│  ├── clocksource: kvmclock 或 tsc（按 rating 选优）               │
+│  │   └── kvmclock → pvclock 共享页 → KVM                        │
+│  │                                                              │
+│  └── read_persistent_clock64 → kvm_get_wallclock                │
+│      └── pvclock_wall_clock → 宿主 CLOCK_REALTIME               │
+│                                                                 │
+│  宿主 / VMM                                                      │
+│  ├── KVM: kvm_write_wall_clock() → pvclock 共享页                │
+│  ├── QEMU: RTC 模拟 → QEMU_CLOCK_HOST → 宿主时间                 │
+│  └── QEMU: kvmclock 迁移设备 → KVM_GET/SET_CLOCK                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+核心结论：
+1. **kvmclock 是 Guest 时间的基石** —— 启动初始化和运行时计时都基于它
+2. **RTC/hwclock 在 KVM Guest 里已退化为兼容层** —— 启动初始化被 kvmclock 替代，持续同步被 ptp_kvm 替代
+3. **所有用户态时间修正都不影响 kvmclock** —— kvmclock 由 KVM 内核模块独占管理
+4. **没有 RTC 的 VMM 也能正常工作** —— 只要 kvmclock 可用，启动和运行时时间都有保障
+
 ### 5. Guest 视角的时钟层次
 
 ```
