@@ -1,724 +1,728 @@
-# 第二阶段源码注释：EPT 内存虚拟化
+# Phase 2：源码精读注释 - EPT 内存虚拟化
 
-> 基于 Linux 6.12.93 源码 | 对应源码树 `arch/x86/kvm/mmu/`
+> 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
+> 行号可能随版本变化，用函数名 grep 定位更可靠。
 
 ---
 
-## 1. SPTE 位定义（spte.h）
+## 1. SPTE 位布局
 
-`arch/x86/kvm/mmu/spte.h` 是内存虚拟化的核心头文件，定义了 SPTE（Shadow Page Table Entry）
-的位布局。KVM 使用 SPTE 来编程 EPT 硬件页表。
+### Q: SPTE 的 64 位里，每一位都是硬件定义的吗？
 
-### 1.1 基础页表位定义
+不是。KVM 的 SPTE 是**硬件位与软件位的混合体**。低 12 位和高 12 位都混入了 KVM 自定义
+的软件位，硬件 EPT 看到这些位会忽略（或当 reserved 位）。写入 EPT 硬件前需要清除。
+
+### Q: 基础页表位定义在哪？
+
+**文件**: `arch/x86/kvm/mmu.h:15-29`（不是 `spte.h`！）
 
 ```c
-/* 来源: arch/x86/kvm/mmu/spte.h */
-
-/*
- * 基础 x86 页表位 —— 同时适用于 Guest PT 和 EPT
- * 这些位直接映射到 Intel SDM 中定义的页表条目位
- */
 #define PT_PRESENT_MASK         (1ULL << 0)     /* 存在位 */
 #define PT_WRITABLE_MASK        (1ULL << 1)     /* 可写位 */
 #define PT_USER_MASK            (1ULL << 2)     /* 用户态位 */
 #define PT_ACCESSED_MASK        (1ULL << 5)     /* 已访问位 */
 #define PT_DIRTY_MASK           (1ULL << 6)     /* 脏页位 */
 #define PT_PAGE_SIZE_MASK       (1ULL << 7)     /* 大页位 (2MB/1GB) */
-#define PT_GLOBAL_MASK          (1ULL << 8)     /* 全局页位 */
 #define PT64_NX_MASK            (1ULL << 63)    /* No-Execute 位 */
-
-/* 权限掩码：R/W/X 组合 */
-#define PT_RWX_MASK             (PT_WRITABLE_MASK | PT_USER_MASK | PT64_NX_MASK)
 ```
 
-### 1.2 EPT 专用位定义
+这些位同时适用于 Guest 页表和 EPT（EPT 的 bit 0/1/2 恰好也对应 R/W/X）。
+
+### Q: 物理地址放在哪几位？
+
+**文件**: `arch/x86/kvm/mmu/spte.h:42`
 
 ```c
-/* 来源: arch/x86/kvm/mmu/spte.h */
-
-/*
- * EPT 位定义 —— Intel VT-x 扩展页表专用
- * EPT 的权限位与标准页表不同：
- *   bit 0 = Read
- *   bit 1 = Write
- *   bit 2 = Execute (for supervisor-mode linear addresses)
- *   bit 10 = Execute (for user-mode linear addresses, 如果支持)
- */
-#define VMX_EPT_READABLE_MASK           (1ULL << 0)
-#define VMX_EPT_WRITABLE_MASK           (1ULL << 1)
-#define VMX_EPT_EXECUTABLE_MASK         (1ULL << 2)
-#define VMX_EPT_SUPPRESS_VE_BIT         (1ULL << 63)
-
-/* EPT 内存类型编码 (Memory Type, MT) */
-#define VMX_EPT_MT_UNCACHABLE           0       /* UC - 不可缓存 */
-#define VMX_EPT_MT_WRITECOMBINING       1       /* WC - 写合并 */
-#define VMX_EPT_MT_WRITETHROUGH         4       /* WT - 直写 */
-#define VMX_EPT_MT_WRITEPROTECTED       5       /* WP - 写保护 */
-#define VMX_EPT_MT_WRITEBACK            6       /* WB - 回写 (最常用) */
-#define VMX_EPT_MT_MASK                 (7ULL << 3) /* MT 字段掩码 */
+#define SPTE_BASE_ADDR_MASK (((1ULL << 52) - 1) & ~(u64)(PAGE_SIZE-1))
+/* 等价于 bits 51:12，即 PFN << 12 */
 ```
 
-### 1.3 SPTE 完整位布局图
+### Q: 软件位（KVM 元数据）分布在哪？
 
-```
-KVM SPTE 64-bit 位布局（EPT 模式）:
+**文件**: `arch/x86/kvm/mmu/spte.h:18-91`
 
-  63       52 51           12 11  10  9  8  7   6   5   4  3  2  1  0
- ┌──────────┬───────────────┬───┬───┬──┬──┬───┬───┬───┬──┬──┬──┬──┬──┐
- │ NX/特殊位 │    PFN        │SW1│SW2│IG│IG│PS │ IG│ A │ D │IG│ W│ R│ P│
- │(bit63)   │(物理页帧号)   │   │   │  │  │   │   │   │   │  │  │  │  │
- └──────────┴───────────────┴───┴───┴──┴──┴───┴───┴───┴──┴──┴──┴──┴──┘
+| 位 | 掩码 | 含义 |
+|----|------|------|
+| 9 | `DEFAULT_SPTE_HOST_WRITABLE` = `BIT_ULL(9)` | 宿主认为可写（非 EPT） |
+| 10 | `DEFAULT_SPTE_MMU_WRITABLE` = `BIT_ULL(10)` | KVM MMU 认为可写（非 EPT） |
+| 11 | `SPTE_MMU_PRESENT_MASK` = `BIT_ULL(11)` | KVM 认为"存在"（区分 MMIO SPTE） |
+| 52:53 | `SPTE_TDP_AD_MASK` = `(3ULL << 52)` | EPT A/D 位跟踪类型 |
+| 54:55 | `SHADOW_ACC_TRACK_SAVED_MASK` | 访问跟踪时保存的原始 R/X 位 |
+| 57 | `EPT_SPTE_HOST_WRITABLE` = `BIT_ULL(57)` | 宿主认为可写（EPT 模式） |
+| 58 | `EPT_SPTE_MMU_WRITABLE` = `BIT_ULL(58)` | KVM MMU 认为可写（EPT 模式） |
 
-字段说明:
-  P     [bit 0]  Present: 页表条目有效
-  R     [bit 1]  Readable / Writable (EPT 写权限)
-  W     [bit 2]  Execute / User (EPT 用户态执行权限)
-  D     [bit 5]  Accessed (通过 MMU-writable 机制模拟)
-  A     [bit 6]  Dirty (通过软件位跟踪)
-  PS    [bit 7]  Page Size: 1=大页(2MB/1GB), 0=4KB页
-  PFN   [bit 12-51] 物理页帧号: 实际物理地址 = PFN << 12
-  SW1   [bit 10] 软件位1: KVM 内部使用
-  SW2   [bit 11] 软件位2: KVM 内部使用
-  NX    [bit 63] No-Execute 或 Suppress #VE
-```
+**为什么 EPT 模式的软件位在高比特（57/58）而非低比特（9/10）？** EPT 低位的可用
+ignore 位太少 —— bit 0/1/2 是 R/W/X，bit 3:5 是 Memory Type，bit 6 是 IPAT，bit 7
+是 Ignore PAT，bit 8/9 是 A/D。EPT 的叶条目几乎**没有**空闲低位可以借用。
 
-### 1.4 软件状态位（MMU 元数据）
+### Q: `SPTE_TDP_AD_MASK` 的三种取值是什么？
+
+**文件**: `arch/x86/kvm/mmu/spte.h:33-36`
 
 ```c
-/* 来源: arch/x86/kvm/mmu/spte.h */
+#define SPTE_TDP_AD_ENABLED       (0ULL << 52)   /* A/D 位启用（默认） */
+#define SPTE_TDP_AD_DISABLED      (1ULL << 52)   /* A/D 位禁用 */
+#define SPTE_TDP_AD_WRPROT_ONLY   (2ULL << 52)   /* 仅写保护跟踪 */
+```
 
-/*
- * KVM 使用高位（bit 52-63）作为软件元数据位
- * 这些位对 EPT 硬件透明，但 KVM 用来跟踪页表状态
- *
- * 重要：这些位必须在写入 EPT 条目前被清除！
- */
+`AD_ENABLED` 值为 0 —— 这样默认路径不需要在 SPTE 里设置额外位。`AD_DISABLED` 对应
+硬件不支持 A/D 位（或嵌套虚拟化 L2 使用 PML 时的写保护模式）。
 
-/* MMU 权限镜像位 —— 记录 "原始" 权限，即使硬件位被临时修改 */
-#define SPTE_PERM_MASK          /* 读/写/执行权限掩码 */
-#define SPTE_MMU_WRITABLE_MASK  /* 软件可写位 - 表示 Guest 认为页面可写 */
-#define SPTE_MMU_EXECUTABLE_MASK /* 软件可执行位 */
+### Q: `shadow_present_mask` 是什么？
 
-/*
- * 关键概念：Hardware Writable vs MMU Writable
- *
- * ┌──────────────────────────────────────────────────────┐
- * │  场景: 脏页日志（Dirty Logging）                      │
- * │                                                      │
- * │  初始状态: HW_W=1, MMU_W=1  → 正常读写               │
- * │                                                      │
- * │  开启脏页日志:                                        │
- * │    1. 清除 HW_Writable → 硬件阻止写入                 │
- * │    2. 保持 MMU_Writable → KVM 知道应该处理写请求      │
- * │    3. 下一次写入触发 EPT Violation                    │
- * │    4. KVM 记录脏页，重新设置 HW_Writable              │
- * │                                                      │
- * │  状态: HW_W=0, MMU_W=1  → 写入被拦截，等脏页记录     │
- * └──────────────────────────────────────────────────────┘
- */
+**文件**: `arch/x86/kvm/mmu/spte.h:180`（声明），`spte.c:37`（定义）
+
+```c
+extern u64 __read_mostly shadow_present_mask;
+```
+
+这是一个**运行时初始化**的变量，不是常量。它根据 EPT 还是 shadow paging 取不同值：
+
+| 模式 | 值 | 初始化位置 |
+|------|----|-----------|
+| EPT（支持 exec-only） | `0` | `spte.c:439`（`kvm_mmu_set_ept_masks`） |
+| EPT（不支持 exec-only） | `VMX_EPT_READABLE_MASK` | 同上 |
+| Shadow/NPT | `PT_PRESENT_MASK` | `spte.c:495`（`kvm_mmu_reset_all_pte_masks`） |
+
+EPT 支持 exec-only 时，present 不需要任何 RWX 位 —— 硬件只需要 entry 非零就认为有效。
+
+### Q: EPT 位定义在哪？
+
+**文件**: `arch/x86/include/asm/vmx.h:534-544`（不是 `spte.h`！）
+
+```c
+#define VMX_EPT_READABLE_MASK           0x1ull          /* bit 0: R */
+#define VMX_EPT_WRITABLE_MASK           0x2ull          /* bit 1: W */
+#define VMX_EPT_EXECUTABLE_MASK         0x4ull          /* bit 2: X */
+#define VMX_EPT_IPAT_BIT                (1ull << 6)    /* bit 6: IPAT */
+#define VMX_EPT_ACCESS_BIT              (1ull << 8)    /* bit 8: A */
+#define VMX_EPT_DIRTY_BIT               (1ull << 9)    /* bit 9: D */
+#define VMX_EPT_SUPPRESS_VE_BIT         (1ull << 63)   /* bit 63: Suppress #VE */
+```
+
+### Q: SPTE 位布局全景图
+
+```
+  63       58 57 55  53 52 51          12 11 10  9  8  7  6  5  4  3 2 1 0
+ ┌──────────┬──┬──┬───┬───┬──────────────┬───┬──┬──┬──┬──┬──┬──┬──┬─┴─┴─┐
+ │NX/Suppress│EPT│Saved│AD │  PFN         │MMU│HW│HW│A │PS│D │A │  MT  │X W R│
+ │  VE (63) │MW │Bits │Typ│ (51:12)      │Pre│MW│Wr│  │  │  │  │  │(5:3)│(2)(1)│
+ │          │(58)│(54) │(52)│             │(11)│(10)│(9)│  │(7)│  │  │   │     │
+ └──────────┴──┴──┴───┴───┴──────────────┴───┴──┴──┴──┴──┴──┴──┴──┴─────┴────┘
+
+非 EPT 模式:
+  - bit 9 = DEFAULT_SPTE_HOST_WRITABLE
+  - bit 10 = DEFAULT_SPTE_MMU_WRITABLE
+  - bit 11 = SPTE_MMU_PRESENT_MASK
+
+EPT 模式:
+  - bit 57 = EPT_SPTE_HOST_WRITABLE
+  - bit 58 = EPT_SPTE_MMU_WRITABLE
+  - bit 11 = SPTE_MMU_PRESENT_MASK（共用）
+  - bits 52:53 = SPTE_TDP_AD_MASK（A/D 跟踪类型）
+  - bits 54:55 = 访问跟踪时保存的原始 R/X 位
 ```
 
 ---
 
-## 2. 缺页处理入口：kvm_handle_page_fault()
+## 2. 缺页处理入口
 
-`kvm_handle_page_fault()` 是 KVM 处理所有缺页的统一入口，由 VM-Exit
-（退出原因 = EPT Violation 或 Page Fault）触发调用。
+### Q: EPT Violation 触发后，代码从 VM-Exit 走到哪里？
 
-### 2.1 函数签名与参数
+**文件**: `arch/x86/kvm/mmu/mmu.c:4628` — `kvm_handle_page_fault()`
 
 ```c
-/* 来源: arch/x86/kvm/mmu/mmu.c:4628 */
-
-/*
- * kvm_handle_page_fault - 处理 VM-Exit 中的缺页异常
- *
- * @vcpu:         触发缺页的虚拟 CPU
- * @error_code:   硬件错误码（来自 VMCS EXIT_QUALIFICATION）
- * @fault_address: 触发缺页的线性/物理地址 (u64)
- * @insn:         导致缺页的指令数据（用于 MMIO 模拟）
- * @insn_len:     指令长度
- *
- * 错误码位定义（与 x86 PF error code 一致）:
- *   bit 0: P    - 0=页面不存在, 1=权限违规
- *   bit 1: W/R  - 0=读, 1=写
- *   bit 2: U/S  - 0=管理态, 1=用户态
- *   bit 3: RSVD - 保留位违规
- *   bit 4: I/D  - 0=数据访问, 1=指令取指
- *   bit 15: SGX - SGX 相关违规
- *
- * 实际实现:
- *   - 如果无 async PF 标志 → kvm_mmu_page_fault() → direct_page_fault()
- *   - 如果有 async PF (PAGE_NOT_PRESENT) → kvm_async_pf_task_wait_schedule()
- */
 int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
-				u64 fault_address, char *insn, int insn_len)
+                            u64 fault_address, char *insn, int insn_len)
 {
-    int r = 1;
-    u32 flags = vcpu->arch.apf.host_apf_flags;
-    /* ... 见下方详细分析 ... */
-}
-```
-
-### 2.2 处理流程详解
-
-```c
-### 2.2 处理流程详解
-
-```c
-/* 来源: arch/x86/kvm/mmu/mmu.c:4628 */
-
-int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
-				u64 fault_address, char *insn, int insn_len)
-{
-    int r = 1;
-    u32 flags = vcpu->arch.apf.host_apf_flags;
-
-#ifndef CONFIG_X86_64
-    if (WARN_ON_ONCE(fault_address >> 32))
-        return -EFAULT;
-#endif
-    if (WARN_ON_ONCE(error_code >> 32))
-        error_code = lower_32_bits(error_code);
-
-    vcpu->arch.l1tf_flush_l1d = true;
-
+    ...
     if (!flags) {
-        /* ★ 正常路径: 调用 MMU 页错误处理 */
-        trace_kvm_page_fault(vcpu, fault_address, error_code);
+        /* ★ 正常路径：无异步缺页标志 */
         r = kvm_mmu_page_fault(vcpu, fault_address, error_code,
                                insn, insn_len);
     } else if (flags & KVM_PV_REASON_PAGE_NOT_PRESENT) {
-        /* ★ 异步缺页 (PV): Guest页不在宿主内存中 */
-        vcpu->arch.apf.host_apf_flags = 0;
-        local_irq_disable();
+        /* ★ 异步缺页：Guest 页不在宿主内存 */
         kvm_async_pf_task_wait_schedule(fault_address);
-        local_irq_enable();
-    } else {
-        WARN_ONCE(1, "Unexpected host async PF flags: %x\n", flags);
+    }
+    ...
+}
+```
+
+这个函数是 VM-Exit 处理函数 `handle_ept_violation()` 的最终调用目标。
+
+### Q: `kvm_mmu_page_fault()` 内部分发逻辑？
+
+**文件**: `arch/x86/kvm/mmu/mmu.c:6106`
+
+```c
+int noinline kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+                                u64 error_code, void *insn, int insn_len)
+{
+    /* ★ 保留位违规 → MMIO 模拟 */
+    if (unlikely(error_code & PFERR_RSVD_MASK)) {
+        r = handle_mmio_page_fault(vcpu, cr2_or_gpa, direct);
+        if (r == RET_PF_EMULATE)
+            goto emulate;
     }
 
-    return r;
+    /* ★ 核心路径：分发到 MMU page fault handler */
+    r = kvm_mmu_do_page_fault(vcpu, cr2_or_gpa, error_code, ...);
+
+    /* 写保护违规 → 可能需要模拟 */
+    if (r == RET_PF_WRITE_PROTECTED)
+        r = kvm_mmu_write_protect_fault(vcpu, ...);
+
+    /* ★ 需要指令模拟 */
+    if (r == RET_PF_EMULATE)
+        return x86_emulate_instruction(vcpu, cr2_or_gpa, ...);
 }
-
-/*
- * kvm_mmu_page_fault() 内部:
- *   → vcpu->arch.mmu->page_fault()
- *     - TDP模式: kvm_tdp_page_fault() (mmu.c:4726)
- *       → direct_page_fault() (mmu.c:4576)
- *         → kvm_tdp_mmu_map() (tdp_mmu.c:1104)
- *     - 影子页表模式: FNAME(page_fault)()
- */
 ```
 
-### 2.3 调用流程图
+### Q: `kvm_mmu_do_page_fault()` 怎么找到正确的处理函数？
 
+**文件**: `arch/x86/kvm/mmu/mmu_internal.h:293`
+
+```c
+static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+                                        u64 err, bool prefetch, ...)
+{
+    struct kvm_page_fault fault = {
+        .addr = cr2_or_gpa,
+        .error_code = err,
+        .prefetch = prefetch,
+        ...
+        .exec   = err & PFERR_FETCH_MASK,     /* ★ 从 error_code 解析 */
+        .write  = err & PFERR_WRITE_MASK,
+        .present = err & PFERR_PRESENT_MASK,
+        .is_tdp = vcpu->arch.mmu->root_role.direct,
+    };
+    ...
+    /* retpoline 缓解：直接调用而非间接 */
+    return kvm_tdp_page_fault(vcpu, &fault);
+}
 ```
-VM-Exit (EPT Violation)
-    │
-    ▼
-vmx_handle_exit()                    [vmx/vmx.c]
-    │
-    ▼
-kvm_handle_page_fault()              [mmu/mmu.c:4628]
-    │
-    ├── 检查 async PF 标志 (host_apf_flags)
-    │   ├── 无标志 → kvm_mmu_page_fault()
-    │   └── PAGE_NOT_PRESENT → kvm_async_pf_task_wait_schedule()
-    │
-    └── kvm_mmu_page_fault()
-        │
-        └── vcpu->arch.mmu->page_fault()
-            │
-            ├── TDP 模式:
-            │   └── kvm_tdp_page_fault()   [mmu/mmu.c:4726]
-            │       └── direct_page_fault() [mmu/mmu.c:4576]
-            │           │
-            │           └── kvm_tdp_mmu_map() [mmu/tdp_mmu.c:1104]
-        │           │
-        │           ├── 分配物理页 (kvm_mmu_alloc_sp())
-        │           ├── 构造 SPTE (make_spte())
-        │           └── 原子写入页表 (tdp_mmu_set_spte_atomic())
-        │
-        └── 影子页表模式:
-            └── kvm_shadow_page_fault()  [mmu/mmu.c]
-```
+
+`kvm_page_fault` 结构体在栈上构造，把 error_code 的各位**预解析**成 bool 字段，
+避免下游代码重复解析。
 
 ---
 
-## 3. TDP 缺页处理：kvm_tdp_page_fault()
+## 3. `struct kvm_page_fault`：缺页上下文
 
-当 KVM 使用 EPT/NPT（两层地址翻译）时，缺页由 `kvm_tdp_page_fault()` 处理。
+### Q: 这个结构体封装了哪些信息？
 
-### 3.1 函数实现
-
-```c
-/* 来源: arch/x86/kvm/mmu/mmu.c */
-
-/*
- * kvm_tdp_page_fault - 处理 TDP（Two-Dimensional Paging）模式缺页
- *
- * 这是 EPT/NPT 模式下的缺页处理入口
- * 核心工作: 建立 GPA → HPA 的 EPT 映射
- */
-static int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
-{
-    /*
-     * 检查是否可以使用直接映射（Direct Map）
-     * 如果 GPA 对应的主机内存已经由 KVM memslot 管理，
-     * 且不需要影子页表，可以使用直接 EPT 映射
-     */
-
-    /* 快速路径: 尝试直接建立映射 */
-    return kvm_tdp_mmu_map(vcpu, fault);
-}
-```
-
-### 3.2 缺页数据结构
+**文件**: `arch/x86/kvm/mmu/mmu_internal.h:190`
 
 ```c
-/* 来源: arch/x86/kvm/mmu/mmu_internal.h */
-
-/*
- * struct kvm_page_fault - 缺页异常信息
- * 封装了一次缺页的所有上下文信息
- */
 struct kvm_page_fault {
-    /* 输入参数 */
-    const gpa_t addr;           /* 触发缺页的 GPA 地址 */
-    const u32 error_code;       /* 硬件错误码 */
+    /* ★ 输入参数 */
+    const gpa_t addr;           /* 触发缺页的 GPA */
+    const u64 error_code;       /* 硬件错误码 */
+    const bool prefetch;        /* 是否为预取 */
 
-    /* 解析后的信息 */
-    const bool user_fault;      /* 是否用户态触发的缺页 */
-    const bool write_fault;     /* 是否是写操作 */
-    const bool exec_fault;      /* 是否是指取指操作 */
-    const bool present;         /* EPT 条目是否已存在（权限违规）*/
-    const bool rsvd;            /* 是否保留位违规 */
-    const bool huge_page_disallowed;  /* 是否禁止大页映射 */
+    /* ★ 从 error_code 解析 */
+    const bool exec;            /* 取指 */
+    const bool write;           /* 写操作 */
+    const bool present;         /* 权限违规（entry 已存在） */
+    const bool rsvd;            /* 保留位违规 */
+    const bool user;            /* 用户态触发 */
 
-    /* 解析后的地址 */
-    const gfn_t gfn;            /* Guest 页帧号 (GPA >> 12) */
-    const hva_t hva;            /* 对应的宿主虚拟地址 */
-    const hpa_t pfn;            /* 对应的宿主物理页帧号 */
+    /* ★ 派生状态 */
+    const bool is_tdp;          /* TDP（EPT）模式 */
+    bool huge_page_disallowed;  /* NX 大页缓解禁止大页 */
 
-    /* 内存槽信息 */
-    struct kvm_memory_slot *slot; /* 对应的 memslot */
+    /* ★ 映射级别决策 */
+    u8 max_level;               /* 允许的最大映射级别 */
+    u8 req_level;               /* 请求的映射级别 */
+    u8 goal_level;              /* ★ 最终目标级别（4K/2M/1G） */
 
-    /* 映射级别（4K/2M/1G） */
-    int max_level;              /* 允许的最大映射级别 */
-    int req_level;              /* 请求的映射级别 */
-    bool goal_level;            /* 目标映射级别 */
-
-    /* MMIO 相关 */
-    bool is_tdp;                /* 是否为 TDP 缺页 */
+    /* ★ 解析后的地址 */
+    gfn_t gfn;                  /* Guest 页帧号 */
+    struct kvm_memory_slot *slot; /* 对应 memslot（可能 NULL） */
+    kvm_pfn_t pfn;              /* 宿主物理页帧号 */
+    hva_t hva;                  /* 宿主虚拟地址 */
+    bool map_writable;          /* 是否可写映射 */
 };
 ```
 
+### Q: `max_level` / `req_level` / `goal_level` 三级的关系？
+
+```
+max_level ← 硬件与 memslot 约束
+  │         （hugepage 是否可用、memslot 边界对齐）
+  │
+  ▼
+req_level ← 宿主页表约束
+  │         （宿主是否用了大页，PFN 对齐情况）
+  │
+  ▼
+goal_level ← 最终决策
+            （min(req_level, max_level)，
+              再受 nx_huge_page 缓解影响）
+```
+
+`goal_level` 决定创建 4K / 2M / 1G 映射。`kvm_mmu_hugepage_adjust()` 负责计算。
+
 ---
 
-## 4. TDP MMU 映射核心：kvm_tdp_mmu_map()
+## 4. TDP 缺页路径
 
-`kvm_tdp_mmu_map()` 是 EPT 映射的核心函数，负责为给定的 GPA 建立到 HPA 的映射。
+### Q: `kvm_tdp_page_fault()` 怎么选择 TDP MMU 还是旧路径？
 
-### 4.1 函数实现
+**文件**: `arch/x86/kvm/mmu/mmu.c:4726`
 
 ```c
-/* 来源: arch/x86/kvm/mmu/tdp_mmu.c:1104 */
+int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+{
+#ifdef CONFIG_X86_64
+    if (tdp_mmu_enabled)
+        return kvm_tdp_mmu_page_fault(vcpu, fault);  /* ★ 新路径 */
+#endif
+    return direct_page_fault(vcpu, fault);            /* 旧路径 */
+}
+```
 
-/*
- * kvm_tdp_mmu_map - 为 Guest GPA 建立 EPT 映射
- *
- * 核心流程:
- *   1. 遍历 EPT 页表，找到需要修改的叶条目
- *   2. 如果需要，分配中间层页表页
- *   3. 分配目标物理页
- *   4. 构造 SPTE 并原子写入
- *
- * 并发安全: 使用原子操作(cmpxchg)更新 SPTE，
- * 支持多个 vCPU 同时处理不同地址的缺页
- */
+`tdp_mmu_enabled` 是编译期+运行期双重控制。6.12 里 TDP MMU（并发安全、无 mmu_lock
+写锁）是默认路径。
+
+### Q: `kvm_tdp_mmu_page_fault()` 的核心流程？
+
+**文件**: `arch/x86/kvm/mmu/mmu.c:4673`
+
+```c
+static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
+                                  struct kvm_page_fault *fault)
+{
+    /* 1. 写跟踪检查（dirty logging） */
+    if (page_fault_handle_page_track(vcpu, fault))
+        return RET_PF_WRITE_PROTECTED;
+
+    /* 2. 快速路径：直接 SPTE 修复 */
+    r = fast_page_fault(vcpu, fault);
+    if (r != RET_PF_INVALID)
+        return r;
+
+    /* 3. 补充内存缓存（页表页、SPTE 缓存） */
+    r = mmu_topup_memory_caches(vcpu, false);
+
+    /* 4. 解析 PFN：GPA → HVA → PFN */
+    r = kvm_faultin_pfn(vcpu, fault, ACC_ALL);
+
+    /* ★ 5. 读锁！不是写锁 —— TDP MMU 的并发关键 */
+    read_lock(&vcpu->kvm->mmu_lock);
+
+    if (is_page_fault_stale(vcpu, fault))
+        goto out_unlock;
+
+    /* ★ 6. 核心映射 */
+    r = kvm_tdp_mmu_map(vcpu, fault);
+
+out_unlock:
+    read_unlock(&vcpu->kvm->mmu_lock);
+    ...
+}
+```
+
+**为什么用读锁？** TDP MMU 的 SPTE 更新用 `cmpxchg` 原子操作，多个 vCPU 可以
+并发处理不同地址的缺页。读锁只防止页表结构在遍历中被释放（RCU 保护），不阻止
+并发写入。
+
+对比 `direct_page_fault()`（旧路径，`mmu.c:4576`）用的是 `write_lock()`。
+
+---
+
+## 5. TDP MMU 映射核心：`kvm_tdp_mmu_map()`
+
+### Q: 函数做了什么？
+
+**文件**: `arch/x86/kvm/mmu/tdp_mmu.c:1104`
+
+```c
 int kvm_tdp_mmu_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 {
     struct kvm_mmu *mmu = vcpu->arch.mmu;
     struct tdp_iter iter;
-    struct kvm_page_fault *f = fault;
-    kvm_pte_t new_spte;
-    int ret;
+    struct kvm_mmu_page *sp;
 
-    /*
-     * Step 1: 获取 TDP MMU 根页面
-     *
-     * TDP MMU 使用引用计数管理根页面:
-     * - 每个 vCPU 在 page fault 期间持有根页面的引用
-     * - 防止根页面在页表遍历过程中被释放
-     * - 使用 RCU 保护根页面的生命周期
-     */
-    /* root = kvm_tdp_mmu_get_root(vcpu); */
+    kvm_mmu_hugepage_adjust(vcpu, fault);    /* 确定 goal_level */
 
-    /*
-     * Step 2: 遍历 EPT 页表
-     *
-     * tdp_root_for_each_leaf_pte() 从根开始遍历 EPT，
-     * 找到 fault->gfn 对应的叶条目位置
-     *
-     * EPT 4级遍历:
-     *   PML4 → PDPT → PD → PT → 叶条目
-     *
-     * 如果使用 2MB 大页:
-     *   PML4 → PDPT → PD(2MB叶)
-     */
-    for_each_tdp_pte(mmu, iter, fault->gfn, fault->gfn + 1) {
-        /*
-         * Step 3: 检查当前叶条目状态
-         *
-         * 三种情况:
-         * a) 条目已存在且映射正确 → 无需操作
-         * b) 条目存在但映射到错误的页 → 需要替换
-         * c) 条目不存在 → 需要创建新映射
-         */
+    rcu_read_lock();                          /* ★ RCU 保护页表遍历 */
 
-        /*
-         * Step 4: 如果需要中间层页表但尚未分配，
-         * 在这里分配（可能需要释放锁后再获取）
-         */
+    tdp_mmu_for_each_pte(iter, mmu, fault->gfn, fault->gfn + 1) {
+        /* 被冻结的 SPTE → 放弃重试 */
+        if (is_frozen_spte(iter.old_spte))
+            goto retry;
 
-        /*
-         * Step 5: 分配目标物理页面
-         * 从 KVM 的页面分配器获取一个 HPA
-         */
+        /* ★ 到达目标级别 → 安装叶 SPTE */
+        if (iter.level == fault->goal_level)
+            goto map_target_level;
 
-        /*
-         * Step 6: 构造新的 SPTE
-         *
-         * make_spte() 根据以下信息构造 SPTE:
-         *   - 目标物理页帧号 (pfn)
-         *   - 访问权限（读/写/执行）
-         *   - 页面大小（4K/2M/1G）
-         *   - 内存类型（WB/UC/...）
-         *   - 脏页/访问位状态
-         */
-        /* new_spte = make_spte(vcpu, fault->slot, ACC_ALL,
-         *                      iter.level, fault->gfn,
-         *                      fault->pfn, ...); */
+        /* 已有下级页表 → 继续下降 */
+        if (is_shadow_present_pte(iter.old_spte) &&
+            !is_large_pte(iter.old_spte))
+            continue;
 
-        /*
-         * Step 7: 原子写入 SPTE
-         *
-         * 使用 cmpxchg (Compare-And-Swap) 原子更新:
-         * - 如果当前 SPTE 未被其他 vCPU 修改 → 成功
-         * - 如果已被修改 → 重试
-         *
-         * 这是 TDP MMU 并发安全的关键机制
-         */
-        /* ret = tdp_mmu_set_spte_atomic(vcpu->kvm, &iter, new_spte); */
+        /* ★ 需要分配中间层页表 */
+        sp = tdp_mmu_alloc_sp(vcpu);
+        tdp_mmu_init_child_sp(sp, &iter);
 
-        /* if (ret == 0) {
-         *     // 成功: 刷新 TLB 如果需要
-         *     return RET_PF_FIXED;
-         * }
-         * // 失败: cmpxchg 竞争，重新遍历
-         */
+        if (is_shadow_present_pte(iter.old_spte))
+            r = tdp_mmu_split_huge_page(kvm, &iter, sp, true);  /* 拆大页 */
+        else
+            r = tdp_mmu_link_sp(kvm, &iter, sp, true);           /* 链接新页表 */
+
+        if (r) {
+            tdp_mmu_free_sp(sp);
+            goto retry;     /* cmpxchg 失败 → 重试 */
+        }
     }
 
-    return RET_PF_RETRY;  /* 需要重试 */
+map_target_level:
+    ret = tdp_mmu_map_handle_target_level(vcpu, fault, &iter);
+
+retry:
+    rcu_read_unlock();
+    return ret;
 }
 ```
 
-### 4.2 映射流程图
+### Q: 叶 SPTE 怎么安装？
 
-```
-kvm_tdp_mmu_map() 内部流程:
+**文件**: `arch/x86/kvm/mmu/tdp_mmu.c:1017` — `tdp_mmu_map_handle_target_level()`
 
-    ┌─────────────────────┐
-    │  获取 TDP MMU Root  │ ← 引用计数 +1
-    └──────────┬──────────┘
-               │
-               ▼
-    ┌─────────────────────┐
-    │  遍历 EPT 页表      │
-    │  (PML4→PDPT→PD→PT) │
-    └──────────┬──────────┘
-               │
-        ┌──────┴──────┐
-        │ 叶条目状态?  │
-        └──┬───┬───┬──┘
-           │   │   │
-    ┌──────┘   │   └──────┐
-    ▼          ▼          ▼
- 不存在     已正确     需替换
-    │       映射       │
-    ▼          │        ▼
- ┌─────────┐  │   ┌─────────┐
- │分配物理页│  │   │替换映射 │
- │分配页表页│  │   │释放旧页 │
- └────┬────┘  │   └────┬────┘
-      │       │        │
-      └───────┼────────┘
-              │
-              ▼
-    ┌─────────────────────┐
-    │   make_spte()       │ ← 构造 SPTE 值
-    │   组合: PFN|权限|MT │
-    └──────────┬──────────┘
-               │
-               ▼
-    ┌─────────────────────┐
-    │ cmpxchg 原子写入    │
-    │ (并发安全的关键!)   │
-    └──────────┬──────────┘
-               │
-        ┌──────┴──────┐
-        │ 成功?       │
-        └──┬──────┬───┘
-           │      │
-          Yes     No
-           │      │
-           ▼      ▼
-     返回成功  重新遍历
-     RET_PF_FIXED  RET_PF_RETRY
+```c
+static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
+                                           struct kvm_page_fault *fault,
+                                           struct tdp_iter *iter)
+{
+    u64 new_spte;
+    bool wrprot;
+
+    /* ★ 构造新 SPTE */
+    wrprot = make_spte(vcpu, sp, fault->slot, ACC_ALL, iter->gfn,
+                       fault->pfn, iter->old_spte, fault->prefetch, true,
+                       fault->map_writable, &new_spte);
+
+    if (new_spte == iter->old_spte)
+        ret = RET_PF_SPURIOUS;                /* 无变化 → 伪缺页 */
+    else if (tdp_mmu_set_spte_atomic(vcpu->kvm, iter, new_spte))
+        return RET_PF_RETRY;                  /* ★ cmpxchg 失败 → 重试 */
+
+    /* 写保护但 fault 是写 → 需要模拟 */
+    if (wrprot && fault->write)
+        ret = RET_PF_WRITE_PROTECTED;
+
+    return ret;
+}
 ```
 
 ---
 
-## 5. SPTE 构造：make_spte()
+## 6. `make_spte()`：构造 SPTE 值
 
-`make_spte()` 函数（位于 `mmu/spte.c`）负责将各种参数组合成一个完整的 SPTE 值。
+### Q: 怎么把 PFN、权限、内存类型拼成 64 位？
 
-### 5.1 构造过程
-
-```c
-/* 来源: arch/x86/kvm/mmu/spte.c:157 */
-
-/*
- * make_spte - 构造一个新的 SPTE
- *
- * 实际签名:
- *   bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
- *                  const struct kvm_memory_slot *slot,
- *                  unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
- *                  u64 old_spte, bool prefetch, bool can_unsync,
- *                  bool host_writable, u64 *new_spte)
- *
- * 输入:
- *   vcpu         - 虚拟CPU
- *   sp           - 目标影子页 (包含level信息)
- *   slot         - 内存槽
- *   pte_access   - 访问权限 (ACC_EXEC_MASK | ACC_WRITE_MASK | ...)
- *   gfn          - Guest 页帧号
- *   pfn          - 目标物理页帧号
- *   old_spte     - 旧SPTE值 (用于A/D位继承)
- *   prefetch     - 是否为预取
- *   can_unsync   - 是否允许unsync
- *   host_writable - 宿主是否可写
- *
- * 输出:
- *   *new_spte = 64位 SPTE 值
- *   返回: true 如果SPTE需要同步 (unsync)
- */
-
-/*
- * SPTE 构造过程:
- *
- * 1. 设置 Present 位
- *    spte = PT_PRESENT_MASK
- *
- * 2. 设置物理页帧号
- *    spte |= (pfn << PT64_LEVEL_BITS)   // PFN 放在高位
- *
- * 3. 设置权限位
- *    if (protection & ACC_WRITE_MASK)
- *        spte |= PT_WRITABLE_MASK
- *    if (!(protection & ACC_EXEC_MASK))
- *        spte |= PT64_NX_MASK
- *
- * 4. 设置大页位（如果需要）
- *    if (level > PG_LEVEL_4K)
- *        spte |= PT_PAGE_SIZE_MASK
- *
- * 5. 设置内存类型（EPT 模式）
- *    spte |= VMX_EPT_MT_WRITEBACK << 3   // 通常使用 WB
- *
- * 6. 设置 Accessed/Dirty 位
- *    if (dirty)
- *        spte |= SPTE_TDP_DIRTY_MASK
- *    spte |= SPTE_TDP_ACCESSED_MASK      // 新建映射标记已访问
- *
- * 返回: 完整的 SPTE 值
- */
-```
-
----
-
-## 6. TDP MMU 根页面管理
-
-TDP MMU 使用多级根页面来支持并发访问和高效回收。
-
-### 6.1 根页面结构
+**文件**: `arch/x86/kvm/mmu/spte.c:157`
 
 ```c
-/* 来源: arch/x86/kvm/mmu/tdp_mmu.h (概念性) */
+bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+               const struct kvm_memory_slot *slot,
+               unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
+               u64 old_spte, bool prefetch, bool can_unsync,
+               bool host_writable, u64 *new_spte)
+{
+    int level = sp->role.level;
+    u64 spte = SPTE_MMU_PRESENT_MASK;          /* ★ bit 11：KVM 认为存在 */
 
-/*
- * TDP MMU 根页面管理
- *
- * KVM 维护一个根页面列表，每个根页面关联一个 address space:
- *   - KVM_ADDRESS_SPACE_MEM: 常规内存
- *   - KVM_ADDRESS_SPACE_MEM_READONLY: 只读内存（用于 SMM 等）
- *
- * 根页面通过引用计数管理生命周期:
- *   - kvm_tdp_mmu_get_root(): 增加引用计数
- *   - kvm_tdp_mmu_put_root(): 减少引用计数，可能释放
- *
- * 并发保护:
- *   - 根页面列表使用 hlist + RCU 保护
- *   - 根页面本身使用 spinlock 保护
- *   - SPTE 更新使用原子操作
- */
+    /* 1. A/D 跟踪类型 */
+    if (sp->role.ad_disabled)
+        spte |= SPTE_TDP_AD_DISABLED;          /* bits 52:53 = 01 */
+    else if (kvm_mmu_page_ad_need_write_protect(sp))
+        spte |= SPTE_TDP_AD_WRPROT_ONLY;       /* bits 52:53 = 10 */
+
+    /* 2. 硬件 present 位 */
+    spte |= shadow_present_mask;                /* EPT: R 或 0 */
+
+    /* 3. 访问位（非预取时设置） */
+    if (!prefetch)
+        spte |= spte_shadow_accessed_mask(spte);
+
+    /* 4. NX 大页缓解：大页 + 可执行 → 强制去执行 */
+    if (level > PG_LEVEL_4K && (pte_access & ACC_EXEC_MASK) &&
+        is_nx_huge_page_enabled(vcpu->kvm)) {
+        pte_access &= ~ACC_EXEC_MASK;
+    }
+
+    /* 5. 执行权限 */
+    if (pte_access & ACC_EXEC_MASK)
+        spte |= shadow_x_mask;
+    else
+        spte |= shadow_nx_mask;
+
+    /* 6. 用户权限 */
+    if (pte_access & ACC_USER_MASK)
+        spte |= shadow_user_mask;
+
+    /* 7. 大页标记 */
+    if (level > PG_LEVEL_4K)
+        spte |= PT_PAGE_SIZE_MASK;              /* bit 7 */
+
+    /* 8. 内存类型（EPT 专属） */
+    if (shadow_memtype_mask)
+        spte |= kvm_x86_call(get_mt_mask)(vcpu, gfn, kvm_is_mmio_pfn(pfn));
+
+    /* 9. 宿主可写标记 */
+    if (host_writable)
+        spte |= shadow_host_writable_mask;
+    else
+        pte_access &= ~ACC_WRITE_MASK;          /* 宿主不可写 → 去写权限 */
+
+    /* 10. PFN 放入 bits 51:12 */
+    spte |= (u64)pfn << PAGE_SHIFT;
+
+    /* 11. 写权限 + MMU 可写标记 */
+    if (pte_access & ACC_WRITE_MASK) {
+        spte |= PT_WRITABLE_MASK | shadow_mmu_writable_mask;
+
+        /* 旧 SPTE 已可写 → 跳过 unsync（优化） */
+        if (is_last_spte(old_spte, level) && is_writable_pte(old_spte))
+            goto out;
+
+        /* 尝试 unsync 影子页；失败则写保护 */
+        if (mmu_try_to_unsync_pages(...)) {
+            pte_access &= ~ACC_WRITE_MASK;
+            spte &= ~(PT_WRITABLE_MASK | shadow_mmu_writable_mask);
+        }
+    }
+
+    /* 12. 脏页标记 */
+    if (pte_access & ACC_WRITE_MASK)
+        spte |= spte_shadow_dirty_mask(spte);
+
+out:
+    *new_spte = spte;
+    return wrprot;     /* true = 需要写保护，调用者需模拟写 */
+}
 ```
 
-### 6.2 根页面生命周期
+### Q: 为什么 `make_spte()` 返回 `bool`？
 
-```
-根页面生命周期:
-
-    ┌───────────────────┐
-    │   创建根页面       │
-    │   (首次 vCPU 需要) │
-    └────────┬──────────┘
-             │
-             ▼
-    ┌───────────────────┐
-    │ 加入根页面列表     │
-    │ hlist_add_head_rcu│
-    │ refcount = 1      │
-    └────────┬──────────┘
-             │
-    ┌────────┴────────┐
-    │                 │
-    ▼                 ▼
- ┌─────────┐   ┌─────────┐
- │ vCPU A  │   │ vCPU B  │     ← 每个 vCPU 在 page fault
- │ get_root│   │ get_root│       时获取引用
- │ ref++   │   │ ref++   │
- └────┬────┘   └────┬────┘
-      │             │
-      ▼             ▼
- ┌─────────┐   ┌─────────┐
- │ 处理    │   │ 处理    │     ← 并发处理不同 GPA 的缺页
- │ page    │   │ page    │       通过 cmpxchg 保证 SPTE 一致性
- │ fault   │   │ fault   │
- └────┬────┘   └────┬────┘
-      │             │
-      ▼             ▼
- ┌─────────┐   ┌─────────┐
- │ put_root│   │ put_root│     ← 完成后释放引用
- │ ref--   │   │ ref--   │
- └─────────┘   └─────────┘
-                    │
-                    ▼ (最后一个引用释放时)
-            ┌───────────────┐
-            │ 回收根页面     │
-            │ 释放页表结构   │
-            │ (可能延迟到   │
-            │  RCU grace    │
-            │  period 后)   │
-            └───────────────┘
-```
+返回 `wrprot`：true 表示"虽然 Guest 想要写权限，但 SPTE 被降级为只读了"。
+原因可能是影子页无法 unsync。调用方拿到 `wrprot=true` + `fault->write=true`
+后走模拟路径（`RET_PF_WRITE_PROTECTED`），不直接重入 Guest。
 
 ---
 
 ## 7. 原子 SPTE 更新
 
-### 7.1 cmpxchg 机制
+### Q: TDP MMU 不用 mmu_lock 写锁，怎么保证并发安全？
+
+**文件**: `arch/x86/kvm/mmu/tdp_mmu.c:533` — `__tdp_mmu_set_spte_atomic()`
 
 ```c
-/* 来源: arch/x86/kvm/mmu/tdp_mmu.c (概念性) */
+static inline int __must_check __tdp_mmu_set_spte_atomic(struct tdp_iter *iter,
+                                                         u64 new_spte)
+{
+    u64 *sptep = rcu_dereference(iter->sptep);
 
-/*
- * tdp_mmu_set_spte_atomic - 原子更新 SPTE
- *
- * 使用 cmpxchg 确保并发安全:
- *
- * expected = *sptep                    // 读取当前值
- * if (cmpxchg(sptep, expected, new)    // 原子比较并交换
- *     == expected)
- *     return 0;                        // 成功
- * else
- *     return -EBUSY;                   // 被其他 vCPU 抢先修改
- *
- * 为什么不用锁?
- * - EPT 缺页是热路径，锁会导致严重的并发瓶颈
- * - cmpxchg 是无锁操作，硬件保证原子性
- * - 失败时只需重新遍历，开销可控
- */
+    /* ★ 原子比较并交换：只有一个 vCPU 能成功 */
+    if (!try_cmpxchg64(sptep, &iter->old_spte, new_spte))
+        return -EBUSY;               /* 被别的 vCPU 抢先了 */
+
+    return 0;
+}
 ```
 
-### 7.2 竞争场景
+**`iter->old_spte` 是双向的**：
+- 作为 cmpxchg 的 expected 值（输入）
+- 失败时被硬件更新为当前值（输出）→ 调用者可以用新值重试
+
+### Q: 竞争场景长什么样？
 
 ```
-并发 SPTE 更新场景:
-
-  vCPU A                          vCPU B
-  (处理 GPA=0x1000)               (处理 GPA=0x2000)
-  │                               │
-  ├─ 遍历到 PD 层                  ├─ 遍历到同一 PD 层
-  │                               │
-  ├─ 需要分配 PT 页面              ├─ 也需要分配 PT 页面
-  │                               │
-  ├─ 分配 PT_A                     ├─ 分配 PT_B
-  │                               │
-  ├─ cmpxchg(PD_entry,            ├─ cmpxchg(PD_entry,
-  │   0, PT_A) → 成功!             │   0, PT_B) → 失败!
-  │                               │   (PD_entry 已被 vCPU A 设置)
-  ├─ 继续写入 PT_A[...]            │
-  │  设置 SPTE                     ├─ 发现 PD_entry 已有值
-  │                               ├─ 释放 PT_B (回退)
-  │                               ├─ 使用 PT_A 继续
-  │                               ├─ 写入 PT_A[...]
-  │                               │  设置 SPTE
-  ▼                               ▼
+vCPU A (GPA=0x1000)              vCPU B (GPA=0x2000)
+│                                │
+├─ 遍历到 PD 层                   ├─ 遍历到同一 PD 层
+│                                │
+├─ 需要分配 PT 页面               ├─ 也需要分配 PT 页面
+├─ 分配 PT_A                      │
+│                                ├─ 分配 PT_B
+├─ cmpxchg(PD[idx],               │
+│    old=0, new=PT_A) → 成功!     │
+│                                ├─ cmpxchg(PD[idx],
+│                                │   old=0, new=PT_B) → 失败!
+│                                │  (iter->old_spte 已被更新为 PT_A)
+│                                │
+├─ 继续向下遍历                    ├─ 发现 PD[idx] 已有值
+│  写入 PT_A[...]                  ├─ 释放 PT_B
+│                                ├─ 使用 PT_A 继续遍历
+│                                ├─ 写入 PT_A[...]
 ```
 
----
+**为什么失败方要释放自己分配的页表？** 胜利方已经把自己的页表链接进了 EPT，
+失败方的页表没人引用了，必须回收。否则泄漏。
 
-## 8. 常见调试技巧
+### Q: 外层包装 `tdp_mmu_set_spte_atomic()` 做什么额外的事？
 
-### 8.1 通过 ftrace 跟踪 SPTE 变化
+**文件**: `arch/x86/kvm/mmu/tdp_mmu.c:576`
 
-```bash
-# 跟踪 SPTE 的创建和修改
-echo kvm_mmu_set_spte > /sys/kernel/debug/tracing/set_event
-echo kvm_mmu_paging_element >> /sys/kernel/debug/tracing/set_event
+```c
+static inline int tdp_mmu_set_spte_atomic(struct kvm *kvm,
+                                          struct tdp_iter *iter,
+                                          u64 new_spte)
+{
+    lockdep_assert_held_read(&kvm->mmu_lock);    /* ★ 读锁即可 */
 
-# 观察大页 vs 4K 页的比例
-# 在 trace 输出中查找 level 字段:
-#   level=2 表示 2MB 大页
-#   level=1 表示 4KB 页
-```
+    ret = __tdp_mmu_set_spte_atomic(iter, new_spte);
+    if (ret)
+        return ret;
 
-### 8.2 通过 /proc 观察内存使用
-
-```bash
-# KVM 内存统计
-cat /proc/meminfo | grep -i kvm
-
-# 页表内存使用
-grep -i "kvm\|mmu" /proc/slabinfo
-
-# 查看每个 VM 的内存槽信息
-cat /sys/kernel/debug/kvm/<vm_id>/memslot
+    /* ★ 更新记账：处理 A/D 位变化、TLB 失效等 */
+    handle_changed_spte(kvm, iter->as_id, iter->gfn,
+                        iter->old_spte, new_spte, iter->level, true);
+    return 0;
+}
 ```
 
 ---
 
-## 9. 关键概念总结
+## 8. TDP MMU 根页面管理
 
-| 概念 | 说明 | 源码位置 |
-|------|------|----------|
-| SPTE | KVM 的页表条目，混合硬件+软件位 | `spte.h` |
-| PFN | 物理页帧号，SPTE 的核心载荷 | SPTE[12:51] |
-| TDP | Two-Dimensional Paging (EPT/NPT) | `tdp_mmu.c` |
-| cmpxchg | 原子比较交换，保证并发 SPTE 更新 | `tdp_mmu.c` |
-| Root 页面 | EPT 的根页表，通过引用计数管理 | `tdp_mmu.c` |
-| Memslot | KVM 内存槽，GPA 到 HVA 的映射 | `mmu.c` |
-| Dirty Logging | 脏页跟踪，通过临时清除 W 位实现 | `mmu.c` |
+### Q: 根页面的生命周期怎么管理？
+
+**获取引用**: `arch/x86/kvm/mmu/tdp_mmu.h:15`
+
+```c
+static inline bool kvm_tdp_mmu_get_root(struct kvm_mmu_page *root)
+{
+    return refcount_inc_not_zero(&root->tdp_mmu_root_count);
+}
+```
+
+**释放引用**: `arch/x86/kvm/mmu/tdp_mmu.c:76`
+
+```c
+void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root)
+{
+    if (!refcount_dec_and_test(&root->tdp_mmu_root_count))
+        return;                              /* 还有其他引用 → 不释放 */
+
+    list_del_rcu(&root->link);               /* 从根列表移除 */
+    call_rcu(&root->rcu_head, tdp_mmu_free_sp_rcu_callback);
+    /* ★ RCU grace period 后才真正释放内存 */
+}
+```
+
+**为什么需要引用计数？** 多个 vCPU 并发处理缺页时，每个都持有根的引用。
+一个 vCPU 想切换根（比如 memslot 变化要 zap 全部），必须等所有引用释放后才能
+安全释放旧根。`call_rcu` 确保正在遍历的 vCPU 不会访问已释放的内存。
+
+---
+
+## 9. 完整调用链
+
+```
+VM-Exit (EPT Violation)
+  │
+  ▼
+vmx_handle_exit() → handle_ept_violation()
+  │
+  ▼
+kvm_handle_page_fault()             [mmu.c:4628]
+  │
+  ├── async PF? → kvm_async_pf_task_wait_schedule()
+  │
+  └── ★ 正常路径:
+      ▼
+kvm_mmu_page_fault()                [mmu.c:6106]
+  │
+  ├── PFERR_RSVD → handle_mmio_page_fault() → MMIO 模拟
+  │
+  └── ★ 核心分发:
+      ▼
+kvm_mmu_do_page_fault()             [mmu_internal.h:293]
+  │ 构造 struct kvm_page_fault
+  │
+  ▼
+kvm_tdp_page_fault()                [mmu.c:4726]
+  │
+  ├── tdp_mmu_enabled?
+  │   │
+  │   ▼ ★ TDP MMU 路径（默认）
+  │ kvm_tdp_mmu_page_fault()        [mmu.c:4673]
+  │   │
+  │   ├── page_fault_handle_page_track() → 脏页跟踪
+  │   ├── fast_page_fault()          → 快速路径
+  │   ├── kvm_faultin_pfn()          → GPA → PFN
+  │   │
+  │   ▼ read_lock(&mmu_lock)        ← ★ 读锁！
+  │ kvm_tdp_mmu_map()               [tdp_mmu.c:1104]
+  │   │
+  │   ├── kvm_mmu_hugepage_adjust()  → 确定 goal_level
+  │   ├── tdp_mmu_for_each_pte()    → 遍历 EPT
+  │   │   ├── 中间层缺页 → 分配 + tdp_mmu_link_sp()
+  │   │   └── 大页需拆 → tdp_mmu_split_huge_page()
+  │   │
+  │   ▼
+  │ tdp_mmu_map_handle_target_level() [tdp_mmu.c:1017]
+  │   │
+  │   ├── make_spte()               [spte.c:157]
+  │   │   └→ 组合: present | PFN | 权限 | MT | A/D
+  │   │
+  │   └── tdp_mmu_set_spte_atomic() [tdp_mmu.c:576]
+  │       └→ try_cmpxchg64()        ← ★ 并发安全核心
+  │
+  └── !tdp_mmu_enabled?
+      │
+      ▼ ★ 旧路径
+  direct_page_fault()                [mmu.c:4576]
+    │
+    ▼ write_lock(&mmu_lock)          ← 写锁（并发差）
+  direct_map() → FNAME(fetch)()
+```
+
+---
+
+## 10. 关键数据结构关系
+
+```
+每 vCPU:
+  struct kvm_vcpu
+    └── arch.mmu → struct kvm_mmu
+          ├── root_role.direct = true    ← TDP 模式标识
+          ├── root.hpa                   ← EPT 根页物理地址
+          └── page_fault → kvm_tdp_page_fault  ← 函数指针
+
+每个 EPT 根:
+  struct kvm_mmu_page (root)
+    ├── tdp_mmu_root_count (refcount)   ← 引用计数
+    ├── link (list_head)                ← 挂在全局根列表
+    ├── role.level / role.ad_disabled   ← 角色信息
+    └── spt → 页表页（512 个 SPTE）
+
+TDP MMU 全局:
+  struct kvm
+    └── arch.tdp_mmu_roots             ← 根列表
+          └── hlist_head → kvm_mmu_page (多个根)
+                                │
+                                └── spt[i] → 下级页表或叶 SPTE
+```
+
+---
+
+## 11. 模块参数
+
+### Q: 哪些 MMU 参数可以在运行时改？
+
+**文件**: `arch/x86/kvm/mmu/mmu.c:67-80`（典型参数）
+
+| 参数名 | 变量名 | 权限 | 默认 | 作用 |
+|--------|--------|------|------|------|
+| `nx_huge_pages` | `nx_huge_pages` | 0444 | auto | NX 大页缓解 |
+| `nx_huge_pages_recovery_ratio` | 同名 | 0644 | 60 | 回收比率 |
+| `tdp_mmu` | `tdp_mmu_enabled` | 0444 | y | TDP MMU 并发路径 |
+| `hugepages` | `allow_hugetlbep` | 0444 | y | 允许大页映射 |
+| `dirty_log_time_acc` | — | — | — | 脏页日志时间片 |
+
+**注意**: `nx_huge_pages` 的缓解逻辑会修改 `make_spte()` 的行为：大页 + 可执行
+→ 强制去执行位，降为只读数据页。这是针对 iTLB multihit 的缓解。
