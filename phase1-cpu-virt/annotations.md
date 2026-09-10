@@ -1,578 +1,528 @@
-# 第一阶段：源码精读注释
+# Phase 1：源码精读注释 - CPU 虚拟化（VMX 层）
 
-> 基于 Linux 6.12.93 源码（行号已验证）
+> 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
+> 行号可能随版本变化，用函数名 grep 定位更可靠。
 
-## 1. vt_x86_ops - VMX操作回调表
+---
+
+## 1. VMX 架构分层
+
+### Q: KVM 如何把「x86 通用逻辑」和「Intel VMX  specifics」解耦？
+
+KVM 在 `arch/x86/kvm/` 下做了一层抽象：
+
+```
+x86 通用层（x86.c）             VMX 实现（vmx/）
+vcpu_enter_guest()              vmx_vcpu_run()
+  └→ kvm_x86_call(vcpu_run)     └→ __vmx_vcpu_run()
+      ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+      │   kvm_x86_ops 回调表（间接调用）   │
+      └───────────────────────────────────┘
+```
+
+`kvm_x86_call(xxx)(...)` 是个宏，本质是 `static_call(kvm_x86_xxx)(...)`。`static_call`
+比函数指针快 —— 它在代码里打了 patch point，运行时直接把调用点 patch 成目标函数地址，
+省掉了一次间接跳转。
+
+### Q: `vt_x86_ops` 这张表长什么样？
 
 **文件**: `arch/x86/kvm/vmx/main.c:19-162`
-
-这是VMX实现的核心接口表，将KVM x86通用层与VMX硬件实现解耦。
 
 ```c
 struct kvm_x86_ops vt_x86_ops __initdata = {
     .name = KBUILD_MODNAME,
 
-    // === 硬件管理 ===
-    .check_processor_compatibility = vmx_check_processor_compat,
-    .hardware_unsetup = vmx_hardware_unsetup,
-    .enable_virtualization_cpu = vmx_enable_virtualization_cpu,   // VMXON
-    .disable_virtualization_cpu = vmx_disable_virtualization_cpu, // VMXOFF
+    /* 硬件开关 */
+    .enable_virtualization_cpu  = vmx_enable_virtualization_cpu,   /* VMXON */
+    .disable_virtualization_cpu = vmx_disable_virtualization_cpu,  /* VMXOFF */
 
-    // === VM生命周期 ===
-    .vm_size = sizeof(struct kvm_vmx),
-    .vm_init = vmx_vm_init,
-    .vm_destroy = vmx_vm_destroy,
+    /* VM / vCPU 生命周期 */
+    .vm_size    = sizeof(struct kvm_vmx),       /* ★ 让通用层分配 private 区 */
+    .vm_init    = vmx_vm_init,
+    .vcpu_create = vmx_vcpu_create,             /* ★ 分配 VMCS 区域 */
 
-    // === vCPU生命周期 ===
-    .vcpu_precreate = vmx_vcpu_precreate,
-    .vcpu_create = vmx_vcpu_create,    // ★ 分配VMCS区域
-    .vcpu_free = vmx_vcpu_free,
-    .vcpu_reset = vmx_vcpu_reset,
-
-    // === vCPU调度 ===
-    .prepare_switch_to_guest = vmx_prepare_switch_to_guest,
-    .vcpu_load = vmx_vcpu_load,        // vCPU加载到pCPU
-    .vcpu_put = vmx_vcpu_put,          // vCPU从pCPU卸载
-
-    // === 寄存器访问 ===
-    .get_msr / .set_msr,              // MSR读写
-    .get_segment_base / .get_segment / .set_segment,  // 段寄存器
-    .get_cpl,                          // 当前特权级
-    .set_cr0 / .set_cr4 / .set_efer,  // 控制寄存器
-    .get_rflags / .set_rflags,        // 标志寄存器
-
-    // === TLB管理 ===
-    .flush_tlb_all = vmx_flush_tlb_all,
-    .flush_tlb_current = vmx_flush_tlb_current,
-    .flush_tlb_gva = vmx_flush_tlb_gva,
-    .flush_tlb_guest = vmx_flush_tlb_guest,  // INVVPID
-
-    // === ★ 核心执行路径 ===
-    .vcpu_pre_run = vmx_vcpu_pre_run,
-    .vcpu_run = vmx_vcpu_run,          // ★ VM-Entry/Exit主循环
-    .handle_exit = vmx_handle_exit,    // ★ VM-Exit处理分发
+    /* ★ 核心执行路径 */
+    .vcpu_run           = vmx_vcpu_run,         /* VM-Entry → Guest → VM-Exit */
+    .handle_exit        = vmx_handle_exit,      /* Exit 分发 */
     .handle_exit_irqoff = vmx_handle_exit_irqoff,
 
-    // === 中断/NMI注入 ===
-    .inject_irq = vmx_inject_irq,
-    .inject_nmi = vmx_inject_nmi,
+    /* 中断注入 */
+    .inject_irq       = vmx_inject_irq,
     .inject_exception = vmx_inject_exception,
-    .cancel_injection = vmx_cancel_injection,
-    .interrupt_allowed = vmx_interrupt_allowed,
-    .nmi_allowed = vmx_nmi_allowed,
-    .enable_irq_window = vmx_enable_irq_window,
-    .enable_nmi_window = vmx_enable_nmi_window,
+    .sync_pir_to_irr  = vmx_sync_pir_to_irr,    /* ★ Posted Interrupts 同步 */
 
-    // === APIC虚拟化 ===
-    .set_virtual_apic_mode = vmx_set_virtual_apic_mode,
-    .set_apic_access_page_addr = vmx_set_apic_access_page_addr,
-    .refresh_apicv_exec_ctrl = vmx_refresh_apicv_exec_ctrl,
-    .sync_pir_to_irr = vmx_sync_pir_to_irr,  // ★ Posted Interrupts同步
-    .hwapic_irr_update = vmx_hwapic_irr_update,
-    .hwapic_isr_update = vmx_hwapic_isr_update,
-    .load_eoi_exitmap = vmx_load_eoi_exitmap,
+    /* TLB / MMU */
+    .flush_tlb_guest = vmx_flush_tlb_guest,     /* INVVPID */
+    .load_mmu_pgd    = vmx_load_mmu_pgd,        /* 写 EPTP */
 
-    // === Posted Interrupts ===
-    .pi_update_irte = vmx_pi_update_irte,     // PI中断重映射表更新
-    .pi_start_assignment = vmx_pi_start_assignment,
-
-    // === MMU ===
-    .load_mmu_pgd = vmx_load_mmu_pgd,         // 加载EPT根页表
-
-    // === TSC ===
-    .get_l2_tsc_offset / .write_tsc_offset,
-    .get_l2_tsc_multiplier / .write_tsc_multiplier,
-
-    // === PML (脏页日志) ===
-    .cpu_dirty_log_size = PML_ENTITY_NUM,
-    .update_cpu_dirty_logging = vmx_update_cpu_dirty_logging,
+    /* ... 其他省略 */
 };
 ```
 
-**学习要点**:
-- 此表定义了VMX实现的所有操作接口
-- KVM x86通用层通过 `kvm_x86_call()` 宏间接调用这些回调
-- `__initdata` 表示初始化后可释放（但回调指针保留在runtime_ops中）
-- 注意区分初始化时和运行时的操作
+### Q: 为什么表上标 `__initdata`，但回调还能在运行时用？
 
----
-
-## 2. vmx_hardware_setup() - 硬件初始化
-
-**文件**: `arch/x86/kvm/vmx/vmx.c:8404-8503`
+`__initdata` 让**结构体本身**在初始化后释放。但初始化结束时，KVM 把每个回调指针
+拷进了 `static_call_key`：
 
 ```c
-__init int vmx_hardware_setup(void)
-{
-    unsigned long host_bndcfgs;
-    struct desc_ptr dt;
-    int r;
-
-    store_idt(&dt);
-    host_idt_base = dt.address;           // 保存Host IDT基址
-
-    vmx_setup_user_return_msrs();          // 配置用户返回MSR列表
-
-    if (setup_vmcs_config(&vmcs_config, &vmx_capability) < 0)
-        return -EIO;                       // ★ 读取VMCS配置 (MSR_IA32_VMX_*)
-
-    if (boot_cpu_has(X86_FEATURE_NX))
-        kvm_enable_efer_bits(EFER_NX);    // 启用NX位支持
-
-    // === 特性检测和启用 ===
-
-    // VPID: 需要硬件支持VPID + INVVPID指令
-    if (!cpu_has_vmx_vpid() || !cpu_has_vmx_invvpid() ||
-        !(cpu_has_vmx_invvpid_single() || cpu_has_vmx_invvpid_global()))
-        enable_vpid = 0;
-
-    // EPT: 需要4级页表 + WB内存类型 + INVEPT全局
-    if (!cpu_has_vmx_ept() ||
-        !cpu_has_vmx_ept_4levels() ||
-        !cpu_has_vmx_ept_mt_wb() ||
-        !cpu_has_vmx_invept_global())
-        enable_ept = 0;
-
-    // 无EPT时必须有NX (影子页表需要NX)
-    if (!enable_ept && !boot_cpu_has(X86_FEATURE_NX)) {
-        pr_err_ratelimited("NX not supported\n");
-        return -EOPNOTSUPP;
-    }
-
-    // EPT A/D位: 需要硬件支持
-    if (!cpu_has_vmx_ept_ad_bits() || !enable_ept)
-        enable_ept_ad_bits = 0;
-
-    // Unrestricted Guest: 允许Guest实模式
-    if (!cpu_has_vmx_unrestricted_guest() || !enable_ept)
-        enable_unrestricted_guest = 0;
-
-    // FlexPriority: TPR Shadow
-    if (!cpu_has_vmx_flexpriority())
-        flexpriority_enabled = 0;
-
-    // 虚拟NMI
-    if (!cpu_has_virtual_nmis())
-        enable_vnmi = 0;
-
-    // APICv: 虚拟中断投递
-    if (!cpu_has_vmx_apicv())
-        enable_apicv = 0;
-    if (!enable_apicv)
-        vt_x86_ops.sync_pir_to_irr = NULL;  // 关闭PI同步
-
-    // IPI虚拟化 (需要APICv + IPIV)
-    if (!enable_apicv || !cpu_has_vmx_ipiv())
-        enable_ipiv = false;
-
-    // TSC缩放
-    if (cpu_has_vmx_tsc_scaling())
-        kvm_caps.has_tsc_control = true;
-
-    // PLE (Pause Loop Exiting)
-    if (!cpu_has_vmx_ple()) {
-        ple_gap = 0; ple_window = 0; ...
-    }
-
-    // Bus Lock检测
-    kvm_caps.has_bus_lock_exit = cpu_has_vmx_bus_lock_detection();
-
-    // SPTE加密位掩码 (MKTME)
-    vmx_setup_me_spte_mask();
-
-    // 嵌套虚拟化
-    if (nested)
-        r = nested_vmx_hardware_setup(kvm_vmx_exit_handlers);
-
-    return r;
-}
+/* arch/x86/kvm/x86.c:9698 — kvm_ops_update() */
+#define __KVM_X86_OP(func) \
+    static_call_update(kvm_x86_##func, kvm_x86_ops.func);
+/* ... 展开为每个回调做 static_call_update */
 ```
 
-**特性检测流程**:
-```
-vmx_hardware_setup()
-  │
-  ├─ setup_vmcs_config()         ← 读取VMX capability MSRs
-  │   ├─ MSR_IA32_VMX_BASIC       ← VMCS revision, VMXON区域大小
-  │   ├─ MSR_IA32_VMX_PINBASED_CTLS ← 引脚控制
-  │   ├─ MSR_IA32_VMX_PROCBASED_CTLS ← CPU控制
-  │   ├─ MSR_IA32_VMX_EXIT_CTLS   ← Exit控制
-  │   ├─ MSR_IA32_VMX_ENTRY_CTLS  ← Entry控制
-  │   └─ MSR_IA32_VMX_EPT_VPID_CAP ← EPT/VPID能力
-  │
-  ├─ 特性启用检测 (按依赖关系)
-  │   ├─ EPT → EPT_AD → unrestricted_guest
-  │   ├─ VPID → INVVPID
-  │   ├─ APICv → IPIv → PI
-  │   └─ FlexPriority → TPR Shadow
-  │
-  └─ 回调表调整 (禁用不支持的功能)
-      ├─ sync_pir_to_irr = NULL (无APICv)
-      ├─ set_apic_access_page_addr = NULL (无FlexPriority)
-      └─ update_cr8_intercept = NULL (无TPR Shadow)
-```
+释放的是**表本身**，不是函数。函数在 `.text` 段里，一直在。这样设计是为了在嵌套虚拟化
+需要切换回调表（VMX → SVM 不可能，但 L1 KVM 做 nested VMX 时需要换实现）时保留灵活性。
 
 ---
 
-## 3. vmx_vcpu_run() - vCPU执行主循环
+## 2. VM-Entry / Exit 汇编路径
 
-**文件**: `arch/x86/kvm/vmx/vmx.c:7344-7530+`
+### Q: 从 C 到 VMENTER 之间到底发生了什么？
 
-这是KVM中最关键的函数之一，负责执行VM-Entry并处理VM-Exit后的状态恢复。
+**文件**: `arch/x86/kvm/vmx/vmx.c:7344` — `vmx_vcpu_run()`
+**文件**: `arch/x86/kvm/vmx/vmenter.S` — `__vmx_vcpu_run()`
 
 ```c
 fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 {
-    bool force_immediate_exit = run_flags & KVM_RUN_FORCE_IMMEDIATE_EXIT;
-    struct vcpu_vmx *vmx = to_vmx(vcpu);
-    unsigned long cr3, cr4;
-
-    // === 前置检查 ===
-
-    // 1. 检查Guest状态有效性
-    if (unlikely(vmx->emulation_required)) {
-        // Guest状态无效，需要模拟而非直接进入
-        vmx->exit_reason.full = EXIT_REASON_INVALID_STATE;
-        vmx->exit_reason.failed_vmentry = 1;
-        return EXIT_FASTPATH_NONE;
-    }
-
-    // === Trace ===
-    trace_kvm_entry(vcpu, force_immediate_exit);
-
-    // === PLE窗口更新 ===
-    if (vmx->ple_window_dirty) {
-        vmx->ple_window_dirty = false;
-        vmcs_write32(PLE_WINDOW, vmx->ple_window);
-    }
-
-    // === 同步脏寄存器到VMCS ===
+    /* ★ 1. 同步脏寄存器到 VMCS */
     if (kvm_register_is_dirty(vcpu, VCPU_REGS_RSP))
         vmcs_writel(GUEST_RSP, vcpu->arch.regs[VCPU_REGS_RSP]);
-    if (kvm_register_is_dirty(vcpu, VCPU_REGS_RIP))
-        vmcs_writel(GUEST_RIP, vcpu->arch.regs[VCPU_REGS_RIP]);
-    vcpu->arch.regs_dirty = 0;
 
-    // === 调试寄存器 ===
-    if (run_flags & KVM_RUN_LOAD_GUEST_DR6)
-        set_debugreg(vcpu->arch.dr6, 6);
-
-    // === Host CR3/CR4 刷新 ===
-    // 必须在VM-Entry前完成，因为内核可能切换PCID
+    /* ★ 2. 刷新 Host CR3/CR4（内核可能切了 PCID） */
     cr3 = __get_current_cr3_fast();
     if (unlikely(cr3 != vmx->loaded_vmcs->host_state.cr3)) {
         vmcs_writel(HOST_CR3, cr3);
         vmx->loaded_vmcs->host_state.cr3 = cr3;
     }
-    cr4 = cr4_read_shadow();
-    if (unlikely(cr4 != vmx->loaded_vmcs->host_state.cr4)) {
-        vmcs_writel(HOST_CR4, cr4);
-        vmx->loaded_vmcs->host_state.cr4 = cr4;
-    }
 
-    // === 单步调试处理 ===
-    if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
-        vmx_set_interrupt_shadow(vcpu, 0);
-
-    // === XSAVE状态切换 ===
-    kvm_load_guest_xsave_state(vcpu);
-
-    // === Intel PT (Processor Trace) ===
-    pt_guest_enter(vmx);
-
-    // === 性能计数器 ===
-    atomic_switch_perf_msrs(vmx);
-    if (intel_pmu_lbr_is_enabled(vcpu))
-        vmx_passthrough_lbr_msrs(vcpu);
-
-    // === 抢占定时器 ===
-    if (enable_preemption_timer)
-        vmx_update_hv_timer(vcpu, force_immediate_exit);
-    else if (force_immediate_exit)
-        smp_send_reschedule(vcpu->cpu);
-
-    // === 等待LAPIC定时器 ===
+    /* 3. 等 LAPIC 定时器到期（避免无谓的 VM-Exit） */
     kvm_wait_lapic_expire(vcpu);
 
-    // ═══════════════════════════════════════════════
-    // ★ ★ ★  核心: VM-Entry/Exit (汇编实现)  ★ ★ ★
-    // ═══════════════════════════════════════════════
+    /* ═══════════ 进入汇编 ═══════════ */
     vmx_vcpu_enter_exit(vcpu, __vmx_vcpu_run_flags(vmx));
-    //
-    // 在此调用内部:
-    //   1. 保存Host状态 (或从VMCS恢复)
-    //   2. VMENTER指令 → 进入Non-Root模式
-    //   3. Guest执行...
-    //   4. VM-Exit触发 → 回到Root模式
-    //   5. 保存VM-Exit信息到vmx结构
-    //
-    // 返回后 vmx->exit_reason 已填充
+    /* ═══════════ 回到 C ═══════════ */
 
-    // === VM-Exit后处理 ===
-
-    // eVMCS同步 (Hyper-V)
-    if (kvm_is_using_evmcs()) {
-        current_evmcs->hv_clean_fields |= HV_VMX_ENLIGHTENED_CLEAN_FIELD_ALL;
-    }
-
-    // DEBUGCTL恢复
-    if (vcpu->arch.host_debugctl)
-        update_debugctlmsr(vcpu->arch.host_debugctl);
-
-    // === 读取VM-Exit信息 ===
-    vmx->exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
-    vmx->exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
-
-    // ... (更多状态保存和恢复)
-
-    // === L1D Flush (安全缓解) ===
-    // vmx_l1d_flush() - 可选的L1D缓存刷新
-
-    // === 返回exit处理类型 ===
-    // EXIT_FASTPATH_NONE        → 需要完整exit处理
-    // EXIT_FASTPATH_REENTER_GUEST → 可以直接重新进入
-    // EXIT_FASTPATH_RETREAT     → 需要回退RIP后重新进入
+    /* 4. 读 VM-Exit 信息 */
+    vmx->exit_qualification = vmcs_read32(EXIT_QUALIFICATION);
+    vmx->exit_reason.full   = vmcs_read32(VM_EXIT_REASON);
+    ...
 }
 ```
 
-**VM-Entry/Exit 汇编入口**:
+### Q: 汇编入口里到底做了什么？
+
+**文件**: `arch/x86/kvm/vmx/vmenter.S:79` — `__vmx_vcpu_run()`
+
+```asm
+SYM_FUNC_START(__vmx_vcpu_run)
+    /* 保存 Host 被调用者保存寄存器 */
+    push %rbp
+    push %r15 ... push %r12
+    push %rbx
+
+    /* 更新 VMCS 中的 HOST_RSP（指向当前栈顶） */
+    call vmx_update_host_rsp    /* vmx.c:7231 */
+
+    /* SPEC_CTRL MSR 切换（Spectre 缓解） */
+    /* ... */
+
+    /* ★ 关键：选择 vmlaunch 或 vmresume */
+    bt   $VMX_RUN_VMRESUME_SHIFT, %ebx
+    jnc  .Lvmlaunch
+
+.Lvmresume:
+    vmresume                    /* 或 vmlaunch（首次） */
+    jmp  .Lvmfail
+
+.Lvmlaunch:
+    vmlaunch
+    jmp  .Lvmfail
+
+    /* --- CPU 进入 Non-Root 模式，执行 Guest --- */
+    /* --- 某个时刻 VM-Exit 触发，CPU 回到 Root 模式 --- */
+    /* --- 硬件自动：恢复 HOST_RSP/HOST_RIP，跳到 vmx_vmexit --- */
+
+SYM_INNER_LABEL(vmx_vmexit, SYM_L_GLOBAL)
+    /* VM-Exit 后：保存 Guest 通用寄存器到 vcpu_vmx */
+    /* 恢复 Host 寄存器 */
+    pop %rbx
+    pop %r12 ... pop %r15
+    pop %rbp
+    ret
+SYM_FUNC_END(__vmx_vcpu_run)
 ```
-vmx_vcpu_enter_exit() [vmx/vmx.c]
-  └→ __vmx_vcpu_run() [vmenter.S]  ← 汇编实现
-       │
-       ├─ 保存Host callee-saved寄存器 (rbx, rbp, r12-r15)
-       ├─ vmcs_writel(HOST_RSP)    ← Host栈指针
-       ├─ vmcs_writel(HOST_RIP)    ← Host返回地址
-       │
-       ├─ ★ VMENTER 指令
-       │     CPU从VMX Root → Non-Root模式
-       │     Guest RIP从VMCS加载
-       │     Guest状态从VMCS Guest Area加载
-       │
-       ├─ Guest执行... (时间不定)
-       │
-       ├─ ★ VM-EXIT 触发
-       │     CPU从Non-Root → Root模式
-       │     Host RIP从VMCS HOST_RIP加载
-       │     Exit信息保存到VMCS Exit Info Fields
-       │
-       └─ 返回到C代码
-```
+
+**`HOST_RIP` 在哪设置？** `vmx.c:4361` — `vmcs_writel(HOST_RIP, (unsigned long)vmx_vmexit)`。
+VM-Exit 后 CPU 自动跳到 `vmx_vmexit` 标签继续执行（不是回到 `.Lvmresume`）。
+
+### Q: 为什么 Host 寄存器要「保存被调用者保存的」就够？
+
+VMENTER 是**函数调用**。按照 System V ABI，callee 必须保存 `rbx/rbp/r12-r15`，caller
+保存的寄存器（`rax/rcx/rdx/rsi/rdi/r8-r11`）由 `vmx_vcpu_run()` 自己负责。VM-Exit
+后 CPU 处于 `__vmx_vcpu_run` 的上下文，**只需要恢复 callee-saved** —— 其它寄存器
+VMX 硬件会在 VM-Exit 时从 Host Area 自动加载。
+
+### Q: VM-Entry 可能失败，失败怎么处理？
+
+VMENTER 指令如果 Guest 状态不合法，CF=1 表示失败、错误码写到 VM-instruction error
+field。`__vmx_vcpu_run` 检测到后跳到错误处理路径，把 `vmx->fail = 1`、填
+`exit_reason = INVALID_STATE`，回到 C 代码。C 代码再走 `handle_invalid_guest_state()`
+模拟执行 —— 这条路径性能很差，说明 Guest 状态有问题（常见于实模式过渡）。
 
 ---
 
-## 4. vmx_handle_exit() - VM-Exit处理
+## 3. VM-Exit 分发
 
-**文件**: `arch/x86/kvm/vmx/vmx.c:6615-6631`
+### Q: VM-Exit 是怎么找到对应处理函数的？
+
+**文件**: `arch/x86/kvm/vmx/vmx.c:6615` — `vmx_handle_exit()`
 
 ```c
 int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 {
     int ret = __vmx_handle_exit(vcpu, exit_fastpath);
 
-    // Bus Lock检测处理
+    /* Bus Lock 检测：退出到用户空间让 QEMU 处理 */
     if (to_vmx(vcpu)->exit_reason.bus_lock_detected) {
         if (ret > 0)
             vcpu->run->exit_reason = KVM_EXIT_X86_BUS_LOCK;
-        vcpu->run->flags |= KVM_RUN_X86_BUS_LOCK;
-        return 0;  // 退出到用户空间
+        return 0;
     }
     return ret;
 }
 ```
 
-**__vmx_handle_exit() 内部分发逻辑**:
+### Q: `__vmx_handle_exit()` 内部分发逻辑？
+
+**文件**: `arch/x86/kvm/vmx/vmx.c:6436` — `__vmx_handle_exit()`
+
+```c
+/* 简化版（省略 PML flush、nested 处理、vectoring info 检查等） */
+
+/* emulation_required: Guest 状态无效，走模拟路径 */
+if (vmx->emulation_required)
+    return handle_invalid_guest_state(vcpu);
+
+/* VM-Entry 失败：直接返回用户空间，不查处理函数表 */
+if (exit_reason.failed_vmentry) {
+    vcpu->run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+    vcpu->run->fail_entry.hardware_entry_failure_reason = exit_reason.full;
+    return 0;
+}
+
+/* ★ 用 exit_reason.basic 索引处理函数表 —— O(1) 分发 */
+exit_handler_index = array_index_nospec((u16)exit_reason.basic,
+                                        kvm_vmx_max_exit_handlers);
+if (!kvm_vmx_exit_handlers[exit_handler_index])
+    goto unexpected_vmexit;      /* 未知 exit → KVM_EXIT_INTERNAL_ERROR */
+
+return kvm_vmx_exit_handlers[exit_handler_index](vcpu);
 ```
-__vmx_handle_exit()
-  │
-  ├─ 检查 failed_vmentry (VM-Entry失败)
-  │   └→ handle_vmentry_failure()
-  │
-  ├─ 检查 exit_fastpath (可快速处理)
-  │   ├─ EXIT_FASTPATH_REENTER_GUEST → 直接返回
-  │   └─ EXIT_FASTPATH_RETREAT → RIP回退后返回
-  │
-  ├─ exit_reason 分发:
-  │   │
-  │   ├─ EXIT_REASON_EXCEPTION_NMI       → handle_exception_nmi()
-  │   ├─ EXIT_REASON_EXTERNAL_INTERRUPT  → handle_external_interrupt()
-  │   ├─ EXIT_REASON_TRIPLE_FAULT        → handle_triple_fault()
-  │   ├─ EXIT_REASON_PENDING_INTERRUPT   → handle_interrupt_window()
-  │   ├─ EXIT_REASON_PENDING_MCE_NMI     → handle_pending_mce_nmi()
-  │   ├─ EXIT_REASON_CPUID               → handle_cpuid()
-  │   ├─ EXIT_REASON_HLT                 → handle_halt()
-  │   ├─ EXIT_REASON_INVD                → handle_invd()
-  │   ├─ EXIT_REASON_INVLPG              → handle_invlpg()
-  │   ├─ EXIT_REASON_RDPMC               → handle_rdpmc()
-  │   ├─ EXIT_REASON_RDRAND              → handle_rdrand()
-  │   ├─ EXIT_REASON_RDSEED              → handle_rdseed()
-  │   ├─ EXIT_REASON_VMCALL              → handle_vmcall()
-  │   ├─ EXIT_REASON_VMCLEAR             → handle_vmx_insn()
-  │   ├─ EXIT_REASON_VMLAUNCH            → handle_vmx_insn()
-  │   ├─ EXIT_REASON_VMPTRLD             → handle_vmx_insn()
-  │   ├─ EXIT_REASON_VMPTRST             → handle_vmx_insn()
-  │   ├─ EXIT_REASON_VMREAD              → handle_vmx_insn()
-  │   ├─ EXIT_REASON_VMRESUME            → handle_vmx_insn()
-  │   ├─ EXIT_REASON_VMWRITE             → handle_vmx_insn()
-  │   ├─ EXIT_REASON_VMXOFF              → handle_vmx_insn()
-  │   ├─ EXIT_REASON_VMXON               → handle_vmx_insn()
-  │   ├─ EXIT_REASON_CR_ACCESS           → handle_cr()
-  │   ├─ EXIT_REASON_DR_ACCESS           → handle_dr()
-  │   ├─ EXIT_REASON_IO_INSTRUCTION      → handle_io()
-  │   ├─ EXIT_REASON_MSR_WRITE           → handle_write_msr()
-  │   ├─ EXIT_REASON_MSR_READ            → handle_read_msr()
-  │   ├─ EXIT_REASON_INVALID_STATE       → handle_invalid_guest_state()
-  │   ├─ EXIT_REASON_MWAIT_INSTRUCTION   → handle_mwait()
-  │   ├─ EXIT_REASON_MONITOR_INSTRUCTION → handle_monitor()
-  │   ├─ EXIT_REASON_PAUSE_INSTRUCTION   → handle_pause()
-  │   ├─ EXIT_REASON_MCE_DURING_VMENTRY  → handle_mce_during_vmentry()
-  │   ├─ EXIT_REASON_TPR_BELOW_THRESHOLD → handle_tpr_below_threshold()
-  │   ├─ EXIT_REASON_APIC_ACCESS         → handle_apic_access()
-  │   ├─ EXIT_REASON_EPT_VIOLATION       → handle_ept_violation()  ★
-  │   ├─ EXIT_REASON_EPT_MISCONFIG      → handle_ept_misconfig()  ★
-  │   ├─ EXIT_REASON_INVPCID             → handle_invpcid()
-  │   ├─ EXIT_REASON_XSAVES              → handle_xsaves()
-  │   ├─ EXIT_REASON_XRSTORS             → handle_xrstors()
-  │   ├─ EXIT_REASON_PML_FULL            → handle_pml_full()
-  │   ├─ EXIT_REASON_PREEMPTION_TIMER    → handle_preemption_timer()
-  │   ├─ EXIT_REASON_BUS_LOCK            → handle_bus_lock()
-  │   └─ EXIT_REASON_NOTIFY_VM_EXIT      → handle_notify_vmexit()
-  │
-  └─ 未知exit_reason → KVM_EXIT_INTERNAL_ERROR
-```
+
+**注意**：`array_index_nospec()` 是 Spectre v1 缓解 —— 防止 `exit_reason.basic` 被用户态
+控制后做推测执行越界访问。
+
+### Q: 哪些 Exit 走快速路径、哪些返回用户空间？
+
+**文件**: `arch/x86/kvm/vmx/vmx.c:6095` — `kvm_vmx_exit_handlers[]`
+
+| Exit reason | 处理函数 | 路径 | 说明 |
+|-------------|---------|------|------|
+| `EPT_VIOLATION` | `handle_ept_violation()` | 内核 | 建页表，重入 |
+| `EXTERNAL_INTERRUPT` | `handle_external_interrupt()` | 内核 | 处理宿主中断 |
+| `HLT` | `kvm_emulate_halt()` | 内核 | 设 `mp_state=HALTED` |
+| `PREEMPTION_TIMER` | `handle_preemption_timer()` | 内核 | 更新定时器 |
+| `APIC_WRITE` | `handle_apic_write()` | 内核 | 同步虚拟 LAPIC |
+| `MSR_WRITE` | `kvm_emulate_wrmsr()` | 内核 | 模拟 MSR 写 |
+| — | — | — | — |
+| `IO_INSTRUCTION` | `handle_io()` | 用户空间* | `KVM_EXIT_IO` |
+| `MMIO` | — | 用户空间 | `KVM_EXIT_MMIO` |
+| `CPUID` | `handle_cpuid()` | 用户空间* | 处理后重入 |
+| `TRIPLE_FAULT` | `handle_triple_fault()` | 用户空间 | `KVM_EXIT_SHUTDOWN` |
+
+*注：`handle_io()` 和 `handle_cpuid()` 在内核态处理后可能返回 1（重入）或 0（回用户空间），取决于是否模拟完成。
+
+### Q: `exit_fastpath` 有几种？
+
+**文件**: `arch/x86/include/asm/kvm_host.h:215`
+
+| 值 | 含义 | 来源 |
+|----|------|------|
+| `EXIT_FASTPATH_NONE` | 走完整 `handle_exit` | 默认 |
+| `EXIT_FASTPATH_REENTER_GUEST` | 直接重入，跳过分发 | Posted Interrupt 处理完 |
+| `EXIT_FASTPATH_EXIT_HANDLED` | exit 已处理完 | 快速路径自己搞定 |
+| `EXIT_FASTPATH_EXIT_USERSPACE` | 必须回用户空间 | MMIO/IO 需 QEMU |
 
 ---
 
-## 5. struct vcpu_vmx - VMX vCPU扩展结构
+## 4. `vcpu_vmx` 结构：VMX vCPU 状态
 
-**文件**: `arch/x86/kvm/vmx/vmx.h:251-400+`
+### Q: `vcpu_vmx` 的核心字段有哪些？
+
+**文件**: `arch/x86/kvm/vmx/vmx.h:251+`
 
 ```c
 struct vcpu_vmx {
-    struct kvm_vcpu       vcpu;        // ★ 基础vCPU结构 (必须在第一位)
-    u8                    fail;        // VM-Entry是否失败
-    u8                    x2apic_msr_bitmap_mode;
+    struct kvm_vcpu     vcpu;             /* ★ 必须在第一位（容器宏转换） */
 
-    bool                  guest_state_loaded;  // Guest状态是否已加载
+    /* --- VMCS：VMX 控制块（每 vCPU 一份，vmcs 指向的内存物理页对齐） --- */
+    struct loaded_vmcs  vmcs01;            /* L1 Guest 的 VMCS */
+    struct loaded_vmcs *loaded_vmcs;       /* 当前活跃 VMCS
+                                            * 非嵌套 = vmcs01
+                                            * 嵌套 L2 = vmcs02 */
 
-    // === VM-Exit信息 (缓存) ===
-    unsigned long         exit_qualification;  // EXIT_QUALIFICATION
-    u32                   exit_intr_info;      // VM_EXIT_INTR_INFO
-    u32                   idt_vectoring_info;  // IDT_VECTORING_INFO
-    ulong                 rflags;
+    /* --- VM-Exit 信息缓存（避免每次从 VMCS 读） --- */
+    unsigned long       exit_qualification;
+    u32                 exit_intr_info;
+    union vmx_exit_reason exit_reason;
 
-    // === MSR管理 ===
-    struct vmx_uret_msr   guest_uret_msrs[MAX_NR_USER_RETURN_MSRS];
-    u64                   spec_ctrl;
-    u32                   msr_ia32_umwait_control;
+    /* --- Posted Interrupts --- */
+    struct pi_desc      pi_desc;           /* ★ PI 描述符（硬件写这个） */
+    struct list_head    pi_wakeup_list;    /* 等待 PI 唤醒时挂的链表 */
 
-    // === ★ VMCS ===
-    struct loaded_vmcs    vmcs01;       // L1 guest的VMCS
-    struct loaded_vmcs   *loaded_vmcs;  // 当前活跃的VMCS
-                                         // 非嵌套=vmcs01, 嵌套=vmcs02
+    /* --- 嵌套虚拟化 --- */
+    struct nested_vmx   nested;            /* L1 的 VMX 状态（做嵌套时才用） */
 
-    struct msr_autoload {
-        struct vmx_msrs guest;
-        struct vmx_msrs host;
-    } msr_autoload;
-
-    struct msr_autostore {
-        struct vmx_msrs guest;
-    } msr_autostore;
-
-    // === APIC虚拟化 ===
-    struct kvm_host_map apic_access_page_map;  // APIC访问页映射
-    struct kvm_host_map virtual_apic_map;      // 虚拟APIC页映射
-
-    // === ★ Posted Interrupts ===
-    struct pi_desc *pi_desc;          // PI描述符指针
-    bool pi_pending;                  // PI挂起标志
-    u16 posted_intr_nv;              // PI通知向量
-
-    // === 抢占定时器 ===
-    struct hrtimer preemption_timer;
-
-    // === VPID ===
-    u16 vpid02;                      // L2的VPID
-    u16 last_vpid;                   // 上次使用的VPID
-
-    // === 嵌套虚拟化 ===
-    struct nested_vmx { ... } nested;
-
-    // === Intel PT ===
-    struct pt_desc pt_desc;
-
-    // === LBR ===
-    struct lbr_desc lbr_desc;
+    /* --- 其他 --- */
+    u16                 vpid;              /* VPID（避免 TLB flush） */
+    struct hrtimer      preemption_timer;  /* 抢占定时器 */
 };
 ```
 
-**内存布局关系**:
+### Q: `vmcs01` 和 `loaded_vmcs` 什么关系？
+
 ```
-struct vcpu_vmx
-├── struct kvm_vcpu vcpu           ← 通用vCPU (所有架构共享)
-│   ├── struct kvm_run *run        ← 与用户空间共享的内存
-│   ├── struct kvm *kvm            ← 所属VM
-│   ├── int vcpu_id                ← vCPU编号
-│   ├── struct kvm_vcpu_arch arch  ← 架构相关状态
-│   │   ├── struct kvm_mmu *mmu   ← MMU上下文
-│   │   ├── u64 regs[...]         ← 通用寄存器缓存
-│   │   ├── struct kvm_lapic *apic← 虚拟LAPIC
-│   │   └── ...
-│   └── ...
-├── struct loaded_vmcs vmcs01      ← VMCS区域 (物理页对齐)
-│   ├── struct vmcs *vmcs          ← VMCS虚拟地址
-│   ├── struct vmcs_host_state host_state
-│   └── ...
-├── struct pi_desc ...              ← Posted Interrupt描述符
-└── ...
+非嵌套场景:
+  loaded_vmcs ──→ vmcs01（L1 Guest 用的 VMCS）
+
+嵌套场景（Guest 里又跑了个 KVM）:
+  loaded_vmcs ──→ vmcs01 （L1 在自己跑）
+                  └─→ vmcs02 （L1 启动了 L2，切换到这里）
 ```
 
----
+L1 VMM 调 `VMPTRLD` 切 VMCS 时，KVM 要拦截（nested VMX 实现）并切换到对应的 `vmcs02`。
+`loaded_vmcs` 就是「当前物理 CPU 上真正 load 着的 VMCS」的指针。
 
-## 6. VMX模块参数
+### Q: `pi_desc` 在 Posted Interrupts 里起什么作用？
 
-**文件**: `arch/x86/kvm/vmx/vmx.c:89-149`
+**文件**: `arch/x86/include/asm/posted_intr.h:12`
 
 ```c
-// 核心模块参数 (可通过 /sys/module/kvm_intel/parameters/ 查看)
+struct pi_desc {
+    union {
+        u32 pir[8];      /* Posted Interrupt Request bitmap (256-bit) */
+        u64 pir64[4];
+    };
+    union {
+        struct {
+            u16 notifications;  /* ★ bits: ON (outstanding) + SN (suppress) */
+            u8  nv;             /* Notification Vector */
+            u8  rsvd_2;
+            u32 ndst;           /* Notification Destination (APIC ID) */
+        };
+        u64 control;
+    };
+    u32 rsvd[6];
+} __aligned(64);              /* ★ 64 字节对齐（缓存行对齐） */
+```
 
-bool enable_vpid = 1;              // VPID支持 (避免VM-Entry时flush TLB)
-bool enable_vnmi = 1;              // 虚拟NMI支持
-bool flexpriority_enabled = 1;     // TPR Shadow (灵活APIC优先级)
-bool enable_ept = 1;               // ★ Extended Page Tables
-bool enable_unrestricted_guest = 1;// 无限制Guest (实模式/保护模式)
-bool enable_ept_ad_bits = 1;       // EPT Accessed/Dirty位
-bool emulate_invalid_guest_state = true; // 模拟无效Guest状态
-bool fasteoi = 1;                  // 快速EOI处理
-bool enable_apicv;                 // ★ APIC虚拟化
-bool enable_ipiv = true;           // IPI虚拟化
-bool nested = 1;                   // ★ 嵌套虚拟化
-bool enable_pml = 1;               // Page Modification Logging (脏页)
-bool enable_preemption_timer = 1;  // 抢占定时器
+硬件投递外部中断时：
+1. 检查 vCPU 是否在 Non-Root 模式（`vcpu->mode == IN_GUEST_MODE`）
+2. 在 `pir[]` 对应位写 1（表示该向量有中断 pending）
+3. 置 `notifications` 字段的 ON 位 = 1
+4. 如果 vCPU 在 Guest 且「Process Posted Interrupts」exec control = 1 → **不产生 VM-Exit**，
+   硬件在下次 VM-Entry 前自动把 PIR 合并到 VIRR
+
+**注意**：`notifications` 是 u16，包含 ON 和 SN 两个位（不是独立的 bitfield）。`nv` 是 u8（不是 u32）。
+结构体 `__aligned(64)` 是缓存行对齐，**不是物理页对齐**。这个结构是**硬件直接写的**，KVM 用原子操作更新。
+
+---
+
+## 5. VMX 特性检测
+
+### Q: `vmx_hardware_setup()` 怎么决定启用哪些特性？
+
+**文件**: `arch/x86/kvm/vmx/vmx.c:8404`
+
+```c
+__init int vmx_hardware_setup(void)
+{
+    /* ★ 1. 读 VMX capability MSRs（硬件告诉你支持什么） */
+    if (setup_vmcs_config(&vmcs_config, &vmx_capability) < 0)
+        return -EIO;
+
+    /* ★ 2. 按依赖关系裁剪 */
+    if (!cpu_has_vmx_ept() || !cpu_has_vmx_ept_4levels() ||
+        !cpu_has_vmx_ept_mt_wb() || !cpu_has_vmx_invept_global())
+        enable_ept = 0;
+
+    /* EPT 是 unrestricted guest 的前提 */
+    if (!cpu_has_vmx_unrestricted_guest() || !enable_ept)
+        enable_unrestricted_guest = 0;
+
+    /* APICv 是 PI 的前提 */
+    if (!cpu_has_vmx_apicv())
+        enable_apicv = 0;
+    if (!enable_apicv)
+        vt_x86_ops.sync_pir_to_irr = NULL;    /* ★ 禁用就清空回调 */
+
+    if (!enable_apicv || !cpu_has_vmx_ipiv())
+        enable_ipiv = false;
+
+    return 0;
+}
+```
+
+### Q: `setup_vmcs_config()` 具体读哪些 MSR？
+
+**文件**: `arch/x86/kvm/vmx/vmx.c:2590`
+
+| MSR | 内容 |
+|-----|------|
+| `MSR_IA32_VMX_BASIC` | VMCS revision、VMXON region 大小、true-CTLS 是否可用 |
+| `MSR_IA32_VMX_PINBASED_CTLS` | 引脚控制（外部中断/NMI/虚拟 NMI 等）|
+| `MSR_IA32_VMX_PROCBASED_CTLS` | 主 CPU 控制（IO 退出/MSR 退出/HLT 退出等）|
+| `MSR_IA32_VMX_PROCBASED_CTLS2` | 二级控制（EPT/VPID/RDTSCP/ Posted Interrupts 等）|
+| `MSR_IA32_VMX_EXIT_CTLS` | VM-Exit 控制（Host 地址空间大小/ACK 中断等）|
+| `MSR_IA32_VMX_ENTRY_CTLS` | VM-Entry 控制（加载 EFER/IA32_PAT 等）|
+| `MSR_IA32_VMX_EPT_VPID_CAP` | EPT/VPID 能力（4 级页表/WB/INVVPID 类型等）|
+
+每个 CTL MSR 的格式都一样：bits 31:0 是「必须为 1」的硬约束，bits 63:32 是「可以为 1」
+的可选能力。KVM 取交集合：`_vmx_report_error` 检查硬件是否满足最低要求。
+
+### Q: 特性依赖链长什么样？
+
+```
+硬件 capability MSR
+    │
+    ├─ EPT 要求：4 级页表 + WB 内存类型 + INVEPT 全局
+    │   └─ EPT_AD 要求：EPT + A/D 位支持
+    │       └─ unrestricted_guest 要求：EPT
+    │
+    ├─ VPID 要求：INVVPID（single 或 global）
+    │
+    ├─ APICv 要求：虚拟中断投递 + EOI 虚拟化 + MSR 位图
+    │   └─ IPIv 要求：APICv + 虚拟 IPI 投递
+    │       └─ Posted Interrupts 要求：APICv
+    │
+    └─ FlexPriority 要求：TPR Shadow
 ```
 
 ---
 
-## 7. vmx_init() - 模块初始化
+## 6. 模块参数：运行时可调的特性开关
+
+### Q: 哪些 VMX 参数可以在运行时改？
+
+**文件**: `arch/x86/kvm/vmx/vmx.c:89-125`
+
+| 参数名 | 变量名 | 权限 | 默认 | 作用 |
+|--------|--------|------|------|------|
+| `ept` | `enable_ept` | 0444 | 1 | Extended Page Tables |
+| `eptad` | `enable_ept_ad_bits` | 0444 | 1 | EPT A/D 位 |
+| `vpid` | `enable_vpid` | 0444 | 1 | Virtual Processor ID |
+| `apicv` | `enable_apicv` | 0444 | 1 | APIC 虚拟化（含 PI）|
+| `ipiv` | `enable_ipiv` | 0444 | 1 | 虚拟 IPI 投递 |
+| `nested` | `nested` | 0444 | 1 | 嵌套虚拟化 |
+| `unrestricted_guest` | `enable_unrestricted_guest` | 0444 | 1 | 无限制 Guest |
+| `flexpriority` | `flexpriority_enabled` | 0444 | 1 | TPR Shadow |
+| `emulate_invalid_guest_state` | 同名 | 0444 | 1 | 模拟无效 Guest 状态 |
+
+**参数名 vs 变量名**：`module_param_named(参数名, 变量名, ...)` 允许两者不同（如 `ept` 参数对应
+`enable_ept` 变量），`module_param(变量名, ...)` 则同名。
+
+**权限 `0444` 意味着什么？** 模块加载后**不能改**。要在加载时设置：
+
+```bash
+modprobe kvm_intel ept=1 nested=1
+# 或写入 /etc/modprobe.d/kvm.conf
+```
+
+这些参数是**初始化时决策**用的 —— `vmx_hardware_setup()` 读完参数后决定是否启用特性。
+运行中再改没意义，因为 VMCS 控制位已经定了。
+
+---
+
+## 7. 模块初始化调用链
+
+### Q: `kvm_intel` 模块加载时都发生了什么？
 
 **文件**: `arch/x86/kvm/vmx/main.c:164-171`
 
 ```c
 struct kvm_x86_init_ops vt_init_ops __initdata = {
-    .hardware_setup = vmx_hardware_setup,  // ★ 硬件初始化回调
-    .handle_intel_pt_intr = NULL,
-    .runtime_ops = &vt_x86_ops,            // 运行时操作表
-    .pmu_ops = &intel_pmu_ops,
+    .hardware_setup = vmx_hardware_setup,    /* ★ 入口 */
+    .runtime_ops    = &vt_x86_ops,           /* 运行时回调表 */
+    .pmu_ops        = &intel_pmu_ops,
 };
 ```
 
-**初始化流程**:
 ```
-module_init() → kvm_init() [kvm_main.c]
-  → kvm_arch_hardware_setup() [x86.c]
-    → kvm_x86_vendor_init()
-      → hardware_setup() = vmx_hardware_setup()  ← 检测CPU特性
-    → kvm_x86_check_processor_compatibility()
-  → kvm_create_vm() 系列 ioctl 注册
+module_init(kvm_intel)
+  │
+  ├→ kvm_init(&vt_init_ops)              ← kvm_main.c
+  │   │
+  │   ├→ kvm_arch_hardware_setup()       ← x86.c
+  │   │   └→ vt_init_ops.hardware_setup()
+  │   │       └→ vmx_hardware_setup()
+  │   │           ├→ setup_vmcs_config()       ← 读 VMX MSR
+  │   │           ├→ 特性检测 + 裁剪
+  │   │           └→ 配置回调表（禁用不用的）
+  │   │
+  │   ├→ static_call_update(kvm_x86_*, ...) ← 把回调指针烤进代码
+  │   │
+  │   └→ kvm_chardev_ops 注册（/dev/kvm）
+  │
+  └→ 完成，可以接受 ioctl 了
+```
+
+### Q: 为什么需要 `vt_init_ops` 和 `vt_x86_ops` 两张表？
+
+| 表 | 生命周期 | 用途 |
+|----|---------|------|
+| `vt_init_ops` | `__initdata`，初始化后释放 | 只给 `kvm_init()` 用一次，含 `hardware_setup` |
+| `vt_x86_ops` | 回调指针拷进 `static_call`，结构体本身可释放 | 运行期所有 VMX 操作入口 |
+
+分两张表的原因：`hardware_setup` 这类初始化函数只在加载时调用一次，没必要占着运行时
+内存。而 `vcpu_run`/`handle_exit` 是每次 VM-Exit 都要跳的，必须常驻 —— 但不是通过
+指针数组，而是通过 `static_call` 直接 patch 进调用点，**性能比函数指针高**。
+
+---
+
+## 8. 关键数据结构关系
+
+```
+kvm_intel.ko 加载
+  │
+  ├─ vt_init_ops (一次性)
+  │   └→ vmx_hardware_setup()
+  │       └→ 读 VMX capability MSRs
+  │       └→ 决定 enable_ept/enable_vpid/...
+  │
+  └─ vt_x86_ops (运行时)
+      └→ 拷进 static_call
+          └→ kvm_x86_call(vcpu_run) = vmx_vcpu_run()
+
+
+每 vCPU 状态:
+  struct vcpu_vmx
+    ├── struct kvm_vcpu vcpu       ← 通用层看到的
+    ├── struct loaded_vmcs vmcs01  ← L1 的 VMCS 容器
+    │   └── vmcs01.vmcs → 物理页对齐的 VMCS 内存
+    ├── struct pi_desc pi_desc     ← PI 描述符 (硬件写, 64B 对齐)
+    └── ...
+
+VMCS 在物理内存里长这样 (简化):
+  ┌─────────────────────────┐
+  │ VMCS revision ID (32b)  │  ← 来自 MSR_IA32_VMX_BASIC
+  ├─────────────────────────┤
+  │ VMCS Data               │
+  │  ├── Host Area          │  ← VM-Exit 后恢复
+  │  ├── Guest Area         │  ← VM-Entry 时加载
+  │  ├── Control Area       │  ← Pin/CPU/Exit/Entry 控制
+  │  ├── Read-only Data     │  ← VM-Exit 信息
+  │  └── Guest Non-reg      │
+  └─────────────────────────┘
 ```
