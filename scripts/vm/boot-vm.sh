@@ -211,6 +211,7 @@ fi
 # 构建 QEMU 命令
 QEMU_ARGS=(
     qemu-system-x86_64
+    -name kvm-study,debug-threads=on   # 给线程命名（vCPU → CPU X/KVM），方便 perf/top 分析
     -m "$MEMORY"
     -smp "$CPUS"
     -kernel "$KERNEL"
