@@ -7,10 +7,10 @@
 3. 追踪从ioctl(KVM_RUN)到VMENTER的完整路径
 4. 理解VM-Exit的分类和处理流程
 5. 熟悉KVM核心数据结构和回调表
-6. **掌握CPUID虚拟化机制（静态过滤 vs 动态拦截）**
-7. **理解MSR Bitmap和MSR虚拟化策略**
-8. **列举触发VM-Exit的指令及KVM处理方式**
-9. **理解vCPU唤醒机制：immediate_exit vs 信号，竞态陷阱，三种VMM的设计权衡**
+6. 掌握CPUID虚拟化机制（静态过滤 vs 动态拦截）
+7. 理解MSR Bitmap和MSR虚拟化策略
+8. 列举触发VM-Exit的指令及KVM处理方式
+9. 理解vCPU唤醒机制：immediate_exit vs 信号，竞态陷阱，三种VMM的设计权衡
 
 ## 📂 本章文件
 
@@ -18,7 +18,7 @@
 |------|------|
 | `README.md` | 本文件：VT-x硬件基础 + 学习指南 |
 | `annotations.md` | 源码精读：vmx_x86_ops, vmx_hardware_setup, vmx_vcpu_run |
-| `cpu-virtualization.md` | ★ CPU虚拟化：CPUID / MSR / 指令虚拟化 / **vCPU唤醒机制与竞态陷阱** |
+| `cpu-virtualization.md` | ★ CPU虚拟化：CPUID / MSR / 指令虚拟化 / vCPU唤醒机制与竞态陷阱 |
 | `practice/` | ★ 实战练习：VMX验证 / CPUID Faulting / MSR测试 / VM-Exit开销测量 |
 
 ## 推荐阅读顺序
@@ -39,7 +39,7 @@
   → MSR Bitmap: 4KB 位图控制逐 MSR 拦截
   → 指令虚拟化: 哪些指令触发 VM-Exit
   → kvm_x86_ops: 通用层 ↔ VMX 桥梁
-  → **vCPU 唤醒机制: immediate_exit vs 信号，竞态陷阱**
+  → vCPU 唤醒机制: immediate_exit vs 信号，竞态陷阱
 
 第4步: practice/ ← 实战练习
   → ex1-vmx-verify: 验证 VMX 支持和能力
