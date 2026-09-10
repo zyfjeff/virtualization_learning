@@ -924,6 +924,291 @@ cat /sys/kernel/debug/tracing/trace | \
 
 ---
 
+## 6. vCPU 唤醒机制与竞态陷阱
+
+### 6.1 问题背景
+
+VMM 需要在以下场景打断正在 guest 里运行的 vCPU：
+- **Pause/Resume**：热迁移、快照时需要冻结 VM
+- **设备模拟**：virtio 队列有数据需要处理
+- **CPU hotplug**：动态添加/移除 vCPU
+- **调试**：gdb 断点、NMI 注入
+
+关键问题：**如何让正在 guest 里执行的 vCPU 立即返回用户态？**
+
+### 6.2 两种机制：immediate_exit vs 信号
+
+#### 6.2.1 immediate_exit 机制
+
+`kvm_run` 结构中的 `immediate_exit` 字段：
+
+```c
+// include/uapi/linux/kvm.h:217
+struct kvm_run {
+    __u8 request_interrupt_window;
+    __u8 immediate_exit;        // ← 这个字段
+    __u8 padding1[6];
+    // ...
+};
+```
+
+**用法**：VMM 设置 `immediate_exit = 1`，KVM 在 KVM_RUN 入口检查，如果为 1 则立即返回 `-EINTR`。
+
+#### 6.2.2 信号机制
+
+发送实时信号（如 `SIGRTMIN`）给 vCPU 线程：
+
+```rust
+// Firecracker 的实现
+self.vcpu_thread.kill(sigrtmin())?;
+```
+
+信号触发后：
+1. 内核设置 `_TIF_SIGPENDING` 标志
+2. 如果 vCPU 在 guest 里，硬件中断导致 VM-Exit
+3. KVM 检查 `_TIF_SIGPENDING`，调用信号处理器
+4. KVM_RUN 返回 `-EINTR`
+
+### 6.3 ⚠️ 关键陷阱：immediate_exit 只在 KVM_RUN 入口检查
+
+**这是最重要的知识点！**
+
+```c
+// virt/kvm/kvm_main.c:4491
+vcpu->wants_to_run = !READ_ONCE(vcpu->run->immediate_exit__unsafe);
+// ↑ 只在 KVM_RUN 入口设置一次
+
+r = kvm_arch_vcpu_ioctl_run(vcpu);
+
+// arch/x86/kvm/x86.c:11676
+if (!vcpu->wants_to_run) {  // 检查 wants_to_run
+    r = -EINTR;
+    goto out;
+}
+
+r = vcpu_run(vcpu);  // 进入 vCPU 主循环
+```
+
+**`vcpu_run` 的主循环里不检查 `wants_to_run`！**
+
+```c
+// arch/x86/kvm/x86.c:11343
+static int vcpu_run(struct kvm_vcpu *vcpu)
+{
+    for (;;) {
+        if (kvm_vcpu_running(vcpu)) {      // 只检查 mp_state，不检查 wants_to_run！
+            r = vcpu_enter_guest(vcpu);
+        } else {
+            r = vcpu_block(vcpu);
+        }
+        
+        // ... 处理 VM-Exit ...
+        
+        if (__xfer_to_guest_mode_work_pending()) {  // 检查信号！
+            r = xfer_to_guest_mode_handle_work(vcpu);
+            if (r) return r;
+        }
+    }
+}
+```
+
+**结论**：
+- `immediate_exit` 只能阻止 vCPU **第一次进入** KVM_RUN
+- 一旦 vCPU 进入 `vcpu_run` 主循环，`immediate_exit` 就**不再被检查**
+- **只有信号能中断正在 guest 里运行的 vCPU**
+
+### 6.4 竞态场景分析
+
+#### 场景 1：vCPU 还没进 KVM_RUN（✅ 安全）
+
+```
+vCPU 线程                      用户态线程
+────────                      ──────────
+                              set_kvm_immediate_exit(1)
+                              kill(sigrtmin())
+                              
+信号被投递并处理
+_TIF_SIGPENDING 清除
+
+进入 KVM_RUN
+读取 immediate_exit → 1       ← 这里会检查！
+设置 wants_to_run = FALSE
+检查 wants_to_run → FALSE
+返回 -EINTR                   ← 立即退出 ✅
+```
+
+即使信号丢失，`immediate_exit` 在 KVM_RUN 入口会被检查，vCPU 立即返回。
+
+#### 场景 2：vCPU 已经在 guest 里（⚠️ 有风险）
+
+```
+vCPU 线程（在 guest 里）       用户态线程
+────────────────────           ──────────
+                               set_kvm_immediate_exit(1)
+                               kill(sigrtmin())
+                               
+VM-Exit（自然发生）
+KVM 处理 VM-Exit
+                               信号被投递
+                               信号处理器执行
+                               _TIF_SIGPENDING 清除
+                               
+检查 _TIF_SIGPENDING → FALSE   ← 信号已处理！
+检查 kvm_vcpu_running() → TRUE  ← 不检查 wants_to_run！
+VMENTER → 回到 guest            ← 又进入 guest 了！⚠️
+```
+
+**问题**：
+1. `_TIF_SIGPENDING` 已经被清除（信号在 VM-Exit 处理期间被消费）
+2. `kvm_vcpu_running()` 只检查 `mp_state`，不检查 `wants_to_run`
+3. **`immediate_exit` 不会在 VM-Exit 后重新检查！**
+4. vCPU 重新进入 guest
+
+**信号丢失后的后果**：vCPU 会在 guest 里持续运行，直到下一次自然 VM-Exit（I/O、定时器等）。
+
+### 6.5 三种 VMM 的设计对比
+
+| VMM | 唤醒机制 | 信号丢失风险 | 保底机制 | 超时 |
+|-----|---------|-------------|---------|------|
+| **QEMU** | 仅 immediate_exit | 无（不用信号） | 不需要 | 无 |
+| **Firecracker** | immediate_exit + 信号 | 极低（微秒级窗口） | 自然 VM-Exit | 30 秒 |
+| **cloud-hypervisor** | 仅信号 | 高（无 immediate_exit 保底） | 重试 | 1 秒 |
+
+#### 6.5.1 QEMU：纯 immediate_exit
+
+```rust
+// QEMU 不使用信号唤醒 vCPU
+fn signal_thread(&self) {
+    // 不存在这个函数
+}
+```
+
+**设计哲学**：QEMU 的 vCPU 线程持续运行，不需要真正的 pause/resume。如果需要打断（如设备模拟），通过共享内存标志 + 自然 VM-Exit 检查。
+
+**优点**：无竞态、无超时、最简单  
+**缺点**：不支持完整的 pause/resume 语义
+
+#### 6.5.2 Firecracker：双保险
+
+```rust
+// src/vmm/src/vstate/vcpu.rs:622-636
+pub fn send_event(&mut self, event: VcpuEvent) -> Result<(), VcpuSendEventError> {
+    self.event_sender.send(event)?;
+    
+    self.vcpu_fd.set_kvm_immediate_exit(1);  // 保底
+    fence(Ordering::Release);
+    
+    self.vcpu_thread.kill(sigrtmin())?;       // 立即中断
+    Ok(())
+}
+```
+
+**信号处理器**：只做内存屏障，确保 immediate_exit 可见
+
+```rust
+extern "C" fn handle_signal(_: c_int, _: *mut siginfo_t, _: *mut c_void) {
+    fence(Ordering::Acquire);  // 确保 immediate_exit 的写可见
+}
+```
+
+**确认机制**：30 秒超时，无重试
+
+```rust
+// src/vmm/src/vstate/vm.rs:297
+.recv_timeout(crate::RECV_TIMEOUT_SEC)  // 30 秒！
+```
+
+**设计哲学**：
+- 信号是"快路径"：立即中断正在 guest 里运行的 vCPU
+- immediate_exit 是"保底"：确保即使信号丢失，vCPU 下次退出时也会看到
+
+**优点**：简单可靠  
+**缺点**：极端情况下等待 30 秒
+
+#### 6.5.3 cloud-hypervisor：信号 + 重试
+
+```rust
+// cloud-hypervisor 的 signal_thread
+fn signal_thread(&self) {
+    unsafe {
+        libc::pthread_kill(handle.as_pthread_t() as _, SIGRTMIN());
+    }
+    // 没有 set_kvm_immediate_exit！
+}
+
+// 重试逻辑
+fn wait_until_signal_acknowledged(&self) -> Result<()> {
+    let mut count = 0;
+    loop {
+        if self.vcpu_run_interrupted.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(1));
+        count += 1;
+        if count >= 1000 {
+            return Err(Error::SignalAcknowledgeTimeout);  // 1 秒超时
+        } else if count % 10 == 0 {
+            self.signal_thread();  // 每 10ms 重试
+        }
+    }
+}
+```
+
+**设计哲学**：信号是边沿触发（丢失就丢失了），必须重试。
+
+**历史问题**：[Issue #7427](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/7427) - 信号竞态导致死锁
+
+**优点**：完整的 pause/resume 语义  
+**缺点**：复杂、有竞态、需要重试
+
+### 6.6 核心知识点总结
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              vCPU 唤醒机制的核心陷阱                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. immediate_exit 只在 KVM_RUN 入口检查一次                 │
+│     ↓                                                        │
+│     进入 vcpu_run 主循环后不再检查                           │
+│     ↓                                                        │
+│     无法中断正在 guest 里运行的 vCPU                         │
+│                                                              │
+│  2. 信号是唯一能中断 guest 执行的机制                        │
+│     ↓                                                        │
+│     设置 _TIF_SIGPENDING → 触发 VM-Exit → 返回用户态        │
+│     ↓                                                        │
+│     但信号有竞态窗口（微秒级）                               │
+│                                                              │
+│  3. 不同 VMM 的设计权衡                                      │
+│     ↓                                                        │
+│     QEMU：简单（不用信号）                                   │
+│     Firecracker：双保险（信号 + immediate_exit）             │
+│     cloud-hypervisor：信号 + 重试                            │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 6.7 源码对照
+
+```bash
+# wants_to_run 只在 KVM_RUN 入口检查
+grep -n "wants_to_run" /root/code/linux-6.12.93/arch/x86/kvm/x86.c
+# 11597:  if (!vcpu->wants_to_run) {  # KVM_RUN 入口
+# 11676:  if (!vcpu->wants_to_run) {  # KVM_RUN 主入口
+
+# vcpu_run 主循环不检查 wants_to_run
+sed -n '11343,11391p' /root/code/linux-6.12.93/arch/x86/kvm/x86.c | grep wants_to_run
+# （无输出）
+
+# XFER_TO_GUEST_MODE_WORK 包含 _TIF_SIGPENDING
+grep -A 3 "define XFER_TO_GUEST_MODE_WORK" \
+    /root/code/linux-6.12.93/include/linux/entry-kvm.h
+# _TIF_NEED_RESCHED | _TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL | ...
+```
+
+---
+
 ## ✅ 验证清单
 
 完成后确认能回答：
@@ -936,3 +1221,6 @@ cat /sys/kernel/debug/tracing/trace | \
 - [ ] kvm_x86_ops 中 vcpu_run 和 handle_exit 的调用时机是什么？
 - [ ] kvmclock 用的 CPUID 叶号是什么？KVM 注入了哪些半虚拟化特性？
 - [ ] x2APIC MSR 在 APICv 启用时如何处理？ICR 为什么例外？
+- [ ] **immediate_exit 在什么时候被检查？为什么不能中断正在 guest 里运行的 vCPU？**
+- [ ] **信号如何中断 vCPU？_TIF_SIGPENDING 在哪个检查点被处理？**
+- [ ] **三种 VMM（QEMU/Firecracker/cloud-hypervisor）的 vCPU 唤醒策略有什么区别？各自的优缺点是什么？**
