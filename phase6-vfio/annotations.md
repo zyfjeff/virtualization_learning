@@ -1,386 +1,140 @@
-# 第六阶段源码注释：VFIO 设备直通
+# Phase 6：源码精读注释 - VFIO 设备直通
 
-> 基于 Linux 6.12.93 源码（行号已验证） | 对应源码树 `drivers/vfio/` 和 `virt/kvm/`
+> 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
+> 行号可能随版本变化，用函数名 grep 定位更可靠。
 
 ---
 
-## 1. VFIO 核心框架（vfio_main.c）
+## 1. VFIO 分层架构
 
-### 1.1 模块概述
+### Q: VFIO 的分层是怎么组织的？
 
-```c
-/* 来源: drivers/vfio/vfio_main.c */
-
-/*
- * VFIO - Virtual Function I/O
- *
- * 模块描述:
- * "VFIO - User Level meta-driver for PCI devices"
- *
- * VFIO 是 Linux 中用于安全设备访问的用户态框架。
- * 它提供:
- *   1. 设备发现（通过 sysfs IOMMU 组）
- *   2. 安全的设备配置空间访问
- *   3. DMA 映射/解映射
- *   4. 设备中断管理
- *
- * 核心文件:
- *   /dev/vfio/vfio       - VFIO API 版本检查，容器管理
- *   /dev/vfio/$GROUP_ID  - IOMMU 组访问
- *   (通过组获取设备 fd)   - 设备特定操作
- */
+```
+用户态 (QEMU)
+  │
+  ├─ /dev/vfio/vfio         ← 容器 API（版本检查、扩展查询）
+  ├─ /dev/vfio/$GROUP_ID    ← 组设备访问（旧 API）
+  └─ /dev/vfio/devices/vfio$N ← 设备 fd（新 cdev API）
+  │
+  │ ioctl / mmap / read / write
+  │
+VFIO 核心框架 (vfio_main.c)
+  │
+  ├─ vfio_device            ← 设备抽象
+  ├─ vfio_group             ← IOMMU 组
+  ├─ vfio_container         ← DMA 容器（旧）
+  └─ iommufd                ← 新 IOMMU fd 框架
+  │
+VFIO 设备驱动 (vfio_pci_core.c)
+  │
+  ├─ PCI 配置空间访问
+  ├─ BAR mmap
+  ├─ 中断管理（INTx/MSI/MSI-X）
+  └─ 设备复位
+  │
+IOMMU 驱动 (vfio_iommu_type1.c)
+  │
+  ├─ DMA 映射/解映射
+  ├─ 页面固定
+  └─ 脏页跟踪
 ```
 
-### 1.2 核心数据结构
+---
+
+## 2. vfio_device：核心设备结构
+
+### Q: `struct vfio_device` 有哪些关键字段？
+
+**文件**: `include/linux/vfio.h:37`
 
 ```c
-/* 来源: include/linux/vfio.h, drivers/vfio/vfio_main.c */
-
-/*
- * struct vfio_device - VFIO 设备核心结构
- *
- * 每个被 VFIO 管理的物理设备对应一个 vfio_device
- * 由设备特定驱动（如 vfio-pci）注册
- */
 struct vfio_device {
-    struct device *dev;           /* 底层 Linux 设备 */
-    const struct vfio_device_ops *ops;  /* 设备操作回调 */
-    struct vfio_group *group;     /* 所属的 VFIO 组 */
-    struct vfio_device_set *dev_set;  /* 设备集（迁移用）*/
-    struct iommufd_ctx *iommufd_ictx; /* IOMMUFD 上下文 */
+    struct device *dev;                      /* ★ 底层 Linux 设备（pci_dev 等） */
+    const struct vfio_device_ops *ops;       /* ★ 设备操作回调 */
+    const struct vfio_migration_ops *mig_ops;  /* 迁移操作 */
+    const struct vfio_log_ops *log_ops;       /* 脏页日志 */
 
-    /* 内部状态 */
-    struct kref kref;             /* 引用计数 */
-    struct rw_semaphore ops_rwsem; /* ops 读写锁 */
-
-    /* 迁移相关 */
+#if IS_ENABLED(CONFIG_VFIO_GROUP)
+    struct vfio_group *group;                /* 所属 IOMMU 组 */
+    struct list_head group_next;
+    struct list_head iommu_entry;
+#endif
+    struct vfio_device_set *dev_set;         /* 设备集（迁移协调用） */
+    struct list_head dev_set_list;
     unsigned int migration_flags;
-    enum vfio_device_mig_state migration_state;
+    struct kvm *kvm;                         /* ★ 关联的 KVM 实例 */
 
-    /* 设备特定数据跟在结构体后面（container_of 访问）*/
+    /* --- 以下为内部字段，驱动不应直接使用 --- */
+    unsigned int index;
+    struct device device;                    /* 内嵌设备（kref 管理生命周期） */
+    refcount_t refcount;
+    unsigned int open_count;                 /* 用户态打开次数 */
+    struct completion comp;
+    struct iommufd_access *iommufd_access;
+    void (*put_kvm)(struct kvm *kvm);
+    struct inode *inode;
+    struct iommufd_device *iommufd_device;   /* iommufd 设备绑定 */
 };
+```
 
-/*
- * struct vfio_device_ops - 设备操作回调
- *
- * 由设备特定驱动（vfio-pci 等）提供
- * VFIO 核心通过这些回调与设备交互
- */
+### Q: `vfio_device` 的 `kvm` 字段怎么来的？
+
+```c
+/* 来源: drivers/vfio/group.c (通过 VFIO_GROUP_SET_CONTAINER 等路径) */
+/* 在 irq_bypass 配对时，consumer 和 producer 通过 token 匹配 */
+/* token 是同一个 eventfd 上下文指针 */
+```
+
+`vfio_device->kvm` 在 VFIO 设备被关联到 KVM 时设置。它主要用于：
+1. Posted Interrupts — KVM 需要知道设备的 PI Descriptor
+2. 迁移 — KVM 和设备驱动协调脏页
+
+### Q: `vfio_device_ops` 回调表长什么样？
+
+**文件**: `include/linux/vfio.h:109`
+
+```c
 struct vfio_device_ops {
     char *name;
-
-    /* 生命周期 */
-    int  (*open_device)(struct vfio_device *vdev);
+    int  (*init)(struct vfio_device *vdev);       /* 初始化私有字段 */
+    void (*release)(struct vfio_device *vdev);    /* 释放私有字段 */
+    int  (*bind_iommufd)(...);                     /* 绑定 iommufd */
+    void (*unbind_iommufd)(...);
+    int  (*attach_ioas)(...);                      /* 附加到 IO 地址空间 */
+    void (*detach_ioas)(...);
+    int  (*open_device)(struct vfio_device *vdev); /* 第一次 fd open */
     void (*close_device)(struct vfio_device *vdev);
-
-    /* I/O 操作 */
-    ssize_t (*read)(struct vfio_device *vdev, char __user *buf,
-                    size_t count, loff_t *ppos);
-    ssize_t (*write)(struct vfio_device *vdev, const char __user *buf,
-                     size_t count, loff_t *ppos);
-    int (*mmap)(struct vfio_device *vdev, struct vm_area_struct *vma);
-
-    /* ioctl - 设备特定操作 */
-    long (*ioctl)(struct vfio_device *vdev, unsigned int cmd,
-                  unsigned long arg);
-
-    /* 绑定/解绑 */
-    int (*bind_iommufd)(struct vfio_device *vdev,
-                        struct iommufd_ctx *ictx, u32 *out_device_id);
-    void (*unbind_iommufd)(struct vfio_device *vdev,
-                           struct iommufd_ctx *ictx);
-    int (*attach_ioas)(struct vfio_device *vdev, u32 *pt_id);
-    void (*detach_ioas)(struct vfio_device *vdev);
-
-    /* 请求 */
-    void (*request)(struct vfio_device *vdev, unsigned int count);
-    int (*get_datapfns)(struct vfio_device *vdev, ...);
+    ssize_t (*read)(...);                          /* 读设备（配置空间等） */
+    ssize_t (*write)(...);
+    long (*ioctl)(...);                            /* ★ 设备特定 ioctl */
+    int  (*mmap)(...);                             /* ★ BAR mmap */
+    void (*request)(...);                          /* 请求释放设备 */
+    int  (*match)(...);
+    void (*dma_unmap)(...);                        /* DMA 解映射通知 */
+    int  (*device_feature)(...);                   /* VFIO_DEVICE_FEATURE */
 };
-```
-
-### 1.3 VFIO 核心 ioctl 分发
-
-```c
-/* 来源: drivers/vfio/vfio_main.c (简化流程) */
-
-/*
- * VFIO 容器级 ioctl 处理
- *
- * /dev/vfio/vfio 是容器设备文件
- * 支持的 ioctl:
- */
-
-/*
- * VFIO_GET_API_VERSION:
- *   返回 VFIO API 版本号 (VFIO_API_VERSION = 0)
- *   用于用户态确认内核支持 VFIO
- *
- * VFIO_CHECK_EXTENSION:
- *   检查是否支持特定扩展
- *   - VFIO_TYPE1_IOMMU (1): 基础 Type 1 IOMMU（Intel VT-d / AMD-Vi）
- *   - VFIO_TYPE1v2_IOMMU (3): Type 1 v2，支持安全的 pin/unpin 操作和 DMA unmap 通知
- *   - VFIO_SPAPR_TCE_IOMMU (2): PowerPC TCE 表支持
- *   - VFIO_SPAPR_TCE_v2_IOMMU (7): PowerPC TCE v2
- *   - VFIO_DMA_CC_IOMMU (4): IOMMU 强制 DMA 缓存一致性
- *   - VFIO_EEH (5): EEH 错误处理（PowerPC 平台）
- *   - VFIO_TYPE1_NESTING_IOMMU (6): 嵌套 IOMMU 支持（隐含 v2 特性）
- *   - VFIO_NOIOMMU_IOMMU (8): No-IOMMU 模式（仅用于调试）
- *   - VFIO_UNMAP_ALL (9): 支持批量解除所有映射
- *   - VFIO_UPDATE_VADDR (10): 支持更新虚拟地址
- *
- *   注: 以上数值为扩展 ID，用于 VFIO_CHECK_EXTENSION ioctl 参数
- *
- * VFIO_SET_IOMMU:
- *   设置容器的 IOMMU 驱动
- *   通常在 VFIO_GROUP_SET_CONTAINER 之后调用
- *   参数: IOMMU 类型（如 VFIO_TYPE1_IOMMU）
- */
 ```
 
 ---
 
-## 2. IOMMU Type 1 驱动（vfio_iommu_type1.c）
+## 3. VFIO PCI 回调表
 
-### 2.1 模块概述
+### Q: `vfio_pci_ops` 怎么挂到 VFIO 框架？
 
-```c
-/* 来源: drivers/vfio/vfio_iommu_type1.c */
-
-/*
- * VFIO IOMMU Type 1 驱动
- *
- * 模块描述:
- * "VFIO IOMMU Type 1 for Intel VT-d and AMD-Vi"
- *
- * Type 1 IOMMU 驱动支持:
- *   - Intel VT-d: DMA remapping hardware
- *   - AMD-Vi: AMD IOMMU
- *
- * 核心功能:
- *   1. DMA 映射: 将用户空间虚拟地址映射到 IOMMU IOVA
- *   2. DMA 解映射: 解除 IOVA 到物理页的映射
- *   3. 页面固定: 防止 DMA 目标页面被换出
- *   4. 脏页跟踪: 支持实时迁移中的脏页检测
- */
-
-/*
- * 关键数据结构:
- */
-
-/* DMA 映射描述 */
-struct vfio_dma {
-    struct rb_node node;          /* DMA 映射的红黑树节点 */
-    dma_addr_t iova;              /* I/O 虚拟地址 */
-    unsigned long vaddr;          /* 用户空间虚拟地址 */
-    size_t size;                  /* 映射大小 */
-    int prot;                     /* 保护标志 (IOMMU_READ/WRITE) */
-    size_t locked;                /* 已固定的页数 */
-    struct task_struct *task;     /* 映射所属进程 */
-    struct vfio_pfn *pfn_list;    /* 映射的物理页列表 */
-    bool cache_remote;            /* 是否缓存远程映射 */
-};
-
-/* 物理页跟踪 */
-struct vfio_pfn {
-    struct rb_node node;
-    unsigned long pfn;            /* 物理页帧号 */
-    int prot;                     /* 保护标志 */
-    unsigned long vaddr;          /* 对应的用户空间虚拟地址 */
-    bool dirty;                   /* 脏页标记 */
-    struct page *page;            /* struct page 指针 */
-};
-```
-
-### 2.2 DMA 映射完整路径
+**文件**: `drivers/vfio/pci/vfio_pci.c:130`
 
 ```c
-/* 来源: drivers/vfio/vfio_iommu_type1.c */
-
-/*
- * vfio_dma_do_map - DMA 映射核心函数
- *
- * 流程:
- *   1. 解析用户态参数（IOVA, VADDR, 大小）
- *   2. 检查 IOVA 范围是否空闲
- *   3. 固定用户空间物理页
- *   4. 通过 IOMMU 核心创建映射
- *
- * @iommu:     IOMMU 实例
- * @iova:      目标 I/O 虚拟地址
- * @vaddr:     用户空间虚拟地址
- * @size:      映射大小（必须页对齐）
- * @prot:      保护标志 (IOMMU_READ | IOMMU_WRITE)
- * @type:      映射类型
- */
-
-/*
- * DMA 映射完整路径:
- *
- * ioctl(VFIO_IOMMU_MAP_DMA)
- *     │
- *     ▼
- * vfio_iommu_type1_ioctl()
- *     │
- *     ▼
- * vfio_dma_do_map(iommu, &map)
- *     │
- *     ├── 验证参数
- *     │   ├── IOVA 必须页对齐
- *     │   ├── 大小必须 > 0
- *     │   └── VADDR 必须在用户空间有效
- *     │
- *     ├── vfio_find_dma_valid()
- *     │   └── 检查 IOVA 范围是否与已有映射重叠
- *     │       └── 如果重叠 → 返回 -EEXIST
- *     │
- *     ├── vfio_lock_acct()
- *     │   └── 检查内存锁定限制 (RLIMIT_MEMLOCK)
- *     │
- *     ├── vfio_pin_pages_remote()
- *     │   ├── get_user_pages_fast() → 固定物理页
- *     │   ├── 创建 vfio_pfn 记录
- *     │   └── 将 pfn 加入 DMA 的 pfn_list
- *     │
- *     ├── iommu_map()
- *     │   ├── 在 IOMMU 页表中创建 IOVA→PFN 条目
- *     │   ├── 设置权限 (Read/Write)
- *     │   └── 刷新 IOMMU TLB (如果需要)
- *     │
- *     └── 更新 DMA 映射的红黑树
- *         └── rb_insert(&iommu->dma_list, &dma->node)
- */
-
-static int vfio_dma_do_map(struct vfio_iommu *iommu,
-                           struct vfio_iommu_type1_dma_map *map)
-{
-    dma_addr_t iova = map->iova;
-    unsigned long vaddr = map->vaddr;
-    size_t size = map->size;
-    int prot = 0;
-    struct vfio_dma *dma;
-    int ret;
-
-    /* 设置保护标志 */
-    if (map->flags & VFIO_DMA_MAP_FLAG_READ)
-        prot |= IOMMU_READ;
-    if (map->flags & VFIO_DMA_MAP_FLAG_WRITE)
-        prot |= IOMMU_WRITE;
-
-    /* 检查对齐 */
-    if (!IS_ALIGNED(iova, PAGE_SIZE) ||
-        !IS_ALIGNED(vaddr, PAGE_SIZE) ||
-        !IS_ALIGNED(size, PAGE_SIZE))
-        return -EINVAL;
-
-    /* 检查是否已存在 */
-    if (vfio_find_dma_valid(iommu, iova, size))
-        return -EEXIST;
-
-    /* 创建 DMA 映射结构 */
-    dma = kzalloc(sizeof(*dma), GFP_KERNEL);
-    dma->iova = iova;
-    dma->vaddr = vaddr;
-    dma->size = size;
-    dma->prot = prot;
-
-    /* 固定物理页并创建 IOMMU 映射 */
-    ret = vfio_pin_map_dma(iommu, dma, size);
-    if (ret) {
-        kfree(dma);
-        return ret;
-    }
-
-    /* 加入红黑树 */
-    vfio_link_dma(iommu, dma);
-    return 0;
-}
-```
-
-### 2.3 DMA 映射流程图
-
-```
-DMA 映射详细流程:
-
-  用户空间                        内核空间
-  ────────                        ────────
-                                  ┌──────────────────────────┐
-  ioctl(MAP_DMA)                  │ vfio_iommu_type1_ioctl()  │
-  { iova, vaddr, size } ───────▶  │                          │
-                                  │ vfio_dma_do_map()         │
-                                  │  ├── 参数验证             │
-                                  │  │   ├── 对齐检查         │
-                                  │  │   ├── 重叠检查         │
-                                  │  │   └── 权限检查         │
-                                  │  │                       │
-                                  │  ├── 内存锁定检查         │
-                                  │  │   └── RLIMIT_MEMLOCK   │
-                                  │  │                       │
-                                  │  ├── 固定物理页           │
-                                  │  │   ┌─────────────────┐ │
-                                  │  │   │ get_user_pages   │ │
-                                  │  │   │ _fast()         │ │
-                                  │  │   │                 │ │
-                                  │  │   │ VADDR → PFN     │ │
-                                  │  │   │ (每个 PAGE_SIZE) │ │
-                                  │  │   └────────┬────────┘ │
-                                  │  │            │          │
-                                  │  ├── 创建 IOMMU 映射      │
-                                  │  │   ┌────────┴────────┐ │
-                                  │  │   │ iommu_map()     │ │
-                                  │  │   │                 │ │
-                                  │  │   │ IOVA → PFN      │ │
-                                  │  │   │ + 权限位        │ │
-                                  │  │   │ + TLB 刷新      │ │
-                                  │  │   └─────────────────┘ │
-                                  │  │                       │
-                                  │  └── 记录到红黑树        │
-                                  │      dma_list ← dma      │
-                                  └──────────────────────────┘
-
-  结果:
-    IOVA 空间:   [iova, iova+size) → [PFN0, PFN1, PFN2, ...]
-    IOMMU 页表:  已更新
-    设备 DMA:    现在可以通过 IOVA 访问这些物理页
-```
-
----
-
-## 3. VFIO PCI 驱动（vfio_pci_core.c）
-
-### 3.1 模块概述
-
-```c
-/* 来源: drivers/vfio/pci/vfio_pci_core.c */
-
-/*
- * VFIO PCI 核心驱动
- *
- * 模块描述:
- * "VFIO PCI - User Level meta-driver for PCI devices"
- *
- * 提供 PCI 设备的 VFIO 接口:
- *   - PCI 配置空间访问（包括扩展配置空间）
- *   - PCI BAR 区域的 mmap 映射
- *   - 中断管理（INTx, MSI, MSI-X）
- *   - 设备复位
- *   - SR-IOV 支持
- */
-
-/*
- * VFIO PCI 设备操作回调:
- * 来源: drivers/vfio/pci/vfio_pci.c:130
- */
 static const struct vfio_device_ops vfio_pci_ops = {
     .name           = "vfio-pci",
     .init           = vfio_pci_core_init_dev,
     .release        = vfio_pci_core_release_dev,
-    .open_device    = vfio_pci_open_device,
+    .open_device    = vfio_pci_open_device,        /* ★ fd open → enable 设备 */
     .close_device   = vfio_pci_core_close_device,
-    .ioctl          = vfio_pci_core_ioctl,
+    .ioctl          = vfio_pci_core_ioctl,          /* ★ 设备 ioctl 分发 */
     .device_feature = vfio_pci_core_ioctl_feature,
-    .read           = vfio_pci_core_read,
-    .write          = vfio_pci_core_write,
-    .mmap           = vfio_pci_core_mmap,
+    .read           = vfio_pci_core_read,           /* PCI 配置空间读 */
+    .write          = vfio_pci_core_write,          /* PCI 配置空间写 */
+    .mmap           = vfio_pci_core_mmap,           /* ★ BAR mmap */
     .request        = vfio_pci_core_request,
     .match          = vfio_pci_core_match,
     .bind_iommufd   = vfio_iommufd_physical_bind,
@@ -390,366 +144,660 @@ static const struct vfio_device_ops vfio_pci_ops = {
 };
 ```
 
-### 3.2 设备启用流程
+### Q: `vfio_pci_probe()` 如何注册设备？
+
+**文件**: `drivers/vfio/pci/vfio_pci.c:149`
 
 ```c
-/* 来源: drivers/vfio/pci/vfio_pci_core.c:500 (简化) */
-
-/*
- * vfio_pci_core_enable - 启用 PCI 设备直通
- *
- * 当用户态打开设备文件时调用
- */
-int vfio_pci_core_enable(struct vfio_device *core_vdev)
+static int vfio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
-    struct vfio_pci_core_device *vdev =
-        container_of(core_vdev, struct vfio_pci_core_device, vdev);
+    struct vfio_pci_core_device *vdev;
+
+    if (vfio_pci_is_denylisted(pdev))
+        return -EINVAL;
+
+    /* ★ 分配 vfio_pci_core_device（包含 vfio_device 作为子结构） */
+    vdev = vfio_alloc_device(vfio_pci_core_device, vdev, &pdev->dev,
+                             &vfio_pci_ops);
+
+    dev_set_drvdata(&pdev->dev, vdev);
+    ret = vfio_pci_core_register_device(vdev);  /* ★ 注册到 VFIO 框架 */
+    ...
+}
+```
+
+**关键**：`driver_managed_dma = true`（`drivers/vfio/pci/vfio_pci.c:205`）
+声明此驱动自己管理 DMA，probe 时**不**占用 default domain（`owner_cnt` 不变）。
+DMA ownership 的实际认领推迟到 `VFIO_GROUP_SET_CONTAINER` 或 `VFIO_GROUP_GET_DEVICE_FD`。
+
+详见 phase6 corrections.md 勘误 1。
+
+---
+
+## 4. vfio_pci_core_enable()：设备启用
+
+### Q: 设备启用时做了什么？
+
+**文件**: `drivers/vfio/pci/vfio_pci_core.c:500`
+
+```c
+int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
+{
     struct pci_dev *pdev = vdev->pdev;
-    int ret;
 
-    /*
-     * Step 1: 重置设备
-     * 确保设备在直通前处于已知状态
-     */
-    ret = pci_reset_function(pdev);
+    /* ★ Step 1: 清除 Bus Master（不允许初始状态有 DMA） */
+    pci_clear_master(pdev);
 
-    /*
-     * Step 2: 启用设备
-     * 启用 PCI 设备的 MMIO 和 Bus Master 能力
-     */
+    /* ★ Step 2: 启用 PCI 设备 */
     ret = pci_enable_device(pdev);
 
-    /*
-     * Step 3: 保存 PCI 配置空间
-     * 保存原始配置，用于设备释放时恢复
-     */
-    vfio_pci_save_config(vdev);
+    /* ★ Step 3: 尝试复位（确保设备在已知状态） */
+    ret = pci_try_reset_function(pdev);
+    vdev->reset_works = !ret;
 
-    /*
-     * Step 4: 设置 BAR 区域
-     * 记录每个 BAR 的基地址和大小
-     */
-    for (i = 0; i < PCI_STD_NUM_BARS; i++) {
-        /* 检查 BAR 类型和大小 */
-        /* 记录 MMIO 区域信息 */
+    /* ★ Step 4: 保存 PCI 配置空间 */
+    pci_save_state(pdev);
+    vdev->pci_saved_state = pci_store_saved_state(pdev);
+
+    /* ★ Step 5: INTx 处理 */
+    if (likely(!nointxmask)) {
+        vdev->pci_2_3 = pci_intx_mask_supported(pdev);
     }
 
-    /*
-     * Step 5: 配置中断
-     * 确定设备支持的中断类型:
-     *   - INTx (传统中断)
-     *   - MSI (Message Signaled Interrupt)
-     *   - MSI-X (Extended MSI)
-     */
+    /* ★ Step 6: 读取 MSI-X 信息 */
+    msix_pos = pdev->msix_cap;
+    if (msix_pos) {
+        pci_read_config_word(pdev, msix_pos + PCI_MSIX_FLAGS, &flags);
+        pci_read_config_dword(pdev, msix_pos + PCI_MSIX_TABLE, &table);
 
-    /*
-     * Step 6: 设置 MMIO 映射
-     * 将设备 BAR 区域映射到用户空间
-     * 用户态（QEMU）可以直接读写设备 MMIO
-     */
+        vdev->msix_bar = table & PCI_MSIX_TABLE_BIR;      /* ★ MSI-X 表在哪个 BAR */
+        vdev->msix_offset = table & PCI_MSIX_TABLE_OFFSET; /* 表内偏移 */
+        vdev->msix_size = ((flags & PCI_MSIX_FLAGS_QSIZE) + 1) * 16;
+    }
+
+    /* Step 7: VGA 检测 */
+    if (!vfio_vga_disabled() && vfio_pci_is_vga(pdev))
+        vdev->has_vga = true;
 
     return 0;
 }
 ```
 
-### 3.3 MMIO 映射
+### Q: 为什么先 `pci_clear_master` 再 `pci_enable_device`？
 
-```c
-/* 来源: drivers/vfio/pci/vfio_pci_core.c:500 (简化) */
-
-/*
- * vfio_pci_core_mmap - 映射设备 MMIO 到用户空间
- *
- * 允许 QEMU 直接访问设备 MMIO 寄存器
- * 无需通过 ioctl，减少内核-用户态切换开销
- *
- * 映射区域:
- *   - PCI BAR 中的 MMIO 区域（非 I/O 端口）
- *   - 通过 mmap 直接暴露给用户态
- *
- * ★ 注意: MSI-X 表所在页面会被从 mmap 中剔除（无 IR 时）
- *   详见 README.md §1.5.9「MSI-X 表与 BAR mmap」
- *   有 IR 时内核通过 VFIO_REGION_INFO_CAP_MSIX_MAPPABLE 允许整 BAR mmap，
- *   但 QEMU 默认仍以 msix_table_mmio subregion 拦截 MSI-X 表访问。
- */
-
-/*
- * MMIO 映射路径:
- *
- * QEMU mmap() ──▶ vfio_pci_core_mmap()
- *                    │
- *                    ├── 检查 BAR 区域有效性
- *                    ├── 检查权限（不可映射 I/O 端口 BAR）
- *                    │
- *                    └── remap_pfn_range()
- *                        └── 将设备物理地址映射到用户空间 VMA
- *
- * 结果:
- *   QEMU 获得设备 MMIO 的直接映射
- *   可以直接读写设备寄存器（通过指针访问）
- *   硬件 MMIO 事务通过 PCIe 总线到达设备
- */
-```
+安全考虑。VFIO 的目标是让设备处于**已知安全状态**后才交给用户空间。
+`pci_clear_master` 确保设备在 enable 前不会发起 DMA。DMA 映射要等 QEMU 显式调
+`VFIO_IOMMU_MAP_DMA` 后才开始。
 
 ---
 
-## 4. KVM-VFIO 桥接（virt/kvm/vfio.c）
+## 5. vfio_pci_core_mmap()：BAR 映射
 
-### 4.1 完整源码分析
+### Q: BAR mmap 如何工作？有什么安全限制？
+
+**文件**: `drivers/vfio/pci/vfio_pci_core.c:1752`
 
 ```c
-/* 来源: virt/kvm/vfio.c */
+int vfio_pci_core_mmap(struct vfio_device *core_vdev, struct vm_area_struct *vma)
+{
+    struct vfio_pci_core_device *vdev = ...;
+    unsigned int index;
 
-/*
- * KVM VFIO 桥接模块
- *
- * 这是 KVM 和 VFIO 之间的桥接层
- * 允许 KVM 感知 VFIO 管理的设备组
- *
- * 主要用途:
- *   1. Posted Interrupts: KVM 需要知道哪些设备属于 VM，
- *      以便正确配置 IRTE 的 Posted Interrupt 字段
- *   2. DMA 一致性: 确保设备 DMA 与 KVM 内存管理一致
- *   3. 设备安全: 通过 VFIO 组机制保证隔离
- *
- * 实现为 KVM 设备文件: /dev/kvm 的 KVM_CREATE_DEVICE 接口
- * 设备类型: KVM_DEV_TYPE_VFIO
- */
+    /* ★ 从 mmap offset 提取 region index */
+    index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
 
-/*
- * KVM VFIO 设备操作:
- */
-static struct kvm_device_ops kvm_vfio_ops = {
-    .name = "kvm-vfio",
-    .create = kvm_vfio_create,
-    .destroy = kvm_vfio_destroy,
-    .set_attr = kvm_vfio_set_attr,
-    .has_attr = kvm_vfio_has_attr,
+    /* 安全检查 */
+    if (index >= VFIO_PCI_NUM_REGIONS + vdev->num_regions) return -EINVAL;
+    if ((vma->vm_flags & VM_SHARED) == 0) return -EINVAL;    /* 必须共享映射 */
+    if (index >= VFIO_PCI_ROM_REGION_INDEX) return -EINVAL;  /* ROM 不可 mmap */
+    if (!vdev->bar_mmap_supported[index]) return -EINVAL;    /* 该 BAR 不支持 */
+
+    /* 计算物理地址范围 */
+    phys_len = PAGE_ALIGN(pci_resource_len(pdev, index));
+    req_len = vma->vm_end - vma->vm_start;
+    pgoff = vma->vm_pgoff & ((1U << (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT)) - 1);
+
+    /* ★ 映射 BAR 内存 */
+    if (!vdev->barmap[index]) {
+        ret = pci_request_selected_regions(pdev, 1 << index, "vfio-pci");
+        vdev->barmap[index] = pci_iomap(pdev, index, 0);
+    }
+
+    /* ★ 设置页面保护：uncached + decrypted */
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+    vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
+
+    vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+    vma->vm_ops = &vfio_pci_mmap_ops;
+
+    return 0;
+}
+```
+
+### Q: MSI-X 表页面能被 mmap 吗？
+
+| 条件 | MSI-X 表 mmap |
+|------|--------------|
+| 无中断重映射（IR） | ❌ 从 mmap 中剔除，必须通过 read/write 访问 |
+| 有中断重映射（IR） | ✅ 整 BAR 可 mmap（`VFIO_REGION_INFO_CAP_MSIX_MAPPABLE`） |
+
+即使有 IR 允许整 BAR mmap，**QEMU 默认仍以 `msix_table_mmio` subregion 拦截 MSI-X 表访问**。
+这是因为 QEMU 需要在 Guest 写 MSI-X 表时同步更新 KVM 中断路由。
+
+详见 CLAUDE.md 已知陷阱 #5（VFIO MSI-X 直通流程）。
+
+---
+
+## 6. vfio_pci_core_ioctl()：设备 ioctl 分发
+
+### Q: 设备 fd 支持哪些 ioctl？
+
+**文件**: `drivers/vfio/pci/vfio_pci_core.c:1488`
+
+```c
+long vfio_pci_core_ioctl(struct vfio_device *core_vdev, unsigned int cmd,
+                         unsigned long arg)
+{
+    switch (cmd) {
+    case VFIO_DEVICE_GET_INFO:            /* 设备基本信息（flag、region 数量等） */
+        return vfio_pci_ioctl_get_info(vdev, uarg);
+    case VFIO_DEVICE_GET_REGION_INFO:     /* ★ BAR region 信息（地址、大小、flag） */
+        return vfio_pci_ioctl_get_region_info(vdev, uarg);
+    case VFIO_DEVICE_GET_IRQ_INFO:        /* ★ 中断信息（INTx/MSI/MSI-X 数量） */
+        return vfio_pci_ioctl_get_irq_info(vdev, uarg);
+    case VFIO_DEVICE_SET_IRQS:            /* ★ 配置中断（武装/触发/屏蔽） */
+        return vfio_pci_ioctl_set_irqs(vdev, uarg);
+    case VFIO_DEVICE_RESET:               /* 设备复位 */
+        return vfio_pci_ioctl_reset(vdev, uarg);
+    case VFIO_DEVICE_PCI_HOT_RESET:       /* PCIe 热复位 */
+        return vfio_pci_ioctl_pci_hot_reset(vdev, uarg);
+    case VFIO_DEVICE_IOEVENTFD:           /* ioeventfd 注册 */
+        return vfio_pci_ioctl_ioeventfd(vdev, uarg);
+    default:
+        return -ENOTTY;
+    }
+}
+```
+
+### Q: `VFIO_DEVICE_SET_IRQS` 的参数结构？
+
+```c
+struct vfio_irq_set {
+    __u32 argsz;          /* 结构体大小 */
+    __u32 flags;          /* ★ 操作标志 */
+    __u32 index;          /* 中断索引（0=INTx, 1=MSI, 2=MSI-X） */
+    __u32 start;          /* 起始向量号 */
+    __u32 count;          /* 向量数量 */
+    __u8 data[];          /* 数据（eventfd 或触发数据） */
 };
-
-/*
- * 支持的操作属性:
- *
- * KVM_DEV_VFIO_GROUP (属性组):
- *   KVM_DEV_VFIO_GROUP_ADD:    添加 VFIO 组
- *   KVM_DEV_VFIO_GROUP_DEL:    删除 VFIO 组
- *   KVM_DEV_VFIO_GROUP_SET_SPAPR_TCE: 设置 TCE（PowerPC）
- *
- * KVM_DEV_VFIO_FILE (属性组):
- *   KVM_DEV_VFIO_FILE_ADD:     添加 VFIO 文件
- *   KVM_DEV_VFIO_FILE_DEL:     删除 VFIO 文件
- */
 ```
 
-### 4.2 KVM VFIO 组管理
+flags 组合：
+
+| flags | 含义 |
+|-------|------|
+| `VFIO_IRQ_SET_DATA_EVENTFD` + `ACTION` | 用 eventfd 武装中断 |
+| `VFIO_IRQ_SET_DATA_NONE` + `ACTION_TRIGGER` | 手动触发中断 |
+| `VFIO_IRQ_SET_DATA_BOOL` + `ACTION_MASK` | 屏蔽指定向量 |
+
+`ACTION` 值：
+
+| 值 | 含义 |
+|----|------|
+| `VFIO_IRQ_SET_ACTION_TRIGGER` | 武装（设置触发源） |
+| `VFIO_IRQ_SET_ACTION_UNMASK` | 解除屏蔽 |
+| `VFIO_IRQ_SET_ACTION_MASK` | 屏蔽 |
+
+**注意**：对 MSI-X 的 mask/unmask 操作，VFIO 内核侧没有直接导出接口（`drivers/vfio/pci/vfio_pci_intrs.c:854-857` 留空为 "XXX Need masking support exported"）。
+mask 位只能由 VMM 直接 pwrite 到物理 MSI-X 表。详见 CLAUDE.md 已知陷阱 #17。
+
+---
+
+## 7. VFIO 核心 ioctl 分发
+
+### Q: 设备 fd 的 ioctl 怎么分发到设备驱动？
+
+**文件**: `drivers/vfio/vfio_main.c:1261`
 
 ```c
-/* 来源: virt/kvm/vfio.c (简化分析) */
+static long vfio_device_fops_unl_ioctl(struct file *filep,
+                                       unsigned int cmd, unsigned long arg)
+{
+    struct vfio_device_file *df = filep->private_data;
+    struct vfio_device *device = df->device;
 
-/*
- * kvm_vfio_group 结构:
- *
- * struct kvm_vfio_group {
- *     struct list_head node;     // 链表节点
- *     struct file *file;         // VFIO 组文件描述符
- * };
- *
- * KVM 维护一个 kvm_vfio_group 列表，记录所有关联到 VM 的 VFIO 组
- */
+    /* ★ 特殊处理：BIND_IOMMUFD 不需要 access_granted */
+    if (cmd == VFIO_DEVICE_BIND_IOMMUFD)
+        return vfio_df_ioctl_bind_iommufd(df, uptr);
 
-/*
- * kvm_vfio_group_add - 添加 VFIO 组到 KVM VM
- *
- * QEMU 通过 ioctl 调用此函数:
- *   KVM_DEV_VFIO_GROUP_ADD + fd (VFIO 组文件描述符)
- *
- * 流程:
- *   1. 获取 VFIO 组的引用 (vfio_file_iommu_group)
- *   2. 检查是否已经添加（避免重复）
- *   3. 创建 kvm_vfio_group 记录
- *   4. 加入 kvm->vfio_groups 链表
- *   5. 更新 DMA 一致性状态
- */
+    /* ★ 安全检查：必须先 open 设备 */
+    if (!smp_load_acquire(&df->access_granted))
+        return -EINVAL;
 
-/*
- * kvm_vfio_group_del - 从 KVM VM 移除 VFIO 组
- *
- * 流程:
- *   1. 在 kvm->vfio_groups 链表中查找匹配的文件
- *   2. 从链表中删除
- *   3. 释放 VFIO 组引用
- *   4. 更新 DMA 一致性状态
- */
+    /* cdev-only ioctls（iommufd 路径） */
+    if (IS_ENABLED(CONFIG_VFIO_DEVICE_CDEV) && !df->group) {
+        switch (cmd) {
+        case VFIO_DEVICE_ATTACH_IOMMUFD_PT: ...
+        case VFIO_DEVICE_DETACH_IOMMUFD_PT: ...
+        }
+    }
 
-/*
- * kvm_vfio_update_coherency - 更新 DMA 一致性
- *
- * 当 VFIO 组列表发生变化时调用
- *
- * 作用:
- *   检查是否有任何 VFIO 组使用非一致性 DMA
- *   如果是，设置 kvm->arch.noncoherent_dma = true
- *   这会影响 KVM 的内存管理策略（如 cache 刷新）
- */
+    switch (cmd) {
+    case VFIO_DEVICE_FEATURE:
+        ret = vfio_ioctl_device_feature(device, uptr);
+        break;
+    default:
+        /* ★ 其他 ioctl 全部转发给设备驱动 */
+        ret = device->ops->ioctl(device, cmd, arg);
+        break;
+    }
+    return ret;
+}
 ```
 
-### 4.3 KVM-VFIO 交互时序图
+### Q: `device->ops->ioctl` 对 vfio-pci 就是 `vfio_pci_core_ioctl()`？
+
+对。调用链：
 
 ```
-QEMU 设置设备直通的完整时序:
-
-  QEMU                              KVM                    VFIO
-  ────                              ───                    ────
-  │                                  │                      │
-  │ 1. 打开 VFIO 容器                │                      │
-  │ open("/dev/vfio/vfio") ─────────────────────────────────▶│
-  │                                  │                      │
-  │ 2. 检查 API 版本                 │                      │
-  │ ioctl(VFIO_GET_API_VERSION) ────────────────────────────▶│
-  │                                  │                      │
-  │ 3. 设置 IOMMU 类型               │                      │
-  │ ioctl(VFIO_SET_IOMMU, TYPE1) ───────────────────────────▶│
-  │                                  │                      │
-  │ 4. 获取 VFIO 组                  │                      │
-  │ open("/dev/vfio/5") ────────────────────────────────────▶│
-  │                                  │                      │
-  │ 5. 将组关联到容器                │                      │
-  │ ioctl(GROUP_SET_CONTAINER) ─────────────────────────────▶│
-  │                                  │                      │
-  │ 6. 将组关联到 KVM VM  ←───────── 关键步骤              │
-  │ ioctl(KVM_DEV_VFIO_GROUP_ADD,    │                      │
-  │       group_fd) ────────────────▶│                      │
-  │                                  │── kvm_vfio_group_add │
-  │                                  │── 获取 vfio_group    │
-  │                                  │── 加入列表           │
-  │                                  │                      │
-  │ 7. 获取设备 fd                   │                      │
-  │ ioctl(GROUP_GET_DEVICE_FD) ─────────────────────────────▶│
-  │                                  │                      │
-  │ 8. 映射 DMA 区域                 │                      │
-  │ ioctl(VFIO_IOMMU_MAP_DMA, ─────────────────────────────▶│
-  │       iova, vaddr, size)         │                      │
-  │                                  │── iommu_map()        │
-  │                                  │                      │
-  │ 9. 启用设备                      │                      │
-  │ ioctl(DEVICE_OPEN) ─────────────────────────────────────▶│
-  │                                  │── vfio_pci_enable()  │
-  │                                  │                      │
-  │ 10. 映射设备 MMIO                │                      │
-  │ mmap(device_fd, bar_offset) ────────────────────────────▶│
-  │                                  │── remap_pfn_range()  │
-  │                                  │                      │
-  │ 11. 配置中断                     │                      │
-  │ ioctl(SET_IRQS, MSI-X config) ─────────────────────────▶│
-  │                                  │                      │
-  │ 12. VM 运行                      │                      │
-  │ ioctl(KVM_RUN) ────────────────▶│                      │
-  │                                  │── VM-Entry           │
-  │                                  │   Guest 直接访问设备  │
-  │                                  │   设备 DMA → IOMMU → │
-  │                                  │   物理内存           │
+vfio_device_fops_unl_ioctl()
+  └→ device->ops->ioctl(device, cmd, arg)
+      └→ vfio_pci_core_ioctl()
+          └→ switch (cmd) ...
 ```
 
 ---
 
-## 5. IOMMU 组与设备隔离
+## 8. KVM-VFIO 桥接
 
-### 5.1 IOMMU 组概念
+### Q: KVM 如何知道哪些 VFIO 设备属于 VM？
+
+**文件**: `virt/kvm/vfio.c:143`
+
+```c
+static int kvm_vfio_file_add(struct kvm_device *dev, unsigned int fd)
+{
+    struct kvm_vfio *kv = dev->private;
+    struct kvm_vfio_file *kvf;
+    struct file *filp;
+
+    filp = fget(fd);
+    if (!kvm_vfio_file_is_valid(filp))
+        return -EINVAL;              /* 不是有效的 VFIO fd */
+
+    /* 检查重复 */
+    list_for_each_entry(kvf, &kv->file_list, node)
+        if (kvf->file == filp)
+            return -EEXIST;
+
+    kvf = kzalloc(sizeof(*kvf), GFP_KERNEL_ACCOUNT);
+    kvf->file = get_file(filp);
+    list_add_tail(&kvf->node, &kv->file_list);
+
+    /* ★ 三件事 */
+    kvm_arch_start_assignment(dev->kvm);       /* 1. 递增 assigned_device_count */
+    kvm_vfio_file_set_kvm(kvf->file, dev->kvm); /* 2. 设置 VFIO 文件的 kvm 指针 */
+    kvm_vfio_update_coherency(dev);             /* 3. 更新 DMA 一致性状态 */
+
+    return 0;
+}
+```
+
+### Q: `kvm_vfio_file_add` 会触发 IRTE Posted 化吗？
+
+**不会**。这是一个常见误解。
+
+`kvm_vfio_file_add` 只做三件事，没有一件涉及 IRTE：
+
+| 调用 | 作用 |
+|------|------|
+| `kvm_arch_start_assignment()` | 递增 `assigned_device_count` |
+| `kvm_vfio_file_set_kvm()` | 让 VFIO 知道关联的 KVM |
+| `kvm_vfio_update_coherency()` | 更新 noncoherent DMA 标志 |
+
+**真正触发 IRTE Posted 化的是 irq_bypass 的 token 配对**：
 
 ```
-IOMMU 组拓扑:
-
-  PCIe 拓扑:                    IOMMU 组划分:
-  ┌─────────────────┐          ┌─────────────────────┐
-  │   Root Complex   │          │                     │
-  │                  │          │  Group 0:           │
-  │  ┌───┐  ┌───┐  │          │   - Root Complex    │
-  │  │0:0│  │0:1│  │          │   - 不可分割设备     │
-  │  └─┬─┘  └─┬─┘  │          │                     │
-  │    │       │    │          │  Group 5:           │
-  │  ┌─┴─┐   ┌┴──┐ │          │   - 03:00.0 (NIC)  │
-  │  │1:0│   │2:0│ │          │   (可直通)          │
-  │  └─┬─┘   └─┬─┘ │          │                     │
-  │    │       │    │          │  Group 8:           │
-  │  ┌─┴─┐   ┌┴──┐ │          │   - 05:00.0 (GPU)  │
-  │  │3:0│   │5:0│ │          │   (可直通)          │
-  │  └───┘   └───┘ │          │                     │
-  └─────────────────┘          └─────────────────────┘
-
-  规则:
-    - 同一组内的设备必须一起直通（或都不直通）
-    - 不同组的设备可以独立直通
-    - ACS (Access Control Services) 允许分离设备到独立组
-    - 如果 ACS 不支持，下游设备可能与上游在同一组
+VFIO 侧:  irq_bypass_register_producer()  → token = ctx->trigger (eventfd)
+KVM 侧:   irq_bypass_register_consumer()  → token = irqfd->eventfd
+                ↓ token 相等
+          __connect()  (virt/lib/irqbypass.c:30)
+            └→ kvm_arch_irq_bypass_add_producer()  (arch/x86/kvm/x86.c:13665)
+                 └→ vmx_pi_update_irte()
+                      └→ intel_ir_set_vcpu_affinity()
+                           └→ modify_irte()  ← ★ IRTE 写成 Posted 模式
 ```
 
-### 5.2 IOMMU 域
+详见 phase6 corrections.md 勘误 4。
+
+### Q: `kvm_vfio_update_coherency()` 做什么？
+
+**文件**: `virt/kvm/vfio.c:120`
+
+```c
+static void kvm_vfio_update_coherency(struct kvm_device *dev)
+{
+    struct kvm_vfio *kv = dev->private;
+    bool noncoherent = false;
+
+    /* 遍历所有关联的 VFIO 文件 */
+    list_for_each_entry(kvf, &kv->file_list, node) {
+        if (!kvm_vfio_file_enforced_coherent(kvf->file)) {
+            noncoherent = true;
+            break;
+        }
+    }
+
+    if (noncoherent != kv->noncoherent) {
+        kv->noncoherent = noncoherent;
+        if (kv->noncoherent)
+            kvm_arch_register_noncoherent_dma(dev->kvm);   /* 需要软件维护一致性 */
+        else
+            kvm_arch_unregister_noncoherent_dma(dev->kvm);
+    }
+}
+```
+
+noncoherent DMA = 设备不保证 cache 一致性，KVM 需要在 VM-Exit 时刷新 cache。
+Intel VT-d 通常是 coherent 的（硬件保证），某些 ARM 平台可能不是。
+
+---
+
+## 9. DMA 映射：VFIO IOMMU Type 1
+
+### Q: `VFIO_IOMMU_MAP_DMA` 的完整路径？
+
+**文件**: `drivers/vfio/vfio_iommu_type1.c:1548`
+
+```c
+static int vfio_dma_do_map(struct vfio_iommu *iommu,
+                           struct vfio_iommu_type1_dma_map *map)
+{
+    dma_addr_t iova = map->iova;
+    unsigned long vaddr = map->vaddr;
+    size_t size = map->size;
+    int prot = 0;
+
+    /* ★ 设置权限 */
+    if (map->flags & VFIO_DMA_MAP_FLAG_WRITE) prot |= IOMMU_WRITE;
+    if (map->flags & VFIO_DMA_MAP_FLAG_READ)  prot |= IOMMU_READ;
+
+    /* ★ 对齐检查（必须页对齐） */
+    pgsize = (size_t)1 << __ffs(iommu->pgsize_bitmap);
+    if (!size || (size | iova | vaddr) & (pgsize - 1))
+        return -EINVAL;
+
+    /* ★ 检查 IOVA 范围是否空闲 */
+    dma = vfio_find_dma(iommu, iova, size);
+    if (dma) return -EEXIST;           /* 已存在映射 */
+
+    /* ★ 固定物理页 + 创建 IOMMU 映射 */
+    ret = vfio_pin_map_dma(iommu, dma, size);
+    /*   ├→ get_user_pages_fast()        ← 固定用户空间物理页 */
+    /*   ├→ 创建 vfio_pfn 记录           ← 记录映射的物理页 */
+    /*   └→ iommu_map()                  ← IOVA → PFN + 权限 → IOMMU 页表 */
+
+    /* ★ 加入红黑树 */
+    vfio_link_dma(iommu, dma);
+    return 0;
+}
+```
+
+### Q: DMA 映射涉及哪些安全约束？
+
+| 约束 | 来源 | 作用 |
+|------|------|------|
+| 对齐检查 | `size \| iova \| vaddr & (pgsize - 1)` | 防止非对齐映射 |
+| 内存锁定限制 | `RLIMIT_MEMLOCK` | 防止用户空间锁定过多内存 |
+| IOVA 不重叠 | `vfio_find_dma()` | 防止地址冲突 |
+| 页面固定 | `get_user_pages_fast()` | 防止 DMA 目标页被换出 |
+| IOMMU 翻译 | `iommu_map()` | 硬件强制隔离 |
+
+---
+
+## 10. IOMMU 组与设备隔离
+
+### Q: IOMMU 组是什么？怎么划分的？
 
 ```
-IOMMU 域管理:
+IOMMU 组 = 必须一起直通的设备集合
 
-  ┌─────────────────────────────────────────────┐
-  │           IOMMU Domain                       │
-  │                                             │
-  │  ┌─────────────┐                            │
-  │  │ iommu_domain│                            │
-  │  │             │                            │
-  │  │ geometry:   │                            │
-  │  │  aperture_start                               │
-  │  │  aperture_end                                 │
-  │  │  force_aperture                               │
-  │  │             │                            │
-  │  │ paging_ops: │ ← 页表操作回调             │
-  │  │  map/unmap  │                            │
-  │  │  iotlb_sync │                            │
-  │  └─────────────┘                            │
-  │                                             │
-  │  关联设备:                                    │
-  │    device 1 (NIC)  ───┐                     │
-  │    device 2 (extra)  ──┤── 共享同一 IOVA 空间│
-  │                        │                     │
-  │  IOVA 空间:             │                     │
-  │    [0x0000 - 0xFFFF]   │                     │
-  │    独立于系统物理地址    │                     │
-  │    由 IOMMU 翻译到 HPA  │                     │
-  └─────────────────────────────────────────────┘
+同一组内的设备:
+  - 必须一起直通（或都不直通）
+  - 共享同一个 IOMMU domain
+  - 不能独立隔离
+
+不同组的设备:
+  - 可以独立直通
+  - 各自有独立的 IOVA 空间
+```
+
+### Q: 组划分的关键代码？
+
+**文件**: `drivers/iommu/iommu.c:1543`（简化）
+
+```c
+static struct iommu_group *pci_device_group(struct device *dev)
+{
+    /* ★ Step 1: DMA 别名查找 */
+    pci_for_each_dma_alias(pdev, get_pci_alias_or_group, &data);
+    if (data.group) return data.group;     /* 找到已有组 */
+
+    /* ★ Step 2: ACS 隔离检查 */
+    for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
+        if (!bus->self) continue;
+        if (pci_acs_path_enabled(bus->self, NULL, REQ_ACS_FLAGS))
+            break;                          /* 上游隔离成立 → 停止 */
+        pdev = bus->self;                   /* 隔离不成立 → 把桥拉进同组 */
+    }
+
+    /* Step 3: 查找或创建组 */
+    ...
+}
+```
+
+### Q: `REQ_ACS_FLAGS` 包含哪些？
+
+**文件**: `drivers/iommu/iommu.c:1383`
+
+```c
+#define REQ_ACS_FLAGS   (PCI_ACS_SV | PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_UF)
+```
+
+| 标志 | 含义 | 作用 |
+|------|------|------|
+| `PCI_ACS_SV` | Source Validation | 验证请求来源 |
+| `PCI_ACS_RR` | P2P Request Redirect | 重定向 P2P 请求到上游 |
+| `PCI_ACS_CR` | P2P Completion Redirect | 重定向 P2P 完成到上游 |
+| `PCI_ACS_UF` | Upstream Forwarding | 上游转发 |
+
+**注意**：`pci_acs_flags_enabled()` 会先按设备声明的 `ACSCap` 掩码：
+
+```c
+/* 来源: drivers/pci/pci.c:3597 */
+pci_read_config_word(pdev, pos + PCI_ACS_CAP, &cap);
+acs_flags &= (cap | PCI_ACS_EC);     /* ★ 没声明的能力不算失败 */
+```
+
+只有「Cap 里声明了、Ctl 里没开」才返回 false。详见 CLAUDE.md 已知陷阱 #11。
+
+---
+
+## 11. DMA Ownership 认领时机
+
+### Q: DMA ownership 什么时候被认领？
+
+**文件**: `drivers/vfio/container.c:437`
+
+```c
+/* 旧 API（container FD）：在 SET_CONTAINER 时认领 */
+ret = iommu_group_claim_dma_owner(group->iommu_group, group);
+```
+
+**文件**: `drivers/vfio/group.c:373`（注释）
+
+```c
+/* With the container FD the iommu_group_claim_dma_owner() is done
+ * during SET_CONTAINER but for IOMMUFd this is done during
+ * VFIO_GROUP_GET_DEVICE_FD. */
+```
+
+| 路径 | 认领时机 |
+|------|---------|
+| container FD（旧） | `VFIO_GROUP_SET_CONTAINER` |
+| iommufd（新） | `VFIO_GROUP_GET_DEVICE_FD` |
+
+认领时如果同组有其他设备绑在普通驱动上，`owner_cnt > 0` → 返回 `-EPERM`。
+
+详见 phase6 corrections.md 勘误 1。
+
+### Q: 认领时的安全联锁？
+
+**文件**: `drivers/iommu/iommu.c:3184`
+
+```c
+static int __iommu_take_dma_ownership(struct iommu_group *group, void *owner)
+{
+    /* ★ 1. 分配 blocking domain */
+    ret = __iommu_group_alloc_blocking_domain(group);
+
+    /* ★ 2. 先切换到 blocking domain（所有 DMA 被拒） */
+    ret = __iommu_group_set_domain(group, group->blocking_domain);
+
+    /* ★ 3. 认领 ownership */
+    ...
+
+    /* ★ 4. 切换到 VFIO 的 domain */
+    ...
+}
+```
+
+```
+时序:
+  blocking_domain_attach_dev    ← 先阻断所有 DMA
+  iommu_group_claim_dma_owner   ← 认领
+  vfio_iommu_type1_attach_group ← 切换到 VFIO domain
+```
+
+blocking domain 确保 ownership 转移期间 DMA 窗口始终关闭。
+详见 phase6 corrections.md 勘误 3。
+
+---
+
+## 12. 设备 fd 与配置空间访问
+
+### Q: 用户态如何访问 PCI 配置空间？
+
+通过 `read()` / `write()` 系统调用：
+
+```c
+/* 来源: drivers/vfio/pci/vfio_pci_core.c */
+
+ssize_t vfio_pci_core_read(struct vfio_device *core_vdev, char __user *buf,
+                           size_t count, loff_t *ppos)
+{
+    /* 根据 *ppos 判断访问区域 */
+    if (*ppos < VFIO_PCI_OFFSET_DATA) {
+        /* 配置空间访问 → 读 PCI config */
+        ret = pci_read_config_byte/word/dword(pdev, ...);
+    }
+    ...
+}
+```
+
+**QEMU 侧**：
+
+```c
+/* QEMU 通过 device fd 的 read/write 访问配置空间 */
+pread(device_fd, buf, size, offset);  /* offset = VFIO_PCI_CONFIG_REGION_INDEX * page + reg */
 ```
 
 ---
 
-## 6. 调试技巧
+## 13. 完整调用链
 
-### 6.1 查看 VFIO 内部状态
-
-```bash
-# 查看已加载的 VFIO 模块
-lsmod | grep vfio
-
-# 查看 VFIO 组
-ls -la /dev/vfio/
-
-# 查看 IOMMU 组信息
-for g in /sys/kernel/iommu_groups/*; do
-    echo "Group $(basename $g):"
-    ls $g/devices/
-done
-
-# 查看 IOMMU 域
-dmesg | grep "iommu: Adding device"
-
-# 查看设备绑定状态
-readlink /sys/bus/pci/devices/0000:03:00.0/driver
 ```
+QEMU 设置 VFIO 设备直通的完整流程:
 
-### 6.2 IOMMU 调试
+  QEMU                                    KVM                    VFIO / IOMMU
+  ────                                    ───                    ────────────
 
-```bash
-# 启用 IOMMU 调试日志
-echo 1 > /sys/module/vfio_iommu_type1/parameters/unsafe_noiommu_mode 2>/dev/null
+  1. 打开 VFIO 容器
+     open("/dev/vfio/vfio") ──────────────────────────────────────▶
+       └→ vfio_fops_open()
 
-# 查看 IOMMU 页表（需要内核调试支持）
-cat /sys/kernel/debug/iommu/intel/0/domains
+  2. 检查 API 版本
+     ioctl(VFIO_GET_API_VERSION) ─────────────────────────────────▶
+       └→ return VFIO_API_VERSION (0)
 
-# 检查 DMAR 表
-acpidump | grep DMAR
+  3. 获取 VFIO 组
+     open("/dev/vfio/$GROUP") ────────────────────────────────────▶
+       └→ vfio_group_fops_open()
+
+  4. 关联组到容器
+     ioctl(VFIO_GROUP_SET_CONTAINER) ─────────────────────────────▶
+       └→ vfio_group_set_container()
+
+  5. 设置 IOMMU 类型
+     ioctl(VFIO_SET_IOMMU, TYPE1) ────────────────────────────────▶
+       └→ vfio_iommu_type1_attach_group()
+           └→ iommu_domain_alloc() + intel_iommu_attach_device()
+
+  6. ★ 关联组到 KVM VM（让 KVM 知道 VFIO 设备）
+     ioctl(KVM_DEV_VFIO_FILE_ADD, group_fd) ──▶
+       └→ kvm_vfio_file_add()
+           ├→ kvm_arch_start_assignment()      ← assigned_device_count++
+           ├→ kvm_vfio_file_set_kvm()
+           └→ kvm_vfio_update_coherency()
+
+  7. 获取设备 fd
+     ioctl(VFIO_GROUP_GET_DEVICE_FD) ─────────────────────────────▶
+       └→ vfio_group_get_device_fd()
+           └→ vfio_device_open()
+               └→ vfio_pci_open_device()
+                   └→ vfio_pci_core_enable()    ← 启用设备、读 MSI-X 信息
+
+  8. DMA 映射
+     ioctl(VFIO_IOMMU_MAP_DMA, {iova, vaddr, size}) ──────────────▶
+       └→ vfio_dma_do_map()
+           ├→ get_user_pages_fast()           ← 固定物理页
+           └→ iommu_map()                     ← IOVA → PFN
+
+  9. 查询 region 信息
+     ioctl(VFIO_DEVICE_GET_REGION_INFO) ──────────────────────────▶
+       └→ vfio_pci_ioctl_get_region_info()    ← BAR 地址/大小/flag
+
+  10. 映射 BAR 到 QEMU 地址空间
+      mmap(device_fd, bar_offset) ────────────────────────────────▶
+        └→ vfio_pci_core_mmap()
+            └→ remap_pfn_range()              ← QEMU 直接访问设备 MMIO
+
+  11. 查询中断信息
+      ioctl(VFIO_DEVICE_GET_IRQ_INFO, index=2) ──────────────────▶
+        └→ 返回 MSI-X 向量数量
+
+  12. 武装中断（eventfd 方式）
+      ioctl(VFIO_DEVICE_SET_IRQS, {index=2, DATA_EVENTFD, TRIGGER}) ▶
+        └→ vfio_pci_ioctl_set_irqs()
+            └→ vfio_msi_enable()
+                ├→ pci_alloc_irq_vectors()    ← 分配 MSI-X 向量
+                ├→ request_irq()              ← 注册 IRQ handler
+                └→ irq_bypass_register_producer()  ← ★ token = eventfd
+
+  13. ★ QEMU 侧 irqfd 配对（Posted Interrupts 的触发点）
+      ioctl(KVM_IRQFD, {fd=irqfd, gsi=N}) ──▶
+        └→ kvm_irqfd()
+            └→ irq_bypass_register_consumer() ← ★ token = irqfd eventfd
+                └→ token 匹配 → __connect()
+                    └→ kvm_arch_irq_bypass_add_producer()
+                        └→ vmx_pi_update_irte()
+                            └→ modify_irte()  ← ★ IRTE IM=1 (Posted)
+
+  14. VM 运行
+      ioctl(KVM_RUN) ──▶
+        └→ vcpu_enter_guest()
+            └→ VM-Entry
+               Guest 直接访问设备 MMIO（通过 mmap 映射）
+               Guest 发起 DMA → IOMMU 翻译 → 物理内存
+               设备中断 → IOMMU → PI Descriptor → vCPU（零 VM-Exit）
 ```
