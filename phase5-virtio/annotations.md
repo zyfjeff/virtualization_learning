@@ -1,928 +1,705 @@
-# Phase 5：源码精读注释 - vhost内核态加速
+# Phase 5：源码精读注释 - vhost 内核态加速
 
-> 基于 Linux 6.12.93 源码（实际代码行号已验证）
+> 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
+> 行号可能随版本变化，用函数名 grep 定位更可靠。
 
 ---
 
-## 1. vhost_dev 核心数据结构
+## 1. vhost_dev：设备级控制块
 
-**文件**: `drivers/vhost/vhost.h:174-210`
+### Q: `struct vhost_dev` 在 6.12.93 里长什么样？
+
+**文件**: `drivers/vhost/vhost.h:174`
 
 ```c
-/* 来源: drivers/vhost/vhost.h:174-210 */
-
 struct vhost_dev {
-	struct mm_struct *mm;             /* 用户空间内存映射 (QEMU的mm) */
-	struct mutex mutex;               /* 设备级互斥锁 */
-	struct vhost_virtqueue **vqs;     /* virtqueue 数组 */
-	int nvqs;                         /* virtqueue 数量 */
-	struct eventfd_ctx *log_ctx;      /* 日志上下文 */
-	struct vhost_iotlb *umem;         /* 用户空间内存映射 (IOTLB) */
-	struct vhost_iotlb *iotlb;        /* IOMMU页表 */
-	spinlock_t iotlb_lock;            /* IOTLB锁 */
-	struct list_head read_list;       /* 待读消息列表 */
-	struct list_head pending_list;    /* 待处理消息列表 */
-	wait_queue_head_t wait;           /* 等待队列 */
-	int iov_limit;                    /* 最大iov数量 */
-	int weight;                       /* 每次调度的最大包数 */
-	int byte_weight;                  /* 每次调度的最大字节数 */
-	struct xarray worker_xa;          /* ★ worker线程 xarray */
-	bool use_worker;                  /* 是否使用工作线程 */
-	bool fork_owner;                  /* 是否从owner继承(使用vhost_task) */
-
-	/* ASID消息处理回调 */
-	int (*msg_handler)(struct vhost_dev *dev, u32 asid,
-			   struct vhost_iotlb_msg *msg);
+    struct mm_struct *mm;              /* ★ 持有者(QEMU)的内存空间 */
+    struct mutex mutex;                /* 设备级互斥锁 */
+    struct vhost_virtqueue **vqs;      /* virtqueue 指针数组 */
+    int nvqs;                          /* vq 数量 */
+    struct eventfd_ctx *log_ctx;       /* 脏页日志 eventfd */
+    struct vhost_iotlb *umem;         /* 用户空间内存映射 */
+    struct vhost_iotlb *iotlb;        /* IOMMU 页表（有 IOMMU 时替代 umem） */
+    spinlock_t iotlb_lock;
+    struct list_head read_list;        /* 待读的 IOTLB 消息 */
+    struct list_head pending_list;     /* 待处理的 IOTLB 消息 */
+    wait_queue_head_t wait;            /* 等待队列 */
+    int iov_limit;                     /* 单次 IO 最大 iov 数 */
+    int weight;                        /* 每次调度最大包数 */
+    int byte_weight;                   /* 每次调度最大字节数 */
+    struct xarray worker_xa;           /* ★ 多 worker 线程管理（xarray） */
+    bool use_worker;                   /* 是否使用工作线程 */
+    bool fork_owner;                   /* true = vhost_task（继承 cgroups 等） */
+                                       /* false = kthread（只继承 cgroups） */
+    int (*msg_handler)(...);           /* ASID 消息回调 */
 };
 ```
 
-**关键变化 (相比旧版本)**：
-- `worker_xa` (xarray) 替代了旧的 `work_list` (llist) 管理多个 worker 线程
-- 每个 vhost_dev 可以有多个 worker，不再只有一个
-- `vq_mutex` 被替换为 `mutex` (设备级)
-- 新增 `fork_owner` 字段，控制 worker 线程创建方式
+### Q: `worker_xa` 替代了什么旧机制？
+
+旧版（< 5.x）只有一个全局 `work_list`（llist），对应一个 worker kthread。
+6.12.93 用 **xarray** 管理多个 worker，每个 vq 可以绑定不同 worker：
+
+| 旧版 | 6.12.93 |
+|------|---------|
+| 单 `work_list`（llist） | `worker_xa`（xarray），多 worker |
+| 唯一 kthread | vhost_task 或 kthread 可选 |
+| `use_mm()`/`unuse_mm()` | `kthread_use_mm()`/`kthread_unuse_mm()` |
+
+### Q: `fork_owner` 为什么有两种选择？
+
+```c
+/* 来源: drivers/vhost/vhost.h:191 */
+/*
+ * If fork_owner is true we use vhost_tasks to create
+ * the worker so all settings/limits like cgroups, NPROC,
+ * scheduler, etc are inherited from the owner.
+ * If false, we use kthreads and only attach to the same
+ * cgroups as the owner for compat with older kernels.
+ */
+bool fork_owner;
+```
+
+| `fork_owner = true` | `fork_owner = false` |
+|---|---|
+| `vhost_task` | `kthread` |
+| 继承 cgroups + NPROC + 调度策略 | 只附加 cgroups |
+| 行为像 fork()，对资源限制可预测 | 兼容旧内核行为 |
+
+默认值由模块参数 `fork_from_owner_default` 控制。
 
 ---
 
-## 2. vhost_dev_init() - vhost设备初始化
+## 2. vhost_virtqueue：队列级状态
 
-**文件**: `drivers/vhost/vhost.c:579-621`
+### Q: `struct vhost_virtqueue` 的核心字段？
+
+**文件**: `drivers/vhost/vhost.h:93`
 
 ```c
-/* 来源: drivers/vhost/vhost.c:579-621 */
+struct vhost_virtqueue {
+    struct vhost_dev *dev;
+    struct vhost_worker __rcu *worker;    /* ★ 关联的 worker（RCU 保护） */
 
+    struct mutex mutex;                    /* vq 级互斥锁 */
+    unsigned int num;                      /* 队列大小 */
+
+    /* ★ 三环的用户空间地址（不是内核虚拟地址！） */
+    vring_desc_t  __user *desc;
+    vring_avail_t __user *avail;
+    vring_used_t  __user *used;
+
+    struct file *kick;                     /* kick eventfd */
+    struct vhost_vring_call call_ctx;      /* ★ call eventfd + irq_bypass producer */
+    struct eventfd_ctx *error_ctx;
+    struct eventfd_ctx *log_ctx;
+
+    struct vhost_poll poll;                /* kick 通知的 poll 结构 */
+    vhost_work_fn_t handle_kick;           /* ★ kick 回调（handle_tx / handle_rx） */
+
+    u16 last_avail_idx;                    /* 上次处理到的 avail 索引 */
+    u16 avail_idx;                         /* 缓存的 avail.idx */
+    u16 last_used_idx;                     /* 上次写入的 used 索引 */
+    u16 used_flags;                        /* used ring flags */
+
+    /* ... iov/iotlb/log 等辅助字段省略 ... */
+
+    u64 acked_features;                    /* 已协商的 feature bits */
+    u64 acked_backend_features;            /* 已协商的 backend features */
+    u32 busyloop_timeout;                  /* 忙等超时（μs） */
+};
+```
+
+### Q: `call_ctx` 里为什么同时有 eventfd 和 irq_bypass_producer？
+
+```c
+/* 来源: drivers/vhost/vhost.h:87 */
+struct vhost_vring_call {
+    struct eventfd_ctx *ctx;                   /* 基础：eventfd 信号 */
+    struct irq_bypass_producer producer;       /* ★ 优化：irq_bypass 配对 */
+};
+```
+
+两个层次的中断注入：
+
+| 路径 | 何时使用 | 延迟 |
+|------|---------|------|
+| `eventfd_signal(ctx)` | 通用路径，所有场景 | ~5μs（回用户空间） |
+| `irq_bypass_producer` | VFIO 直通 + Posted Interrupts | ~0.5μs（硬件直投） |
+
+当 QEMU 同时配置了 irqfd + VFIO 直通设备时，irq_bypass 框架把 producer（VFIO 注册）
+和 consumer（KVM irqfd 注册）按 token（同一个 eventfd 上下文指针）配对：
+
+```c
+/* 来源: virt/lib/irqbypass.c:108 */
+if (consumer->token == producer->token) {
+    ret = __connect(producer, consumer);
+    /* → kvm_arch_irq_bypass_add_producer() → vmx_pi_update_irte() */
+    /*   → IRTE 写成 Posted 模式 */
+}
+```
+
+**注意**：这走的是完全独立于 `KVM_DEV_VFIO_FILE_ADD` 的路径。详见 phase6 corrections.md 勘误 4。
+
+---
+
+## 3. vhost_dev_init()：初始化
+
+### Q: 初始化做了什么？签名和旧版有何不同？
+
+**文件**: `drivers/vhost/vhost.c:579`
+
+```c
 void vhost_dev_init(struct vhost_dev *dev,
-		    struct vhost_virtqueue **vqs, int nvqs,
-		    int iov_limit, int weight, int byte_weight,
-		    bool use_worker,
-		    int (*msg_handler)(struct vhost_dev *dev, u32 asid,
-				       struct vhost_iotlb_msg *msg))
+                    struct vhost_virtqueue **vqs, int nvqs,
+                    int iov_limit, int weight, int byte_weight,
+                    bool use_worker,
+                    int (*msg_handler)(struct vhost_dev *dev, u32 asid,
+                                       struct vhost_iotlb_msg *msg))
 {
-	struct vhost_virtqueue *vq;
-	int i;
+    /* ★ 基础字段 */
+    dev->vqs = vqs;
+    dev->nvqs = nvqs;
+    mutex_init(&dev->mutex);
+    dev->iov_limit = iov_limit;
+    dev->weight = weight;          /* 每次调度最大包数 */
+    dev->byte_weight = byte_weight;
+    dev->use_worker = use_worker;
+    dev->fork_owner = fork_from_owner_default;
 
-	/* ============================================
-	 * Step 1: 初始化基础字段
-	 * ============================================ */
-	dev->vqs = vqs;
-	dev->nvqs = nvqs;
-	mutex_init(&dev->mutex);              /* 设备级互斥锁 */
-	dev->log_ctx = NULL;
-	dev->umem = NULL;
-	dev->iotlb = NULL;
-	dev->mm = NULL;
-	dev->iov_limit = iov_limit;
-	dev->weight = weight;
-	dev->byte_weight = byte_weight;
-	dev->use_worker = use_worker;
-	dev->msg_handler = msg_handler;
-	dev->fork_owner = fork_from_owner_default;
-	init_waitqueue_head(&dev->wait);
-	INIT_LIST_HEAD(&dev->read_list);
-	INIT_LIST_HEAD(&dev->pending_list);
-	spin_lock_init(&dev->iotlb_lock);
+    xa_init_flags(&dev->worker_xa, XA_FLAGS_ALLOC);  /* ★ xarray 管理 worker */
 
-	/* ★ 使用 xarray 管理 worker 线程 */
-	xa_init_flags(&dev->worker_xa, XA_FLAGS_ALLOC);
-
-	/* ============================================
-	 * Step 2: 初始化每个 virtqueue
-	 * ============================================ */
-	for (i = 0; i < dev->nvqs; ++i) {
-		vq = dev->vqs[i];
-		vq->log = NULL;
-		vq->indirect = NULL;
-		vq->heads = NULL;
-		vq->dev = dev;
-		mutex_init(&vq->mutex);           /* 每个vq独立的互斥锁 */
-		vhost_vq_reset(dev, vq);
-		if (vq->handle_kick)
-			vhost_poll_init(&vq->poll, vq->handle_kick,
-					EPOLLIN, dev, vq);
-	}
+    /* ★ 初始化每个 vq */
+    for (i = 0; i < dev->nvqs; ++i) {
+        vq = dev->vqs[i];
+        vq->dev = dev;
+        mutex_init(&vq->mutex);
+        vhost_vq_reset(dev, vq);
+        if (vq->handle_kick)
+            vhost_poll_init(&vq->poll, vq->handle_kick,
+                            EPOLLIN, dev, vq);   /* ★ 注册 kick 的 poll 回调 */
+    }
 }
 ```
 
-**函数签名对比**：
-```
-旧版 (文档原始): vhost_dev_init(dev, vqs, nvqs, iov_limit, lock_limit,
-                                   name, use_worker, poll)
-实际 6.12.93:   vhost_dev_init(dev, vqs, nvqs, iov_limit, weight,
-                                byte_weight, use_worker, msg_handler)
-```
+### Q: `vhost_dev_init` 签名变化对比？
+
+| 版本 | 签名 |
+|------|------|
+| 旧版 (< 6.x) | `(dev, vqs, nvqs, iov_limit, lock_limit, name, use_worker, poll)` |
+| **6.12.93** | `(dev, vqs, nvqs, iov_limit, weight, byte_weight, use_worker, msg_handler)` |
+
+变化要点：
+- `lock_limit` 和 `name` 被移除
+- 新增 `weight`、`byte_weight`（调度权重限制）
+- `poll` 回调改为 `msg_handler`（ASID 消息处理）
+- `vhost_dev_init` **不创建 worker 线程** — worker 在 `vhost_dev_set_owner()` 时创建
 
 ---
 
-## 3. vhost工作线程 - 新架构
+## 4. Worker 线程：新旧架构
 
-**文件**: `drivers/vhost/vhost.c:390-470`
+### Q: 6.12.93 的 worker 架构长什么样？
 
-6.12.93 中 vhost 的工作线程架构已经完全重构，不再使用单一的 `vhost_worker()` 函数，而是支持多个 worker 线程（通过 xarray 管理）。
-
-### 3.1 kthread模式的工作线程
-
-```c
-/* 来源: drivers/vhost/vhost.c:400-435 */
-
-/*
- * vhost_run_work_kthread_list - kthread模式的工作循环
- *
- * 这是传统的 kthread 工作线程实现
- */
-static int vhost_run_work_kthread_list(void *data)
-{
-	struct vhost_worker *worker = data;
-	struct vhost_work *work, *work_next;
-	struct vhost_dev *dev = worker->dev;
-	struct llist_node *node;
-
-	/* ★ 使用QEMU的内存空间 (替代旧的 use_mm) */
-	kthread_use_mm(dev->mm);
-
-	for (;;) {
-		set_current_state(TASK_INTERRUPTIBLE);
-
-		if (kthread_should_stop()) {
-			__set_current_state(TASK_RUNNING);
-			break;
-		}
-
-		/* 从 worker 的 llist 中取出所有工作 */
-		node = llist_del_all(&worker->work_list);
-		if (!node)
-			schedule();              /* 没有工作则让出CPU */
-
-		/* 反转链表顺序 (FIFO) */
-		node = llist_reverse_order(node);
-		smp_wmb();
-
-		/* ★ 处理所有工作 */
-		llist_for_each_entry_safe(work, work_next, node, node) {
-			clear_bit(VHOST_WORK_QUEUED, &work->flags);
-			__set_current_state(TASK_RUNNING);
-			kcov_remote_start_common(worker->kcov_handle);
-			work->fn(work);          /* 调用工作函数 */
-			kcov_remote_stop();
-			cond_resched();          /* 适时让出CPU */
-		}
-	}
-
-	kthread_unuse_mm(dev->mm);       /* 释放QEMU的内存空间 */
-	return 0;
-}
 ```
+新架构 (6.12.93):
 
-### 3.2 vhost_task模式的工作循环
-
-```c
-/* 来源: drivers/vhost/vhost.c:437-465 */
-
-/*
- * vhost_run_work_list - vhost_task模式的工作处理
- *
- * 新的 vhost_task 模式将调度逻辑分离出来
- * 只处理工作列表，不涉及线程生命周期
- */
-static bool vhost_run_work_list(void *data)
-{
-	struct vhost_worker *worker = data;
-	struct vhost_work *work, *work_next;
-	struct llist_node *node;
-
-	node = llist_del_all(&worker->work_list);
-	if (node) {
-		__set_current_state(TASK_RUNNING);
-
-		node = llist_reverse_order(node);
-		smp_wmb();
-		llist_for_each_entry_safe(work, work_next, node, node) {
-			clear_bit(VHOST_WORK_QUEUED, &work->flags);
-			kcov_remote_start_common(worker->kcov_handle);
-			work->fn(work);
-			kcov_remote_stop();
-			cond_resched();
-		}
-	}
-
-	return !!node;
-}
-```
-
-**工作线程架构变化**：
-```
-旧架构 (单worker):
-  vhost_dev
-    └── work_list (llist)
-        └── vhost_worker()  ← 唯一的kthread
-            └── for(;;) { schedule(); llist_del_all(); 处理; }
-
-新架构 (多worker, 6.12.93):
   vhost_dev
     └── worker_xa (xarray)
-        ├── worker[0] (vhost_task 或 kthread)
-        │   └── work_list (llist)
-        ├── worker[1]
-        │   └── work_list (llist)
-        └── worker[N]
-            └── work_list (llist)
+         ├── worker[0] (vhost_task 或 kthread)
+         │    ├── work_list (llist_head)
+         │    ├── mutex (序列化 flush)
+         │    ├── kcov_handle
+         │    └── id, attachment_cnt, killed
+         ├── worker[1]
+         │    └── ...
+         └── worker[N]
+              └── ...
+    每个 vq 通过 vq->worker (RCU) 指向一个 worker
 ```
 
----
-
-## 4. vhost_get_vq_desc() - 读取virtqueue描述符
-
-**文件**: `drivers/vhost/vhost.c:2786-2904`
+**文件**: `drivers/vhost/vhost.h:39`
 
 ```c
-/* 来源: drivers/vhost/vhost.c:2786-2904 */
+struct vhost_worker {
+    struct task_struct *kthread_task;     /* kthread 模式的任务 */
+    struct vhost_task *vtsk;              /* vhost_task 模式的封装 */
+    struct vhost_dev *dev;
+    struct mutex mutex;                   /* 序列化 flush */
+    struct llist_head work_list;          /* ★ 无锁工作队列 */
+    u64 kcov_handle;
+    u32 id;
+    int attachment_cnt;
+    bool killed;
+    const struct vhost_worker_ops *ops;
+};
+```
 
-int vhost_get_vq_desc(struct vhost_virtqueue *vq,
-		      struct iovec iov[], unsigned int iov_size,
-		      unsigned int *out_num, unsigned int *in_num,
-		      struct vhost_log *log, unsigned int *log_num)
+### Q: vhost_task 模式和 kthread 模式的区别？
+
+**文件**: `drivers/vhost/vhost.c:437`（vhost_task 模式）
+
+```c
+static bool vhost_run_work_list(void *data)
 {
-	struct vring_desc desc;
-	unsigned int i, head, found = 0;
-	u16 last_avail_idx = vq->last_avail_idx;
-	__virtio16 ring_head;
-	int ret, access;
+    struct vhost_worker *worker = data;
+    struct llist_node *node;
 
-	/* ============================================
-	 * Step 1: 检查是否有新的描述符
-	 * ============================================ */
-	if (vq->avail_idx == vq->last_avail_idx) {
-		ret = vhost_get_avail_idx(vq);    /* ★ 从用户空间读取avail_idx */
-		if (unlikely(ret < 0))
-			return ret;
-		if (!ret)
-			return vq->num;               /* 没有新的描述符 */
-	}
-
-	/* ============================================
-	 * Step 2: 获取avail ring中的描述符索引
-	 * ============================================ */
-	if (unlikely(vhost_get_avail_head(vq, &ring_head, last_avail_idx))) {
-		vq_err(vq, "Failed to read head: idx %d address %p\n",
-		       last_avail_idx,
-		       &vq->avail->ring[last_avail_idx % vq->num]);
-		return -EFAULT;
-	}
-
-	head = vhost16_to_cpu(vq, ring_head);
-
-	if (unlikely(head >= vq->num)) {
-		vq_err(vq, "Guest says index %u > %u is available",
-		       head, vq->num);
-		return -EINVAL;
-	}
-
-	/* ============================================
-	 * Step 3: 遍历描述符链
-	 * ============================================ */
-	*out_num = *in_num = 0;
-	if (unlikely(log))
-		*log_num = 0;
-
-	i = head;
-	do {
-		unsigned iov_count = *in_num + *out_num;
-
-		if (unlikely(i >= vq->num)) {
-			vq_err(vq, "Desc index is %u > %u, head = %u",
-			       i, vq->num, head);
-			return -EINVAL;
-		}
-		if (unlikely(++found > vq->num)) {
-			vq_err(vq, "Loop detected: last one at %u "
-			       "vq size %u head %u\n", i, vq->num, head);
-			return -EINVAL;
-		}
-
-		/* ★ 读取描述符 (从用户空间拷贝) */
-		ret = vhost_get_desc(vq, &desc, i);
-		if (unlikely(ret))
-			return -EFAULT;
-
-		/* 处理间接描述符 */
-		if (desc.flags & cpu_to_vhost16(vq, VRING_DESC_F_INDIRECT)) {
-			ret = get_indirect(vq, iov, iov_size,
-					   out_num, in_num,
-					   log, log_num, &desc);
-			if (unlikely(ret < 0))
-				return ret;
-			continue;
-		}
-
-		/* 判断访问方向 */
-		if (desc.flags & cpu_to_vhost16(vq, VRING_DESC_F_WRITE))
-			access = VHOST_ACCESS_WO;    /* 可写 = 输入 */
-		else
-			access = VHOST_ACCESS_RO;    /* 只读 = 输出 */
-
-		/* ★ 地址翻译: Guest物理地址 → 内核虚拟地址 */
-		ret = translate_desc(vq, vhost64_to_cpu(vq, desc.addr),
-				     vhost32_to_cpu(vq, desc.len),
-				     iov + iov_count,
-				     iov_size - iov_count, access);
-		if (unlikely(ret < 0))
-			return ret;
-
-		if (access == VHOST_ACCESS_WO) {
-			*in_num += ret;
-			if (unlikely(log && ret)) {
-				log[*log_num].addr = vhost64_to_cpu(vq, desc.addr);
-				log[*log_num].len = vhost32_to_cpu(vq, desc.len);
-				++*log_num;
-			}
-		} else {
-			if (unlikely(*in_num)) {
-				vq_err(vq, "Descriptor has out after in");
-				return -EINVAL;
-			}
-			*out_num += ret;
-		}
-	} while ((i = next_desc(vq, &desc)) != -1);
-
-	/* 递增avail索引 */
-	vq->last_avail_idx++;
-
-	BUG_ON(!(vq->used_flags & VRING_USED_F_NO_NOTIFY));
-	return head;
-}
-```
-
-**关键差异 (vs 旧版文档)**：
-- 返回值: `int` (可为负错误码)，旧文档写 `unsigned`
-- 使用 `vhost_get_avail_idx()` / `vhost_get_avail_head()` 替代直接 `vhost_get_user()`
-- 使用 `translate_desc()` 进行地址翻译，替代直接设置iov地址
-- 新增 `vhost_get_desc()` 读取描述符
-- 支持间接描述符 (`VRING_DESC_F_INDIRECT`)
-- 新增循环检测 (`found > vq->num`)
-
----
-
-## 5. vhost_add_used() - 写入used ring
-
-**文件**: `drivers/vhost/vhost.c:2915-2924`
-
-```c
-/* 来源: drivers/vhost/vhost.c:2915-2924 */
-
-/*
- * vhost_add_used - 向 used ring 添加一个已使用的描述符
- *
- * 返回: 0 成功, 负数错误码
- * 注意: 返回类型是 int (不是 void!)
- */
-int vhost_add_used(struct vhost_virtqueue *vq, unsigned int head, int len)
-{
-	struct vring_used_elem heads = {
-		cpu_to_vhost32(vq, head),
-		cpu_to_vhost32(vq, len)
-	};
-
-	return vhost_add_used_n(vq, &heads, 1);
-}
-```
-
-**底层实现** (`__vhost_add_used_n`):
-```c
-/* 来源: drivers/vhost/vhost.c (紧接 vhost_add_used 之后) */
-
-static int __vhost_add_used_n(struct vhost_virtqueue *vq,
-			    struct vring_used_elem *heads,
-			    unsigned count)
-{
-	vring_used_elem_t __user *used;
-	u16 old, new;
-	int start;
-
-	start = vq->last_used_idx & (vq->num - 1);
-	used = vq->used->ring + start;
-
-	/* ★ 写入 used ring (通过 vhost_put_used → copy_to_user) */
-	if (vhost_put_used(vq, heads, start, count)) {
-		vq_err(vq, "Failed to write used");
-		return -EFAULT;
-	}
-
-	/* 脏页日志 */
-	if (unlikely(vq->log_used)) {
-		smp_wmb();   /* 确保数据先于日志写入 */
-		log_used(vq, ((void __user *)used - (void __user *)vq->used),
-			 count * sizeof *used);
-	}
-
-	old = vq->last_used_idx;
-	new = (vq->last_used_idx += count);
-
-	/* 处理索引回绕 */
-	if (unlikely((u16)(new - vq->signalled_used) < (u16)(new - old)))
-		vq->signalled_used_valid = false;
-
-	return 0;
-}
-```
-
-**关键差异 (vs 旧版文档)**：
-- 返回 `int` (不是 `void`)
-- 使用 `vhost_put_used()` (封装了 copy_to_user)，替代直接 `vhost_put_user()`
-- `smp_wmb()` 仅在需要日志时执行
-- 通过 `vhost_add_used_n()` 支持批量添加
-
----
-
-## 6. vhost与KVM交互 - 中断注入
-
-```c
-/* vhost如何注入中断到Guest */
-
-/*
- * 方法1: eventfd (标准方式)
- *
- * 设备 → eventfd_signal() → eventfd → QEMU → ioctl(KVM_IRQ_LINE) → KVM
- *
- * 优点: 通用, 不依赖KVM内部
- * 缺点: 需要用户态介入, 延迟较高 (~5μs)
- */
-
-/*
- * 方法2: irqfd + irq_bypass (优化方式)
- *
- * 当VFIO设备直通时:
- *   设备MSI → IOMMU (IRTE) → Posted Interrupt → vCPU
- *
- * 中断完全绕过QEMU和KVM软件注入:
- *   - 设备直接通过IOMMU投递中断到vCPU的PI描述符
- *   - 硬件自动将PIR同步到IRR
- *   - 零VM-Exit (如果Guest在运行中)
- *   - 延迟: 最低 (~0.5μs)
- *
- * 初始化路径:
- *   QEMU: eventfd → irqfd
- *   KVM:  kvm_vfio_setup_pi_irte()
- *         → kvm_x86_call(pi_update_irte)()
- *           → vmx_pi_update_irte()
- *             IRTE.PDA = __pa(&vmx->pi_desc)
- *             IRTE.DM = 1 (PI模式)
- */
-```
-
----
-
-## 7. 关键数据结构关系图
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  vhost 核心数据结构关系 (6.12.93)                                │
-│                                                                  │
-│  ┌─────────────────┐                                            │
-│  │ struct vhost_dev│←──── vhost设备                              │
-│  └────────┬────────┘                                            │
-│           │                                                     │
-│           ├──→ mutex (设备级互斥锁)                              │
-│           │                                                     │
-│           ├──→ vqs[] (virtqueue数组)                            │
-│           │    └──→ struct vhost_virtqueue                      │
-│           │         ├── dev (所属设备)                           │
-│           │         ├── mutex (vq级互斥锁)                      │
-│           │         ├── last_avail_idx                          │
-│           │         ├── last_used_idx                           │
-│           │         ├── avail_idx (缓存的avail索引)             │
-│           │         ├── desc (描述符表, 用户空间地址)            │
-│           │         ├── avail (avail ring, 用户空间地址)         │
-│           │         ├── used (used ring, 用户空间地址)           │
-│           │         ├── worker (关联的worker, xarray索引)        │
-│           │         ├── poll (kick通知的poll结构)               │
-│           │         └── iotlb (vq级IOTLB)                       │
-│           │                                                     │
-│           ├──→ worker_xa (xarray, 管理多个worker)               │
-│           │    └──→ struct vhost_worker                         │
-│           │         ├── dev (所属设备)                           │
-│           │         ├── work_list (llist, 待处理工作)            │
-│           │         ├── task / kthread (线程)                   │
-│           │         ├── mutex                                    │
-│           │         └── kcov_handle                              │
-│           │                                                     │
-│           ├──→ mm (QEMU的内存空间)                              │
-│           │    └→ 通过 kthread_use_mm() / vhost_task 访问       │
-│           │                                                     │
-│           ├──→ umem (IOTLB内存映射)                             │
-│           ├──→ iotlb (IOMMU页表)                                │
-│           └──→ iotlb_lock (IOTLB操作锁)                         │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 8. 与旧版本的关键差异总结
-
-```
-┌─────────────────────┬──────────────────────────┬──────────────────────────┐
-│ 特性                │ 旧版 (< 6.x)             │ 6.12.93                  │
-├─────────────────────┼──────────────────────────┼──────────────────────────┤
-│ Worker线程管理       │ 单一work_list (llist)    │ worker_xa (xarray)       │
-│                     │ 一个全局kthread          │ 多个worker (per-vq或更多) │
-├─────────────────────┼──────────────────────────┼──────────────────────────┤
-│ Worker创建          │ kthread_create()         │ vhost_task 或 kthread    │
-│                     │                          │ (根据fork_owner选择)      │
-├─────────────────────┼──────────────────────────┼──────────────────────────┤
-│ 内存空间访问        │ use_mm(dev->mm)          │ kthread_use_mm(dev->mm)  │
-│                     │ unuse_mm(dev->mm)        │ kthread_unuse_mm(dev->mm)│
-├─────────────────────┼──────────────────────────┼──────────────────────────┤
-│ vhost_dev_init签名  │ (..., lock_limit, name,  │ (..., weight,            │
-│                     │  use_worker, poll)       │  byte_weight, use_worker,│
-│                     │                          │  msg_handler)            │
-├─────────────────────┼──────────────────────────┼──────────────────────────┤
-│ vhost_get_vq_desc   │ 返回 unsigned            │ 返回 int (可为负错误码)  │
-│                     │ 直接 vhost_get_user()    │ vhost_get_desc()         │
-│                     │                          │ + translate_desc()       │
-├─────────────────────┼──────────────────────────┼──────────────────────────┤
-│ vhost_add_used      │ 返回 void                │ 返回 int                 │
-│                     │ 直接 vhost_put_user()    │ vhost_put_used()         │
-│                     │                          │ + vhost_add_used_n()     │
-├─────────────────────┼──────────────────────────┼──────────────────────────┤
-│ set_fs(KERNEL_DS)   │ 使用                     │ 已移除 (不安全)          │
-├─────────────────────┼──────────────────────────┼──────────────────────────┤
-│ 中断注入            │ eventfd → QEMU → KVM    │ irqfd + Posted Interrupts│
-│                     │                          │ (bypass QEMU)            │
-└─────────────────────┴──────────────────────────┴──────────────────────────┘
-```
-
----
-
-## 9. Virtio Queue 核心代码分析
-
-### 代码层面深度分析
-
-让我们深入内核源码，看看 Virtio Queue 的实际实现。
-
-#### 1. vring 初始化
-
-```c
-/* drivers/virtio/virtio_ring.c */
-
-/* vring 初始化 - 设置 virtqueue 的内存布局 */
-struct virtqueue *vring_create_virtqueue(
-    unsigned int index,
-    unsigned int num,
-    unsigned int vring_align,
-    struct virtio_device *vdev,
-    bool weak_barriers,
-    bool ctx,
-    bool (*notify)(struct virtqueue *),
-    void (*callback)(struct virtqueue *),
-    const char *name)
-{
-    struct vring_virtqueue *vq;
-    void *queue;
-    
-    /* 计算 vring 总大小 */
-    /* 包括：描述符表 + avail ring + used ring */
-    size_t queue_size = vring_size(num, vring_align);
-    
-    /* 分配连续的内存区域 */
-    queue = kmalloc(queue_size, GFP_KERNEL);
-    
-    /* 初始化 vring 结构 */
-    struct vring vring;
-    vring_init(&vring, num, queue, vring_align);
-    
-    /* vring_init 实际做的事: */
-    /*
-     * vring.desc = queue;                          // 描述符表起始地址
-     * vring.avail = (struct vring_avail *)(queue + 
-     *                   num * sizeof(struct vring_desc));  // avail ring
-     * vring.used = (struct vring_used *)(((uintptr_t)&vring.avail->ring[num] + 
-     *                   sizeof(__virtio16) + vring_align - 1) & ~(vring_align - 1));
-     */
-    
-    /* 创建 virtqueue 结构 */
-    vq = kmalloc(sizeof(*vq), GFP_KERNEL);
-    vq->vq.vring = vring;
-    vq->vq.index = index;
-    vq->num = num;
-    vq->notify = notify;
-    vq->callback = callback;
-    
-    /* 初始化索引 */
-    vq->last_used_idx = 0;
-    vq->num_added = 0;
-    
-    return &vq->vq;
-}
-```
-
-#### 2. 驱动侧：添加 buffer 到 avail ring
-
-```c
-/* drivers/virtio/virtio_ring.c */
-
-/* 驱动侧：添加 buffer 到 virtqueue */
-int virtqueue_add(struct virtqueue *_vq,
-                  struct scatterlist *sgs,
-                  unsigned int out_sgs,
-                  unsigned int in_sgs,
-                  void *data,
-                  const void *ctx,
-                  gfp_t gfp)
-{
-    struct vring_virtqueue *vq = to_vvq(_vq);
-    struct vring_desc *desc;
-    unsigned int i;
-    
-    /* 1. 获取下一个可用的描述符索引 */
-    /* avail.idx 指向下一个可用位置 */
-    unsigned int head = vq->free_head;
-    
-    /* 2. 填充描述符链 */
-    desc = vq->vring.desc;
-    i = head;
-    
-    /* 填充输出描述符（设备只读） */
-    for (unsigned int n = 0; n < out_sgs; n++) {
-        desc[i].addr = sg_phys(sgs[n]);  // Guest 物理地址
-        desc[i].len = sg_len(sgs[n]);
-        desc[i].flags = 0;  // 设备只读
-        
-        if (n + 1 < out_sgs + in_sgs) {
-            /* 还有后续描述符，设置 NEXT 标志 */
-            desc[i].flags |= VRING_DESC_F_NEXT;
-            desc[i].next = ++i;
+    node = llist_del_all(&worker->work_list);  /* ★ 原子取走全部工作 */
+    if (node) {
+        __set_current_state(TASK_RUNNING);
+        node = llist_reverse_order(node);       /* 反转 → FIFO 顺序 */
+        smp_wmb();
+        llist_for_each_entry_safe(work, work_next, node, node) {
+            clear_bit(VHOST_WORK_QUEUED, &work->flags);
+            work->fn(work);                     /* ★ 执行工作函数 */
+            cond_resched();
         }
     }
-    
-    /* 填充输入描述符（设备可写） */
-    for (unsigned int n = 0; n < in_sgs; n++) {
-        desc[i].addr = sg_phys(sgs[out_sgs + n]);
-        desc[i].len = sg_len(sgs[out_sgs + n]);
-        desc[i].flags = VRING_DESC_F_WRITE;  // 设备可写
-        
-        if (n + 1 < in_sgs) {
-            desc[i].flags |= VRING_DESC_F_NEXT;
-            desc[i].next = ++i;
-        }
+    return !!node;
+}
+```
+
+**文件**: `drivers/vhost/vhost.c:400`（kthread 模式）
+
+```c
+static int vhost_run_work_kthread_list(void *data)
+{
+    struct vhost_worker *worker = data;
+    kthread_use_mm(dev->mm);                   /* ★ 借用 QEMU 的内存空间 */
+
+    for (;;) {
+        set_current_state(TASK_INTERRUPTIBLE);
+        if (kthread_should_stop()) break;
+
+        node = llist_del_all(&worker->work_list);
+        if (!node)
+            schedule();                         /* 无工作 → 睡眠 */
+
+        /* 处理工作（同 vhost_run_work_list） */
+        ...
     }
-    
-    /* 3. 更新 free_head，指向下一个空闲描述符 */
-    vq->free_head = desc[i].next;
-    
-    /* 4. 将描述符链的头索引写入 avail ring */
-    /* 关键：使用 memory barrier 确保描述符先写入 */
-    virtio_wmb(vq->weak_barriers);
-    
-    /* avail.ring[idx % num] = head */
-    vq->vring.avail->ring[vq->avail_idx_shadow & (vq->vring.num - 1)] = head;
-    
-    /* 5. 递增 avail.idx */
-    vq->avail_idx_shadow++;
-    
-    /* 关键：使用 memory barrier 确保 idx 更新在最后 */
-    virtio_wmb(vq->weak_barriers);
-    vq->vring.avail->idx = vq->avail_idx_shadow;
-    
-    /* 6. 检查是否需要 kick 设备 */
-    /* 使用 Event Index 优化：避免不必要的 kick */
-    if (virtqueue_need_kick(vq)) {
-        /* 触发 VM-Exit，通知设备 */
-        vq->notify(&vq->vq);
-    }
-    
+
+    kthread_unuse_mm(dev->mm);
     return 0;
 }
+```
 
-/* 判断是否需要 kick 的逻辑 */
-static inline bool virtqueue_need_kick(struct vring_virtqueue *vq)
+| | kthread 模式 | vhost_task 模式 |
+|---|---|---|
+| 生命周期 | `kthread_create` + `kthread_stop` | `vhost_task_create` + `vhost_task_stop` |
+| 内存空间 | `kthread_use_mm()` 显式借用 | `vhost_task` 内部自动管理 |
+| 资源继承 | 只继承 cgroups | 继承 cgroups + NPROC + 调度策略 |
+| 工作处理 | 自含 for 循环 + schedule | 外层循环由 vhost_task 框架驱动 |
+
+---
+
+## 5. vhost_get_vq_desc()：读取 avail ring
+
+### Q: 从 avail ring 到 iovec，经过了哪些步骤？
+
+**文件**: `drivers/vhost/vhost.c:2786`
+
+```c
+int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+                      struct iovec iov[], unsigned int iov_size,
+                      unsigned int *out_num, unsigned int *in_num,
+                      struct vhost_log *log, unsigned int *log_num)
 {
-    /* 如果设备支持 Event Index */
-    if (virtio_has_feature(vq->vq.vdev, VIRTIO_RING_F_EVENT_IDX)) {
-        /* 读取设备侧的 avail_event */
-        __virtio16 avail_event = vring_avail_event(&vq->vring);
-        
-        /* 判断：当前 idx 是否 >= avail_event */
-        /* 如果是，说明设备已经处理完了之前的请求，需要新的 kick */
-        return vring_need_event(avail_event, vq->avail_idx_shadow, 
-                                vq->avail_idx_shadow - vq->num_added);
+    /* ★ Step 1: 检查 avail ring 是否有新描述符 */
+    if (vq->avail_idx == vq->last_avail_idx) {
+        ret = vhost_get_avail_idx(vq);       /* 从用户空间读 avail.idx */
+        if (!ret) return vq->num;            /* 无新描述符 */
     }
-    
-    /* 否则，检查 used ring 的 flags */
-    return !(vq->vring.used->flags & VRING_USED_F_NO_NOTIFY);
+
+    /* ★ Step 2: 读 avail ring 中的描述符索引 */
+    vhost_get_avail_head(vq, &ring_head, last_avail_idx);
+    head = vhost16_to_cpu(vq, ring_head);
+
+    /* ★ Step 3: 遍历描述符链 */
+    i = head;
+    do {
+        /* 安全检查 */
+        if (unlikely(i >= vq->num))   return -EINVAL;
+        if (unlikely(++found > vq->num)) return -EINVAL;  /* 循环检测 */
+
+        /* 读描述符（从用户空间拷贝） */
+        ret = vhost_get_desc(vq, &desc, i);
+
+        /* 间接描述符 */
+        if (desc.flags & VRING_DESC_F_INDIRECT) {
+            ret = get_indirect(vq, iov, ...);
+            continue;
+        }
+
+        /* ★ 地址翻译: Guest 地址 → 宿主用户空间地址 */
+        ret = translate_desc(vq, desc.addr, desc.len,
+                             iov + iov_count, iov_size - iov_count,
+                             access);
+
+        /* 分类: 输出(RO) vs 输入(WO) */
+        if (access == VHOST_ACCESS_WO) *in_num += ret;
+        else                           *out_num += ret;
+
+    } while ((i = next_desc(vq, &desc)) != -1);
+
+    vq->last_avail_idx++;
+    return head;     /* ★ 返回描述符链的头索引，供 vhost_add_used() 使用 */
 }
 ```
 
-#### 3. 设备侧（vhost）：处理 avail ring
+### Q: 为什么返回值是 `int` 而非 `unsigned`？
+
+旧版返回 `unsigned`，用 `vq->num` 表示「无描述符」。6.12.93 返回 `int`，可以是负错误码：
+
+| 返回值 | 含义 |
+|--------|------|
+| `>= 0` | 描述符链头索引 |
+| `vq->num` | 无新描述符（仍为非负） |
+| `-EFAULT` | 用户空间访问失败 |
+| `-EINVAL` | 描述符索引越界或循环 |
+| `-EAGAIN` | IOTLB miss，需等待翻译 |
+| `-EPERM` | 权限不匹配 |
+
+### Q: `translate_desc()` 做了什么？
+
+**文件**: `drivers/vhost/vhost.c:2624`
 
 ```c
-/* drivers/vhost/vhost.c */
-
-/* vhost 侧：从 avail ring 获取描述符 */
-int vhost_get_vq_desc(struct vhost_virtqueue *vq,
-                      struct iovec iov[],
-                      unsigned int iov_size,
-                      unsigned int *out_num,
-                      unsigned int *in_num,
-                      vhost_logger_t logger,
-                      unsigned long arg)
+static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+                          struct iovec iov[], int iov_size, int access)
 {
-    struct vring_desc desc;
-    unsigned int i, head;
-    __virtio16 avail_idx;
-    __virtio16 ring_head;
-    int ret;
-    
-    /* 1. 读取 avail.idx */
-    /* 使用 __get_user 从 Guest 内存读取 */
-    if (__get_user(avail_idx, &vq->avail->idx)) {
-        vq_err(vq, "Failed to access avail idx\n");
-        return -EFAULT;
-    }
-    
-    /* 2. 检查是否有新的描述符 */
-    if (vq->last_avail_idx == vhost16_to_cpu(vq, avail_idx)) {
-        return vq->num;  /* 没有新的描述符 */
-    }
-    
-    /* 3. 从 avail.ring 读取描述符索引 */
-    /* 关键：使用 memory barrier 确保先读取 idx */
-    virtio_rmb();
-    
-    if (__get_user(ring_head, &vq->avail->ring[vq->last_avail_idx % vq->num])) {
-        vq_err(vq, "Failed to read ring head\n");
-        return -EFAULT;
-    }
-    
-    head = vhost16_to_cpu(vq, ring_head);
-    i = head;
-    
-    /* 4. 遍历描述符链 */
-    *out_num = 0;
-    *in_num = 0;
-    
-    do {
-        if (i >= vq->num) {
-            vq_err(vq, "Descriptor index out of bounds\n");
-            return -EFAULT;
-        }
-        
-        /* 读取描述符 */
-        if (__copy_from_user(&desc, &vq->desc[i], sizeof(desc))) {
-            vq_err(vq, "Failed to read descriptor\n");
-            return -EFAULT;
-        }
-        
-        /* 转换 Guest 物理地址到 Host 虚拟地址 */
-        void *addr = vq_meta_trans(vq, vhost64_to_cpu(vq, desc.addr));
-        
-        if (desc.flags & VRING_DESC_F_WRITE) {
-            /* 设备可写（输入） */
-            iov[*in_num].iov_base = addr;
-            iov[*in_num].iov_len = vhost32_to_cpu(vq, desc.len);
-            (*in_num)++;
-        } else {
-            /* 设备只读（输出） */
-            iov[*out_num].iov_base = addr;
-            iov[*out_num].iov_len = vhost32_to_cpu(vq, desc.len);
-            (*out_num)++;
-        }
-        
-        /* 检查是否有下一个描述符 */
-        if (!(desc.flags & VRING_DESC_F_NEXT)) {
+    struct vhost_iotlb *umem = dev->iotlb ? dev->iotlb : dev->umem;
+
+    while ((u64)len > s) {
+        /* ★ 在 IOTLB 中查找覆盖 [addr, addr+size) 的映射 */
+        map = vhost_iotlb_itree_first(umem, addr, last);
+        if (!map || map->start > addr) {
+            if (umem != dev->iotlb)
+                ret = -EFAULT;        /* umem 模式：直接失败 */
+            else
+                ret = -EAGAIN;        /* iotlb 模式：触发 IOTLB miss */
             break;
         }
-        
-        i = vhost16_to_cpu(vq, desc.next);
-    } while (true);
-    
-    /* 5. 更新 last_avail_idx */
-    vq->last_avail_idx++;
-    
-    return head;  /* 返回描述符链的头索引 */
+
+        /* ★ 权限检查 */
+        if (!(map->perm & access)) { ret = -EPERM; break; }
+
+        /* 生成 iov：用户空间虚拟地址（HVA） */
+        _iov->iov_base = (void __user *)(map->addr + addr - map->start);
+        _iov->iov_len  = min(len - s, map->size - addr + map->start);
+        ...
+    }
+
+    if (ret == -EAGAIN)
+        vhost_iotlb_miss(vq, addr, access);  /* 通知 QEMU 更新 IOTLB */
+    return ret;
 }
 ```
 
-#### 4. 设备侧（vhost）：写入 used ring
+**关键理解**：vhost 在内核态运行，但访问的是 QEMU 用户空间映射的 Guest 内存。
+`translate_desc()` 通过 IOTLB（QEMU 通过 `VHOST_SET_VRING_ADDR` 配置）把 Guest 地址
+翻译成宿主的用户空间地址（HVA），然后用 `copy_to_user()` / `copy_from_user()` 访问。
+
+---
+
+## 6. vhost_add_used()：写入 used ring
+
+### Q: 写 used ring 的完整流程？
+
+**文件**: `drivers/vhost/vhost.c:2915`
 
 ```c
-/* drivers/vhost/vhost.c */
-
-/* vhost 侧：将处理完成的描述符写入 used ring */
-void vhost_add_used(struct vhost_virtqueue *vq,
-                    unsigned int head,
-                    int len)
+int vhost_add_used(struct vhost_virtqueue *vq, unsigned int head, int len)
 {
     struct vring_used_elem heads = {
         cpu_to_vhost32(vq, head),
         cpu_to_vhost32(vq, len)
     };
-    
-    vhost_add_used_n(vq, &heads, 1);
-}
-
-void vhost_add_used_n(struct vhost_virtqueue *vq,
-                      struct vring_used_elem *heads,
-                      unsigned count)
-{
-    /* 1. 计算 used ring 的位置 */
-    unsigned int start = vq->last_used_idx & (vq->num - 1);
-    struct vring_used_elem *used = vq->used->ring + start;
-    
-    /* 2. 写入 used ring */
-    /* 关键：先写入数据 */
-    if (__copy_to_user(used, heads, count * sizeof(*heads))) {
-        vq_err(vq, "Failed to write used ring\n");
-        return;
-    }
-    
-    /* 3. 使用 memory barrier 确保数据先写入 */
-    smp_wmb();
-    
-    /* 4. 更新 used.idx */
-    vq->last_used_idx += count;
-    
-    if (__put_user(cpu_to_vhost16(vq, vq->last_used_idx),
-                   &vq->used->idx)) {
-        vq_err(vq, "Failed to update used idx\n");
-        return;
-    }
-    
-    /* 5. 检查是否需要通知驱动 */
-    /* 使用 Event Index 优化 */
-    if (vhost_need_event(vhost16_to_cpu(vq, vring_used_event(&vq->vring)),
-                         vq->last_used_idx,
-                         vq->last_used_idx - count)) {
-        /* 发送中断通知驱动 */
-        vhost_signal(&vq->dev, vq);
-    }
-}
-
-/* 发送中断信号 */
-void vhost_signal(struct vhost_dev *dev, struct vhost_virtqueue *vq)
-{
-    /* 通过 eventfd 通知 KVM */
-    if (vq->call_ctx) {
-        eventfd_signal(vq->call_ctx, 1);
-    }
+    return vhost_add_used_n(vq, &heads, 1);   /* 批量写入的通用入口 */
 }
 ```
 
-#### 5. 内存屏障的关键作用
+**文件**: `drivers/vhost/vhost.c:2926`
 
 ```c
-/* 为什么需要内存屏障？ */
-
-/* 场景：多核 CPU 环境下 */
-
-/* 驱动侧（CPU 0） */
-void driver_add_buffer(void)
+static int __vhost_add_used_n(struct vhost_virtqueue *vq,
+                              struct vring_used_elem *heads, unsigned count)
 {
-    /* 1. 填充描述符 */
-    desc->addr = buffer_addr;
-    desc->len = buffer_len;
-    
-    /* ❌ 如果没有 memory barrier */
-    /* CPU 可能重排序：先更新 idx，后写入描述符 */
-    /* 设备看到新的 idx，但描述符还没写入 */
-    /* 导致设备读取到旧数据或未初始化数据 */
-    
-    /* ✅ 使用 write memory barrier */
-    virtio_wmb(vq->weak_barriers);
-    
-    /* 2. 更新 avail.idx */
-    avail->idx = new_idx;
-    
-    /* 现在保证：描述符先写入，idx 后更新 */
-    /* 设备看到新的 idx 时，描述符已经就绪 */
-}
+    start = vq->last_used_idx & (vq->num - 1);
+    used = vq->used->ring + start;
 
-/* 设备侧（CPU 1，vhost 线程） */
-void device_process_buffer(void)
+    /* ★ 写入 used ring（通过 copy_to_user） */
+    if (vhost_put_used(vq, heads, start, count))
+        return -EFAULT;
+
+    /* ★ 脏页日志（迁移时需要） */
+    if (unlikely(vq->log_used)) {
+        smp_wmb();          /* 数据先于日志 */
+        log_used(vq, ...);
+    }
+
+    /* 更新 last_used_idx */
+    old = vq->last_used_idx;
+    new = (vq->last_used_idx += count);
+
+    /* 回绕保护：如果 idx 绕过了 signalled_used，标记失效 */
+    if (unlikely((u16)(new - vq->signalled_used) < (u16)(new - old)))
+        vq->signalled_used_valid = false;
+
+    return 0;
+}
+```
+
+### Q: `vhost_signal()` 何时触发？
+
+写完 used ring 后，需要通知 Guest。vhost 用 eventfd 通知：
+
+```c
+/* 简化逻辑 */
+void vhost_signal(struct vhost_dev *dev, struct vhost_virtqueue *vq)
 {
-    /* 1. 读取 avail.idx */
-    idx = avail->idx;
-    
-    /* ❌ 如果没有 memory barrier */
-    /* CPU 可能重排序：先读取描述符，后读取 idx */
-    /* 导致读取到旧的描述符 */
-    
-    /* ✅ 使用 read memory barrier */
-    virtio_rmb();
-    
-    /* 2. 读取描述符 */
-    desc = &desc_ring[avail->ring[idx]];
-    
-    /* 现在保证：idx 先读取，描述符后读取 */
-    /* 读取到的描述符是最新的 */
-}
+    /* 检查 Guest 是否屏蔽了通知 */
+    if (vq->used_flags & VRING_USED_F_NO_NOTIFY)
+        return;
 
-/* 内存屏障类型： */
-/* - virtio_wmb(): Write Memory Barrier */
-/*   确保之前的写操作在之后的写操作之前完成 */
-/* - virtio_rmb(): Read Memory Barrier */
-/*   确保之前的读操作在之后的读操作之前完成 */
-/* - virtio_mb(): Full Memory Barrier */
-/*   确保之前的所有操作在之后的所有操作之前完成 */
+    /* Event Index 优化：只在需要时通知 */
+    if (vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX)) {
+        if (!vhost_need_event(vhost16_to_cpu(vq, vring_used_event(&vq->vring)),
+                              vq->last_used_idx, vq->last_used_idx - count))
+            return;
+    }
+
+    /* ★ 通过 eventfd 通知（6.12.93 只有 1 个参数） */
+    eventfd_signal(vq->call_ctx.ctx);
+}
 ```
 
 ---
 
+## 7. vhost-net：数据面
+
+### Q: `struct vhost_net` 包含什么？
+
+**文件**: `drivers/vhost/net.c:133`
+
+```c
+struct vhost_net {
+    struct vhost_dev dev;                          /* ★ 继承 vhost_dev */
+    struct vhost_net_virtqueue vqs[VHOST_NET_VQ_MAX]; /* TX + RX 两个队列 */
+    struct vhost_poll poll[VHOST_NET_VQ_MAX];      /* socket 可读通知 */
+    unsigned tx_packets;        /* 最近发送的包数 */
+    unsigned tx_zcopy_err;      /* 零拷贝失败次数 */
+    bool tx_flush;              /* 零拷贝刷新进行中 */
+    struct page_frag_cache pf_cache;  /* 页面碎片缓存 */
+};
+```
+
+### Q: `handle_tx()` 做什么？
+
+**文件**: `drivers/vhost/net.c:945`
+
+```c
+static void handle_tx(struct vhost_net *net)
+{
+    struct vhost_virtqueue *vq = &net->vqs[VHOST_NET_VQ_TX].vq;
+    struct socket *sock;
+
+    mutex_lock_nested(&vq->mutex, VHOST_NET_VQ_TX);
+    sock = vhost_vq_get_backend(vq);   /* ★ 后端是 TAP socket */
+    if (!sock) goto out;
+
+    vhost_disable_notify(&net->dev, vq);  /* 禁用通知，减少 VM-Exit */
+
+    if (vhost_sock_zcopy(sock))
+        handle_tx_zerocopy(net, sock);    /* 零拷贝：不拷贝数据 */
+    else
+        handle_tx_copy(net, sock);        /* 拷贝模式 */
+
+out:
+    mutex_unlock(&vq->mutex);
+}
+```
+
+### Q: TX 路径的两种模式有什么区别？
+
+| 模式 | 触发条件 | 行为 | 性能 |
+|------|---------|------|------|
+| `handle_tx_copy` | 默认 | `copy_to_iter()` 拷贝到 skb，`sock_sendmsg()` 发送 | 简单可靠 |
+| `handle_tx_zerocopy` | `VHOST_NET_USE_VHOST_NET_ZCOPY` + 支持 | 页面直接挂到 skb（`skb_zerocopy_realloc`），需要等待 DMA 完成才能释放 | 高吞吐但复杂 |
+
+### Q: `handle_rx()` 的批处理机制？
+
+**文件**: `drivers/vhost/net.c:1092`
+
+```c
+static void handle_rx(struct vhost_net *net)
+{
+    struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_RX];
+    struct vhost_virtqueue *vq = &nvq->vq;
+
+    /* ★ 从 TAP socket 收包到 vhost_net_buf（批量） */
+    vhost_net_buf_produce(nvq);    /* ptr_ring_consume_batched → 批量取 skb */
+
+    /* 逐个分发给 Guest */
+    while (!vhost_net_buf_is_empty(&nvq->rxq)) {
+        /* 从描述符链获取 buffer */
+        head = vhost_get_vq_desc(vq, vq->iov, ...);
+
+        /* 拷贝数据到 Guest buffer */
+        skb = vhost_net_buf_consume(&nvq->rxq);
+        /* copy_to_iter / zerocopy 到描述符指向的 Guest 内存 */
+
+        /* 写入 used ring */
+        vhost_add_used(vq, head, len);
+
+        /* 检查是否达到调度权重限制 */
+        if (vhost_exceeds_weight(vq, ++pkts, total_len))
+            break;
+    }
+}
+```
+
+---
+
+## 8. vhost ioctl 接口
+
+### Q: vhost 支持哪些 ioctl？
+
+**文件**: `drivers/vhost/vhost.c` — `vhost_vring_ioctl()`
+
+| ioctl | 作用 |
+|-------|------|
+| `VHOST_GET_FEATURES` | 返回 vhost 支持的 feature bits |
+| `VHOST_SET_FEATURES` | 协商 features（Guest 和 vhost 都支持的） |
+| `VHOST_SET_OWNER` | 设置持有者（绑定 mm，创建 worker） |
+| `VHOST_RESET_OWNER` | 重置持有者 |
+| `VHOST_SET_VRING_NUM` | 设置 virtqueue 大小 |
+| `VHOST_SET_VRING_ADDR` | ★ 设置 desc/avail/used 地址 + IOTLB |
+| `VHOST_SET_VRING_BASE` | 设置 avail/used 索引起点 |
+| `VHOST_GET_VRING_BASE` | 获取当前索引（迁移用） |
+| `VHOST_SET_VRING_KICK` | ★ 设置 kick eventfd（Guest→vhost 通知） |
+| `VHOST_SET_VRING_CALL` | ★ 设置 call eventfd（vhost→Guest 通知） |
+| `VHOST_SET_VRING_ERR` | 设置 error eventfd |
+| `VHOST_SET_BACKEND_FEATURES` | 协商 backend features（IOTLB、双缓冲等） |
+
+### Q: `VHOST_SET_VRING_KICK` 做了什么？
+
+```c
+/* 简化逻辑 */
+case VHOST_SET_VRING_KICK:
+    /* 获取用户传入的 eventfd */
+    fd = ...;
+    kick = eventfd_ctx_fdget(fd);
+
+    /* 替换旧的 kick */
+    old_kick = vq->kick;
+    vq->kick = kick;
+
+    /* 如果设了 kick，启动 poll 监听 */
+    if (kick)
+        vhost_poll_start(&vq->poll, kick_file);
+
+    /* 释放旧的 */
+    if (old_kick)
+        eventfd_ctx_put(old_kick);
+```
+
+当 Guest 写 avail.idx 触发 VM-Exit → KVM 检测到 ioeventfd 匹配 →
+直接唤醒 vhost worker 线程，不需要回 QEMU。
+
+---
+
+## 9. vhost 与 KVM 的协作
+
+### Q: vhost 如何避免 VM-Exit 回 QEMU？
+
+```
+传统用户态 virtio（每个包 2 次 VM-Exit）:
+
+  Guest kick → VM-Exit → KVM → QEMU → 处理 → eventfd → VM-Entry
+
+vhost 内核态（0 次 VM-Exit 用于数据处理）:
+
+  Guest kick → VM-Exit → KVM ioeventfd → 唤醒 vhost worker
+  vhost worker（内核态）:
+    1. vhost_get_vq_desc() — 读描述符
+    2. translate_desc() — 地址翻译
+    3. 处理数据（handle_tx/handle_rx）
+    4. vhost_add_used() — 写 used ring
+    5. eventfd_signal(call_ctx) — 通知 Guest
+```
+
+### Q: 中断注入的两条路径？
+
+| 路径 | 机制 | 场景 |
+|------|------|------|
+| eventfd → KVM | `eventfd_signal()` → irqfd → `kvm_set_irq()` | 通用 |
+| Posted Interrupts | irq_bypass 配对 → IRTE 写 Posted → 硬件直投 | VFIO 直通 |
+
+**通用路径详解**：
+
+```
+vhost 写 used ring 完成
+    ↓
+eventfd_signal(call_ctx.ctx)
+    ↓
+irqfd 的 wake_function 被调用
+    ↓
+kvm_set_irq() → KVM 中断注入
+    ↓
+Guest 收到中断 → 处理 completed buffer
+```
+
+---
+
+## 10. 完整调用链
+
+```
+QEMU 设置 vhost-net:
+  │
+  ├─ open("/dev/vhost-net")
+  │   └→ vhost_net_open()
+  │      └→ vhost_dev_init(dev, vqs, 2, ...)    ← 初始化 2 个队列(TX+RX)
+  │
+  ├─ ioctl(VHOST_SET_OWNER)
+  │   └→ vhost_dev_set_owner()
+  │      └→ 创建 worker 线程（vhost_task 或 kthread）
+  │      └→ dev->mm = current->mm               ← 继承 QEMU 的内存空间
+  │
+  ├─ ioctl(VHOST_SET_FEATURES)
+  │   └→ vhost_set_features()
+  │      └→ dev->acked_features = features
+  │
+  ├─ ioctl(VHOST_NET_SET_BACKEND)               ← vhost-net 特有
+  │   └→ 关联 TAP socket 到 vq->private_data
+  │
+  ├─ ioctl(VHOST_SET_VRING_NUM/ADDR/BASE/KICK/CALL)
+  │   └→ vhost_vring_ioctl()
+  │      └→ 配置每个 vq 的参数
+  │
+  └─ VM 开始运行
+      │
+      ├─ Guest 写 avail.idx
+      │   └→ VM-Exit → KVM ioeventfd → 唤醒 vhost worker
+      │
+      ├─ vhost worker 线程:
+      │   └→ handle_tx() / handle_rx()           ← vq->handle_kick 回调
+      │      ├→ vhost_get_vq_desc()
+      │      │   ├→ vhost_get_avail_idx()         ← 读 avail.idx
+      │      │   ├→ vhost_get_avail_head()         ← 读 avail ring
+      │      │   ├→ vhost_get_desc()               ← 读描述符
+      │      │   └→ translate_desc()               ← GPA → HVA
+      │      │
+      │      ├→ handle_tx_copy() / handle_tx_zerocopy()
+      │      │   └→ sock_sendmsg()                 ← 发到 TAP
+      │      │
+      │      ├→ vhost_add_used()                   ← 写 used ring
+      │      │   └→ vhost_put_used()               ← copy_to_user
+      │      │
+      │      └→ vhost_signal()                     ← 通知 Guest
+      │          └→ eventfd_signal(call_ctx)        ← 6.12.93: 无 n 参数
+      │              └→ irqfd → kvm_set_irq() → Guest 收到中断
+      │
+      └─ 循环直到 QEMU 关闭设备
+```
