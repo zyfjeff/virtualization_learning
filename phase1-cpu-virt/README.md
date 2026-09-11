@@ -19,7 +19,7 @@
 | `README.md` | 本文件：VT-x硬件基础 + 学习指南 |
 | `annotations.md` | 源码精读：vmx_x86_ops, vmx_hardware_setup, vmx_vcpu_run |
 | `cpu-virtualization.md` | ★ CPU虚拟化：CPUID / MSR / 指令虚拟化 / vCPU唤醒机制与竞态陷阱 |
-| `practice/` | ★ 实战练习：VMX验证 / CPUID Faulting / MSR测试 / VM-Exit开销测量 |
+| `practice/` | ★ 实战练习：VMX深度解码 / MSR Bitmap分析 / VM-Exit Profiling / CPUID双机制 / vCPU调度观测 |
 
 ## 推荐阅读顺序
 
@@ -41,11 +41,12 @@
   → kvm_x86_ops: 通用层 ↔ VMX 桥梁
   → vCPU 唤醒机制: immediate_exit vs 信号，竞态陷阱
 
-第4步: practice/ ← 实战练习
-  → ex1-vmx-verify: 验证 VMX 支持和能力
-  → ex2-cpuid-fault: 测试 CPUID Faulting 机制
-  → ex3-msr-test: 测量 MSR 访问时间
-  → ex5-vmexit-overhead: 测量 VM-Exit 开销
+第4步: practice/ ← 实战练习（5 个递进式深度实验）
+  → ex1: VMX Capability 深度解码（7 个 MSR 全解码）
+  → ex2: MSR Bitmap 可视化 + ftrace 热 MSR 分析
+  → ex3: VM-Exit Reason Profiling（perf kvm stat）
+  → ex4: CPUID 虚拟化双机制对比（Faulting vs KVM 拦截）
+  → ex5: vCPU 调度与 halt-polling 观测
 
 第5步: 运行示例 + ftrace 追踪
   → kvm-demo: 完整 VM 生命周期
@@ -167,15 +168,15 @@ cat README.md
 # 编译练习程序
 make
 
-# 运行实验（不需要 VM）
-sudo ./ex1-vmx-verify        # VMX 支持验证
-sudo ./ex2-cpuid-fault       # CPUID Faulting 测试
-sudo ./ex3-msr-test          # MSR 测试
+# 运行不需要 VM 的实验
+sudo ./ex1-vmx-verify        # VMX Capability 深度解码（7 个 MSR）
 
 # 运行需要 VM 的实验：先在另一个终端启动 VM
 cd ../../scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
-# 回到 practice 目录测量
-sudo ./ex5-vmexit-overhead   # VM-Exit 开销测量
+# 回到 practice 目录运行分析脚本
+./trace-msr-access.sh        # MSR Bitmap 热 MSR 分析
+./profile-vmexit.sh          # VM-Exit Reason Profiling
+./trace-vcpu-sched.sh        # vCPU 调度观测
 # 清理：在 Guest 内执行 poweroff
 ```
 
@@ -183,10 +184,11 @@ sudo ./ex5-vmexit-overhead   # VM-Exit 开销测量
 
 | 编号 | 实验名称 | 需要 VM | 难度 | 预计时间 | 核心知识点 |
 |------|---------|---------|------|---------|-----------|
-| 1 | VMX 支持验证 | 否 | ★☆☆ | 10min | VMX 特性检查 |
-| 2 | CPUID Faulting | 否 | ★★☆ | 15min | CPUID 虚拟化 |
-| 3 | MSR 测试 | 否 | ★★☆ | 15min | MSR 读写 |
-| 5 | VM-Exit 开销 | 是 | ★★★ | 20min | VM-Exit 性能 |
+| 1 | VMX Capability 深度解码 | 否 | ★★☆ | 30min | VMX MSR 完整解码、特性依赖链 |
+| 2 | MSR Bitmap 可视化与热 MSR 分析 | 是 | ★★☆ | 20min | ftrace kvm_msr、透传 vs 拦截 |
+| 3 | VM-Exit Reason Profiling | 是 | ★★★ | 25min | perf kvm stat、快速/慢速路径 |
+| 4 | CPUID 虚拟化双机制对比 | 是 | ★★★ | 25min | CPUID Faulting vs KVM 拦截 |
+| 5 | vCPU 调度与 Halt-Polling 观测 | 是 | ★★★ | 20min | perf sched、halt-polling 自适应 |
 
 ### 统一测试环境
 
@@ -222,7 +224,7 @@ echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_entry/enable
 cat /sys/kernel/debug/tracing/trace_pipe
 ```
 
-### 4. 关键tracepoints列表
+### 关键 tracepoints 列表
 ```bash
 # 列出所有KVM tracepoints
 ls /sys/kernel/debug/tracing/events/kvm/
@@ -238,7 +240,7 @@ ls /sys/kernel/debug/tracing/events/kvm/
 # kvm_eoi            ← EOI处理
 ```
 
-### 5. ftrace函数追踪
+### ftrace 函数追踪
 ```bash
 # 追踪vmx_vcpu_run函数调用链
 echo function > /sys/kernel/debug/tracing/current_tracer
