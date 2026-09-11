@@ -1,584 +1,551 @@
-# Phase 1 实战练习 - VT-x 基础
+# Phase 1 深度实践 — CPU 虚拟化源码精读配套练习
 
-> 通过 QEMU 虚拟机动手实践 VT-x 核心概念
-
----
-
-## 🎯 练习目标
-
-完成以下练习后，你应该能够：
-1. ✅ 验证 VMX 硬件支持
-2. ✅ 观察 CPUID Faulting 机制
-3. ✅ 理解 MSR Bitmap 工作原理
-4. ✅ 测试嵌套虚拟化
-5. ✅ 测量 VM-Exit 开销
+> 基于 Linux 6.12.93 源码。每个练习连接 `../annotations.md` 的源码精读，
+> 要求**先读懂源码，再做实验验证**。
+>
+> **执行环境**：
+> - ex1/ex2/ex3/ex4/ex5 在 **Guest 内**执行（读取虚拟化的硬件状态）
+> - trace/profile 脚本在**宿主侧**执行（观测 KVM 行为）
+> - VM 启动必须带 `-enable-kvm -cpu host`（`boot-vm.sh` 默认已带）
 
 ---
 
-## 📋 环境准备
+## 练习总览
 
-### 启动测试 VM
+| # | 名称 | 核心问题 | 连接 annotations.md | 执行位置 |
+|---|------|---------|-------------------|---------|
+| 1 | VMX Capability 深度解码 | KVM 为什么只启用这些 VMX 特性？依赖链是什么？ | §5 VMX 特性检测 | Guest |
+| 2 | MSR Bitmap 可视化与热 MSR 分析 | MSR Bitmap 如何减少 VM-Exit？哪些 MSR 最热？ | §5, §6 | 宿主 + Guest |
+| 3 | VM-Exit Reason Profiling | 不同工作负载的 VM-Exit 分布有何差异？ | §3 VM-Exit 分发 | 宿主 |
+| 4 | CPUID 虚拟化双机制对比 | 静态过滤 vs 动态拦截，KVM 如何选择？ | §5, annotations §2 | Guest + 宿主 |
+| 5 | vCPU 调度与 Halt-Polling 观测 | halt-polling 如何在延迟和 CPU 占用间权衡？ | phase0 §7 halt-polling | 宿主 |
+
+---
+
+## 环境准备
 
 ```bash
-# 宿主机上执行
+# 宿主侧：启动 VM（默认 -enable-kvm -cpu host）
 cd ../../scripts/vm
-./boot-vm.sh minimal
-```
+./boot-vm.sh ubuntu --memory 4G --cpus 4
 
-> `boot-vm.sh` 默认传 `-enable-kvm -cpu host`。本 phase 的实验要在 guest 内看到 VMX，
-> 还需要宿主开启嵌套虚拟化（`cat /sys/module/kvm_intel/parameters/nested` 应为 `Y`），
-> 脚本启动前会自检并在未开启时告警。
+# 确认走的是 KVM（不是 TCG）
+ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm
+# 输出应 >0；=0 说明走的是 TCG，所有 KVM 追踪实验结论都无效
 
-### 验证环境
+# Guest 侧：编译练习程序
+cd /mnt/shared
+make clean && make
 
-```bash
-# VM 内执行
-uname -r                    # 应该显示 6.12.93-kvm-study
-cat /proc/cpuinfo | grep vmx # 应该看到 vmx 标志
-ls /mnt/shared/              # 应该看到测试程序
+# 宿主侧：确认 tracefs 可用
+ls /sys/kernel/tracing/events/kvm/ | head
+# 应有 kvm_exit, kvm_entry, kvm_cpuid, kvm_msr 等
 ```
 
 ---
 
-## 🔬 练习 1: 验证 VMX 支持
+## Exercise 1: VMX Capability 深度解码
 
 ### 目标
-理解 CPU 如何报告虚拟化支持
+
+完整解码 KVM 读取的所有 VMX capability MSR，理解特性依赖链。
+
+**核心问题**：`vmx_hardware_setup()` 读完 MSR 后为什么只启用这些特性？如果某位不支持，
+KVM 怎么回退？
+
+### 连接 annotations.md
+
+- §5「VMX 特性检测」：`setup_vmcs_config()` 读取哪些 MSR
+- §5「特性依赖链」：EPT → unrestricted_guest, APICv → Posted Interrupts
+- §6「模块参数」：`ept`, `vpid`, `apicv` 等参数如何影响决策
 
 ### 步骤
 
-#### 1.1 检查 CPUID 虚拟化标志
+#### 1.1 运行增强版 ex1-vmx-verify
 
 ```bash
-# 查看 CPU 特性
-cat /proc/cpuinfo | grep -E "vmx|svm|ept|vpid"
+./ex1-vmx-verify
 ```
 
-**预期输出**:
-```
-flags: ... vmx ept vpid ...
-```
+程序会解码 7 个 VMX MSR：
+- IA32_VMX_BASIC (0x480)
+- IA32_VMX_PINBASED_CTLS (0x481)
+- IA32_VMX_PROCBASED_CTLS (0x482)
+- IA32_VMX_EXIT_CTLS (0x483)
+- IA32_VMX_ENTRY_CTLS (0x484)
+- IA32_VMX_PROCBASED_CTLS2 (0x48B)
+- IA32_VMX_EPT_VPID_CAP (0x48C)
 
-#### 1.2 使用 cpuid 指令详细查看
+每个 MSR 的 allowed-0（必须为 1）和 allowed-1（可以为 1）位都会解码。
 
-```bash
-# 安装 cpuid 工具（如果可用）
-# 或者使用我们的测试程序
+#### 1.2 对照 KVM 源码
 
-# 查看 CPUID leaf 1 (特性标志)
-/mnt/shared/test-cpuid-fault
-```
+读 `arch/x86/kvm/vmx/vmx.c:2590` — `setup_vmcs_config()`：
 
-#### 1.3 读取 VMX 能力 MSR
-
-```bash
-# 创建测试程序
-cat > /tmp/vmx-capabilities.c << 'EOF'
-#include <stdio.h>
-
-int main() {
-    unsigned int eax, ebx, ecx, edx;
-    
-    // CPUID leaf 1: 检查 VMX 支持
-    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
-    
-    if (ecx & (1 << 5)) {
-        printf("✓ CPU 支持 VMX (VT-x)\n");
-    } else {
-        printf("✗ CPU 不支持 VMX\n");
-        return 1;
-    }
-    
-    // 读取 IA32_VMX_BASIC MSR (0x480)
-    unsigned long long vmx_basic;
-    asm volatile("rdmsr" : "=A"(vmx_basic) : "c"(0x480));
-    
-    printf("\nIA32_VMX_BASIC MSR (0x480):\n");
-    printf("  VMCS 修订版: %llu\n", vmx_basic & 0x7FFFFFFF);
-    printf("  VMCS 大小: %llu 字节\n", (vmx_basic >> 32) & 0x1FFF);
-    
-    // 读取 IA32_VMX_EPT_VPID_CAP MSR (0x48C)
-    unsigned long long ept_vpid;
-    asm volatile("rdmsr" : "=A"(ept_vpid) : "c"(0x48C));
-    
-    printf("\nIA32_VMX_EPT_VPID_CAP MSR (0x48C):\n");
-    printf("  EPT 支持: %s\n", (ept_vpid & 1) ? "是" : "否");
-    printf("  VPID 支持: %s\n", ((ept_vpid >> 26) & 1) ? "是" : "否");
-    printf("  EPT 大页: %s\n", ((ept_vpid >> 6) & 1) ? "是" : "否");
-    
-    return 0;
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:2590 */
+static int setup_vmcs_config(struct vmcs_config *vmcs_conf,
+                             struct vmx_capability *vmx_cap)
+{
+    /* 读 MSR，取交集合 */
+    if (adjust_vmx_controls(KVM_REQUIRED_VMX_CPU_BASED_VM_EXEC_CONTROL,
+                            KVM_OPTIONAL_VMX_CPU_BASED_VM_EXEC_CONTROL,
+                            MSR_IA32_VMX_PROCBASED_CTLS,
+                            &_cpu_based_exec_control))
+        return -EIO;
+    /* ... */
 }
-EOF
-
-gcc -o /tmp/vmx-capabilities /tmp/vmx-capabilities.c
-/tmp/vmx-capabilities
 ```
 
-**思考题**:
-- VMCS 的作用是什么？
-- 为什么需要 EPT 和 VPID？
+`adjust_vmx_controls()` 的逻辑（`vmx.c:2563`）：
+- `ctl &= vmx_msr_high;` — 硬件不支持的位（high=0）强制清零
+- `ctl |= vmx_msr_low;` — 硬件强制要求的位（low=1）强制置 1
+- `if (ctl_min & ~ctl)` — 如果 KVM 必须的位硬件不支持，返回 -EIO
+
+#### 1.3 验证特性依赖链
+
+对照 `vmx_hardware_setup()`（`vmx.c:8404`）：
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:8404 */
+__init int vmx_hardware_setup(void)
+{
+    if (setup_vmcs_config(&vmcs_config, &vmx_capability) < 0)
+        return -EIO;
+
+    /* EPT 依赖：4 级页表 + WB 内存类型 + INVEPT 全局 */
+    if (!cpu_has_vmx_ept() || !cpu_has_vmx_ept_4levels() ||
+        !cpu_has_vmx_ept_mt_wb() || !cpu_has_vmx_invept_global())
+        enable_ept = 0;
+
+    /* unrestricted_guest 依赖 EPT */
+    if (!cpu_has_vmx_unrestricted_guest() || !enable_ept)
+        enable_unrestricted_guest = 0;
+
+    /* APICv 是 Posted Interrupts 的前提 */
+    if (!cpu_has_vmx_apicv())
+        enable_apicv = 0;
+    if (!enable_apicv)
+        vt_x86_ops.sync_pir_to_irr = NULL;  /* 禁用回调 */
+}
+```
+
+### 思考题
+
+1. **如果 CPU 不支持 EPT_AD_BITS（EPT A/D 位），KVM 会怎样回退？**
+   - 读 `vmx.c` 找 `enable_ept_ad_bits` 的决策逻辑
+   - 没有 A/D 位时，KVM 必须用更昂贵的页表 walk 来跟踪访问/脏位
+   - 对照 Intel SDM Vol 3, Appendix A.3.3
+
+2. **为什么 `PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR = 0x00000016`？**
+   - 哪些位是「即使没有 true-CTLS MSR 也必须为 1」的？
+   - 对照 SDM Vol 3, Appendix A.3.1
+
+3. **PROCBASED_CTLS 的 allowed-0 里有哪些位是 KVM 必须启用的？**
+   - 读 `KVM_REQUIRED_VMX_CPU_BASED_VM_EXEC_CONTROL` 定义
+   - 为什么 MSR_BITMAP 是必须的？
+
+### 输出示例
+
+```
+IA32_VMX_BASIC (0x480) = 0x0000000000000000
+  VMCS revision: 1
+  VMCS size: 4096 bytes
+  True controls: supported
+  ...
+
+IA32_VMX_PINBASED_CTLS (0x481) = 0xXXXXXXXXXXXXXXXX
+  allowed-0 (must-be-1): 0x00000016
+    bit 1: 1 (Reserved)
+    bit 2: 1 (Reserved)
+    bit 4: 1 (Reserved)
+  allowed-1 (can-be-1): 0x0000006F
+    bit 0: 1 - External-interrupt exiting
+    bit 3: 1 - NMI exiting
+    bit 5: 1 - Virtual NMIs
+    bit 6: 1 - Activate VMX-preemption timer
+    bit 7: 1 - Process posted interrupts
+  ...
+```
 
 ---
 
-## 🔬 练习 2: CPUID Faulting 机制
+## Exercise 2: MSR Bitmap 可视化与热 MSR 分析
 
 ### 目标
-理解 CPUID Faulting 如何阻止用户态程序探测 CPU
+
+理解 MSR Bitmap 如何减少 VM-Exit，追踪哪些 MSR 最热。
+
+**核心问题**：KVM 初始把所有 MSR 都拦截（bitmap 全 1），运行时按需放开。哪些 MSR 被放开？
+为什么？
+
+### 连接 annotations.md
+
+- §5「VMX 特性检测」：MSR_BITMAP 控制位
+- §6「模块参数」：动态调整 MSR 拦截
 
 ### 步骤
 
-#### 2.1 测试 CPUID Faulting 基本行为
+#### 2.1 在 Guest 内运行 ex3-msr-test
 
 ```bash
-# 运行完整的 CPUID Faulting 测试
-/mnt/shared/test-cpuid-fault
+./ex3-msr-test
 ```
 
-**预期输出**:
-```
-=== CPUID Faulting 测试 ===
+测量不同 MSR 的访问时间。透传的 MSR（如 IA32_TSC）比拦截的 MSR（如 IA32_EFER）快 10-100 倍。
 
-1. 检测 CPUID Faulting 支持
-   ✓ CPU 支持 CPUID Faulting
-
-2. 测试 CPUID（未启用 Faulting）
-   ✓ CPUID 成功执行
-   CPU 厂商: Intel(R) ...
-
-3. 启用 CPUID Faulting
-   调用 arch_prctl(ARCH_SET_CPUID, 0)
-   ✓ 启用成功
-
-4. 测试 CPUID（已启用 Faulting）
-   ✗ CPUID 触发信号 11 (SIGSEGV)
-   ✓ 这说明 CPUID Faulting 生效了！
-
-5. 禁用 CPUID Faulting
-   调用 arch_prctl(ARCH_SET_CPUID, 1)
-   ✓ 禁用成功
-
-6. 再次测试 CPUID
-   ✓ CPUID 恢复正常
-```
-
-#### 2.2 手动验证 CPUID Faulting
+#### 2.2 在宿主侧用 ftrace 追踪 MSR 访问
 
 ```bash
-# 创建简单的测试程序
-cat > /tmp/test-cpuid.c << 'EOF'
-#include <stdio.h>
-#include <signal.h>
-#include <setjmp.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
-#ifndef ARCH_GET_CPUID
-#define ARCH_GET_CPUID  0x1011
-#endif
-#ifndef ARCH_SET_CPUID
-#define ARCH_SET_CPUID  0x1012
-#endif
-
-static sigjmp_buf jmpbuf;
-
-void handler(int sig) {
-    printf("捕获到信号 %d (CPUID 被阻止)\n", sig);
-    siglongjmp(jmpbuf, 1);
-}
-
-int main() {
-    unsigned int eax, ebx, ecx, edx;
-    
-    // 测试 1: 正常执行 CPUID
-    printf("测试 1: 正常执行 CPUID\n");
-    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
-    printf("  EAX=0x%x (最大 CPUID leaf)\n", eax);
-    
-    // 测试 2: 启用 CPUID Faulting
-    printf("\n测试 2: 启用 CPUID Faulting\n");
-    long ret = syscall(SYS_arch_prctl, ARCH_SET_CPUID, 0);
-    if (ret == 0) {
-        printf("  ✓ CPUID Faulting 已启用\n");
-    }
-    
-    // 测试 3: 尝试执行 CPUID（应该触发 #GP）
-    printf("\n测试 3: 尝试执行 CPUID（应该失败）\n");
-    signal(SIGSEGV, handler);
-    
-    if (sigsetjmp(jmpbuf, 1) == 0) {
-        asm volatile("cpuid" : "=a"(eax) : "a"(0));
-        printf("  ✗ CPUID 执行成功（不应该发生）\n");
-    } else {
-        printf("  ✓ CPUID 被阻止（符合预期）\n");
-    }
-    
-    // 测试 4: 禁用 CPUID Faulting
-    printf("\n测试 4: 禁用 CPUID Faulting\n");
-    syscall(SYS_arch_prctl, ARCH_SET_CPUID, 1);
-    printf("  ✓ CPUID Faulting 已禁用\n");
-    
-    // 测试 5: 再次执行 CPUID（应该成功）
-    printf("\n测试 5: 再次执行 CPUID\n");
-    asm volatile("cpuid" : "=a"(eax) : "a"(0));
-    printf("  ✓ CPUID 执行成功，EAX=0x%x\n", eax);
-    
-    return 0;
-}
-EOF
-
-gcc -o /tmp/test-cpuid /tmp/test-cpuid.c
-/tmp/test-cpuid
+sudo ./trace-msr-access.sh -p $(pgrep -f qemu-system) -d 10
 ```
 
-**思考题**:
-- CPUID Faulting 在什么场景下有用？
-- 为什么 Ring 0 不受 CPUID Faulting 影响？
+脚本会启用 `kvm:kvm_msr` 事件，收集 10 秒内的 MSR 访问统计。
+
+#### 2.3 分析 MSR Bitmap 实现
+
+读 `arch/x86/kvm/vmx/vmx.c`：
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:171 */
+static u32 vmx_possible_passthrough_msrs[MAX_POSSIBLE_PASSTHROUGH_MSRS] = {
+    MSR_IA32_SPEC_CTRL,      /* 0x48 - Spectre 缓解 */
+    MSR_IA32_PRED_CMD,       /* 0x49 - Indirect branch prediction */
+    MSR_IA32_FLUSH_CMD,      /* 0x10B - L1D flush */
+    MSR_IA32_TSC,            /* 0x10 - Timestamp counter */
+    MSR_FS_BASE,             /* 0xC0000100 - FS base */
+    MSR_GS_BASE,             /* 0xC0000101 - GS base */
+    MSR_KERNEL_GS_BASE,      /* 0xC0000102 - Kernel GS base */
+    MSR_IA32_XFD,            /* 0x1C4 - Extended feature disable */
+    MSR_IA32_XFD_ERR,        /* 0x1C5 - XFD error */
+    MSR_IA32_SYSENTER_CS,    /* 0x174 - SYSENTER CS */
+    MSR_IA32_SYSENTER_ESP,   /* 0x175 - SYSENTER ESP */
+    MSR_IA32_SYSENTER_EIP,   /* 0x176 - SYSENTER EIP */
+    MSR_CORE_C1_RES,         /* C1 residency */
+    MSR_CORE_C3_RESIDENCY,   /* C3 residency */
+    MSR_CORE_C6_RESIDENCY,   /* C6 residency */
+    MSR_CORE_C7_RESIDENCY,   /* C7 residency */
+};
+```
+
+MSR Bitmap 初始全 1（全部拦截）（`vmx.c:2963`）：
+```c
+memset(loaded_vmcs->msr_bitmap, 0xff, PAGE_SIZE);
+```
+
+运行时按需放开（`vmx.c:4000`）：
+```c
+void vmx_disable_intercept_for_msr(struct kvm_vcpu *vcpu, u32 msr, int type)
+{
+    /* 清 bitmap 对应位 → 硬件不再拦截该 MSR */
+    if (type & MSR_TYPE_R)
+        vmx_clear_msr_bitmap_read(msr_bitmap, msr);
+    if (type & MSR_TYPE_W)
+        vmx_clear_msr_bitmap_write(msr_bitmap, msr);
+}
+```
+
+### 思考题
+
+1. **为什么 IA32_TSC 被透传，但 IA32_EFER 被拦截？**
+   - TSC 是只读的，Guest 读 TSC 不会改变状态
+   - EFER 控制长模式（LME/LMA），Guest 写 EFER 必须被 KVM 拦截
+   - 对照 `vmx_set_msr()` 里的处理逻辑
+
+2. **MSR Bitmap 的布局是什么？**
+   - 低 1024 字节：MSR 0x00000000 - 0x00001FFF 的读拦截
+   - 接下来 1024 字节：MSR 0x00000000 - 0x00001FFF 的写拦截
+   - 接下来 1024 字节：MSR 0xC0000000 - 0xC0001FFF 的读拦截
+   - 最后 1024 字节：MSR 0xC0000000 - 0xC0001FFF 的写拦截
+   - 对照 Intel SDM Vol 3, Section 24.6.9, Figure 24-11
+
+3. **如果 Guest 访问不在 bitmap 范围内的 MSR（如 0x2000），会怎样？**
+   - 硬件会触发 VM-Exit（因为 bitmap 只覆盖 0x0000-0x1FFF 和 0xC000-0xC001）
+   - KVM 在 `handle_msr()` 里模拟
 
 ---
 
-## 🔬 练习 3: MSR Bitmap 和 VM-Exit
+## Exercise 3: VM-Exit Reason Profiling
 
 ### 目标
-理解 MSR 访问如何触发 VM-Exit
+
+分析不同工作负载的 VM-Exit 分布，理解快速路径 vs 慢速路径。
+
+**核心问题**：idle VM 和 CPU-bound VM 的 VM-Exit 分布有何差异？哪些 Exit 走快速路径？
+
+### 连接 annotations.md
+
+- §3「VM-Exit 分发」：`kvm_vmx_exit_handlers[]` 表
+- §3「exit_fastpath」：快速路径的 4 种返回值
 
 ### 步骤
 
-#### 3.1 观察 MSR 访问
+#### 3.1 运行 perf kvm stat
 
 ```bash
-# 创建 MSR 测试程序
-cat > /tmp/test-msr.c << 'EOF'
-#include <stdio.h>
-
-int main() {
-    unsigned long long value;
-    
-    printf("=== MSR 访问测试 ===\n\n");
-    
-    // 读取 IA32_TSC (0x10) - 通常透传
-    printf("1. 读取 IA32_TSC (0x10)\n");
-    asm volatile("rdmsr" : "=A"(value) : "c"(0x10));
-    printf("   TSC = %llu\n", value);
-    printf("   说明: 这个 MSR 通常被透传，无 VM-Exit\n\n");
-    
-    // 读取 IA32_EFER (0xC0000080) - 通常拦截
-    printf("2. 读取 IA32_EFER (0xC0000080)\n");
-    asm volatile("rdmsr" : "=A"(value) : "c"(0xC0000080));
-    printf("   EFER = 0x%llx\n", value);
-    printf("   说明: 这个 MSR 通常被拦截，触发 VM-Exit\n\n");
-    
-    // 读取 IA32_APIC_BASE (0x1B) - 通常拦截
-    printf("3. 读取 IA32_APIC_BASE (0x1B)\n");
-    asm volatile("rdmsr" : "=A"(value) : "c"(0x1B));
-    printf("   APIC_BASE = 0x%llx\n", value);
-    printf("   说明: 这个 MSR 通常被拦截\n\n");
-    
-    return 0;
-}
-EOF
-
-gcc -o /tmp/test-msr /tmp/test-msr.c
-/tmp/test-msr
+sudo ./profile-vmexit.sh -p $(pgrep -f qemu-system) -d 30
 ```
 
-#### 3.2 测量 MSR 访问时间
+脚本会收集 30 秒的 `perf kvm stat` 数据，并按 Exit reason 统计。
 
+#### 3.2 运行 3 种负载
+
+**负载 1: idle**
 ```bash
-# 创建性能测试程序
-cat > /tmp/msr-perf.c << 'EOF'
-#include <stdio.h>
-#include <time.h>
-
-#define ITERATIONS 1000000
-
-int main() {
-    unsigned long long value;
-    struct timespec start, end;
-    
-    printf("=== MSR 访问性能测试 ===\n\n");
-    printf("测试 %d 次 MSR 读取\n\n", ITERATIONS);
-    
-    // 测试 IA32_TSC（透传）
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < ITERATIONS; i++) {
-        asm volatile("rdmsr" : "=A"(value) : "c"(0x10));
-    }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    
-    double tsc_time = (end.tv_sec - start.tv_sec) * 1000000000.0 + 
-                      (end.tv_nsec - start.tv_nsec);
-    printf("IA32_TSC (透传): %.2f ns/次\n", tsc_time / ITERATIONS);
-    
-    // 测试 IA32_EFER（拦截）
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < ITERATIONS; i++) {
-        asm volatile("rdmsr" : "=A"(value) : "c"(0xC0000080));
-    }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    
-    double efer_time = (end.tv_sec - start.tv_sec) * 1000000000.0 + 
-                       (end.tv_nsec - start.tv_nsec);
-    printf("IA32_EFER (拦截): %.2f ns/次\n", efer_time / ITERATIONS);
-    
-    printf("\n开销差异: %.2fx\n", efer_time / tsc_time);
-    
-    return 0;
-}
-EOF
-
-gcc -O2 -o /tmp/msr-perf /tmp/msr-perf.c
-/tmp/msr-perf
+# Guest 内什么都不做，或运行 sleep
+sleep 30
 ```
 
-**思考题**:
-- 为什么透传的 MSR 比拦截的 MSR 快？
-- VM-Exit 的开销主要来自哪里？
+**负载 2: CPU-bound**
+```bash
+# Guest 内运行 stress
+stress --cpu 4 --timeout 30
+```
+
+**负载 3: IO-bound**
+```bash
+# Guest 内运行 dd
+dd if=/dev/zero of=/tmp/test bs=1M count=1000 oflag=direct
+```
+
+#### 3.3 分析 VM-Exit 分布
+
+对照 `vmx.c:6095` 的 `kvm_vmx_exit_handlers[]` 表：
+
+| Exit reason | 处理函数 | 快速路径？ | 说明 |
+|-------------|---------|-----------|------|
+| EXTERNAL_INTERRUPT | `handle_external_interrupt()` | 可能 | Posted Interrupt |
+| PREEMPTION_TIMER | `handle_preemption_timer()` | 是 | 定时器到期 |
+| EPT_VIOLATION | `handle_ept_violation()` | 否 | 建页表 |
+| MSR_WRITE | `kvm_emulate_wrmsr()` | 否 | 模拟 MSR 写 |
+| CPUID | `handle_cpuid()` | 否 | 回用户空间 |
+| IO_INSTRUCTION | `handle_io()` | 可能 | 回用户空间 |
+
+### 思考题
+
+1. **为什么 idle VM 的 PREEMPTION_TIMER 占比最高？**
+   - idle VM 执行 HLT，KVM 设置 preemption timer 防止无限阻塞
+   - timer 到期触发 VM-Exit，KVM 检查是否有中断，没有则继续 halt
+   - 对照 `handle_preemption_timer()` 实现
+
+2. **EXTERNAL_INTERRUPT 在什么情况下走快速路径？**
+   - Posted Interrupts 启用时，外部中断不触发 VM-Exit
+   - 但如果通知向量不匹配，或 PI 未启用，会触发 `EXTERNAL_INTERRUPT`
+   - 对照 `handle_external_interrupt()` 和 SDM Vol 3, Section 30.6
+
+3. **为什么 IO_INSTRUCTION 有时走快速路径，有时回用户空间？**
+   - 如果 IO 端口被 QEMU 模拟（如 0x3f8 串口），回用户空间
+   - 如果 IO 端口由内核处理（如 virtio MMIO），可能在内核完成
+   - 对照 `handle_io()` 的返回值
+
+### 输出示例
+
+```
+=== VM-Exit Reason Distribution (30s) ===
+
+Idle VM:
+  PREEMPTION_TIMER      15000 (50.0%)
+  EXTERNAL_INTERRUPT     8000 (26.7%)
+  EPT_VIOLATION          3000 (10.0%)
+  HLT                    2000  (6.7%)
+  ...
+
+CPU-bound VM:
+  EPT_VIOLATION         50000 (83.3%)
+  PREEMPTION_TIMER       5000  (8.3%)
+  MSR_WRITE              3000  (5.0%)
+  ...
+
+IO-bound VM:
+  IO_INSTRUCTION        40000 (66.7%)
+  EPT_VIOLATION         15000 (25.0%)
+  PREEMPTION_TIMER       3000  (5.0%)
+  ...
+```
 
 ---
 
-## 🔬 练习 4: 嵌套虚拟化
+## Exercise 4: CPUID 虚拟化双机制对比
 
 ### 目标
-在 VM 内运行 KVM（嵌套虚拟化）
+
+对比 CPUID Faulting（用户态拦截）和 KVM CPUID 拦截（Guest 内核态拦截）。
+
+**核心问题**：KVM 如何过滤 CPUID？Guest 内核执行 CPUID 时，是读物理 CPUID 还是 KVM 模拟的值？
+
+### 连接 annotations.md
+
+- §5「VMX 特性检测」：CPUID 指令总是触发 VM-Exit
+- §2「VM-Entry/Exit 汇编路径」：CPUID 是 VM-Exit 的来源之一
 
 ### 步骤
 
-#### 4.1 检查嵌套虚拟化支持
+#### 4.1 运行 ex4-cpuid-analysis
 
 ```bash
-# 检查 VM 是否支持嵌套虚拟化
-cat /sys/module/kvm_intel/parameters/nested
-# 应该输出 Y 或 1
+./ex4-cpuid-analysis
 ```
 
-#### 4.2 加载 KVM 模块
+程序会：
+- 遍历 CPUID leaf 0-1F，记录每次执行
+- 对比 KVM 过滤前后的值
+- 标注哪些 leaf 被修改（如 leaf 1 的 VMX 位）
+
+#### 4.2 在宿主侧追踪 CPUID 拦截
 
 ```bash
-# 加载 KVM 模块
-modprobe kvm
-modprobe kvm_intel
+# 宿主侧
+TRACEFS=/sys/kernel/tracing
+echo kvm:kvm_cpuid > $TRACEFS/set_event
+echo $(pgrep -f qemu-system) > $TRACEFS/set_event_pid
+echo 1 > $TRACEFS/tracing_on
 
-# 检查设备
-ls -l /dev/kvm
+# Guest 侧运行 ex4-cpuid-analysis
+
+# 宿主侧收集数据
+echo 0 > $TRACEFS/tracing_on
+cat $TRACEFS/trace | grep kvm_cpuid | wc -l
 ```
 
-#### 4.3 运行嵌套 VM（可选）
+#### 4.3 对比 CPUID Faulting
+
+运行 ex2-cpuid-fault：
 
 ```bash
-# 如果有第二个内核镜像和 initramfs
-# 可以在 VM 内启动另一个 VM
-
-# 这需要：
-# 1. 在 VM 内安装 QEMU
-# 2. 复制内核和 initramfs 到 VM
-# 3. 启动嵌套 VM
-
-# 简化版本：只验证 KVM 模块可以加载
-dmesg | grep kvm
+./ex2-cpuid-fault
 ```
 
-**思考题**:
-- 嵌套虚拟化的性能开销主要来自哪里？
-- 什么场景需要嵌套虚拟化？
+对比：
+- **CPUID Faulting**：用户态（Ring 3）执行 CPUID 触发 #GP，内核态不受影响
+- **KVM CPUID 拦截**：Guest 内核态（Ring 0）执行 CPUID 触发 VM-Exit，KVM 返回过滤后的值
+
+### 思考题
+
+1. **为什么 Guest 内核执行 CPUID 也要触发 VM-Exit？**
+   - Guest 内核可能读 CPUID 来检测特性（如 VMX、EPT）
+   - KVM 必须过滤这些特性，避免 Guest 看到真实硬件能力
+   - 对照 `handle_cpuid()` 和 `kvm_emulate_cpuid()`
+
+2. **CPUID Faulting 和 KVM CPUID 拦截的区别是什么？**
+   - CPUID Faulting：阻止用户态探测，安全特性
+   - KVM 拦截：过滤返回值，虚拟化特性
+   - 两者可以同时启用
+
+3. **哪些 CPUID leaf 会被 KVM 修改？**
+   - Leaf 1: VMX 位、APIC ID
+   - Leaf 7: 特性标志（如 INVPCID、SMAP）
+   - Leaf B: 拓扑信息
+   - 对照 `kvm_get_cpuid()` 实现
 
 ---
 
-## 🔬 练习 5: VM-Exit 开销测量
+## Exercise 5: vCPU 调度与 Halt-Polling 观测
 
 ### 目标
-量化 VM-Exit 的性能开销
+
+观测 halt-polling 的行为，理解延迟 vs CPU 占用的权衡。
+
+**核心问题**：halt-polling 窗口多大会让 CPU 占用显著上升？收益在哪里？
+
+### 连接 annotations.md
+
+- phase0 `annotations.md` §7「halt-polling」：三阶段算法
+- phase0 `README.md`「halt-polling 调优」：实测结论
 
 ### 步骤
 
-#### 5.1 使用 perf 工具
+#### 5.1 追踪 vCPU 调度
 
 ```bash
-# 安装 perf（如果可用）
-# apt install linux-tools-generic
+sudo ./trace-vcpu-sched.sh -p $(pgrep -f qemu-system) -d 10
+```
 
-# 如果 perf 不可用，使用手动计时
-cat > /tmp/vmexit-overhead.c << 'EOF'
-#include <stdio.h>
-#include <time.h>
+脚本会用 `perf sched` 追踪 vCPU 线程的调度行为。
 
-#define ITERATIONS 100000
+#### 5.2 调整 halt_poll_ns 参数
 
-int main() {
-    struct timespec start, end;
-    unsigned long long dummy;
-    
-    printf("=== VM-Exit 开销测量 ===\n\n");
-    printf("测试 %d 次操作\n\n", ITERATIONS);
-    
-    // 测试 1: CPUID（触发 VM-Exit）
-    printf("1. CPUID 指令（触发 VM-Exit）\n");
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < ITERATIONS; i++) {
-        asm volatile("cpuid" : "=a"(dummy) : "a"(0) : "ebx", "ecx", "edx");
+```bash
+# 查看当前值（默认 200000 ns = 200 μs）
+cat /sys/module/kvm/parameters/halt_poll_ns
+
+# 四档对比
+for v in 0 200000 400000 1000000; do
+    echo "$v" > /sys/module/kvm/parameters/halt_poll_ns
+    echo "=== halt_poll_ns = $v ns ==="
+    # 运行工作负载，测量延迟和 CPU 占用
+done
+
+# 恢复原值
+echo 200000 > /sys/module/kvm/parameters/halt_poll_ns
+```
+
+#### 5.3 分析 halt-polling 实现
+
+读 `virt/kvm/kvm_main.c:3811` — `kvm_vcpu_halt()`：
+
+```c
+/* 来源: virt/kvm/kvm_main.c:3811 */
+void kvm_vcpu_halt(struct kvm_vcpu *vcpu)
+{
+    unsigned int max_halt_poll_ns = kvm_vcpu_max_halt_poll_ns(vcpu);
+    bool do_halt_poll = halt_poll_allowed && vcpu->halt_poll_ns;
+
+    if (do_halt_poll) {
+        /* Phase 1: 忙等 */
+        do {
+            if (kvm_vcpu_check_block(vcpu) < 0)
+                goto out;  /* 有事件 → 立即恢复 */
+            cpu_relax();
+        } while (kvm_vcpu_can_poll(cur, stop));
     }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    
-    double cpuid_time = (end.tv_sec - start.tv_sec) * 1000000000.0 + 
-                        (end.tv_nsec - start.tv_nsec);
-    printf("   总时间: %.2f ms\n", cpuid_time / 1000000);
-    printf("   平均: %.2f ns/次\n\n", cpuid_time / ITERATIONS);
-    
-    // 测试 2: RDTSC（不触发 VM-Exit）
-    printf("2. RDTSC 指令（不触发 VM-Exit）\n");
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < ITERATIONS; i++) {
-        asm volatile("rdtsc" : "=A"(dummy));
-    }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    
-    double rdtsc_time = (end.tv_sec - start.tv_sec) * 1000000000.0 + 
-                        (end.tv_nsec - start.tv_nsec);
-    printf("   总时间: %.2f ms\n", rdtsc_time / 1000000);
-    printf("   平均: %.2f ns/次\n\n", rdtsc_time / ITERATIONS);
-    
-    // 测试 3: MOV 指令（基线）
-    printf("3. MOV 指令（基线）\n");
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < ITERATIONS; i++) {
-        asm volatile("mov %0, %%rax" : : "i"(0x12345678) : "rax");
-    }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    
-    double mov_time = (end.tv_sec - start.tv_sec) * 1000000000.0 + 
-                      (end.tv_nsec - start.tv_nsec);
-    printf("   总时间: %.2f ms\n", mov_time / 1000000);
-    printf("   平均: %.2f ns/次\n\n", mov_time / ITERATIONS);
-    
-    printf("=== 分析 ===\n");
-    printf("VM-Exit 开销: %.2f ns\n", (cpuid_time - rdtsc_time) / ITERATIONS);
-    printf("CPUID vs MOV: %.2fx\n", cpuid_time / mov_time);
-    
-    return 0;
+
+    /* Phase 2: 真正阻塞 */
+    waited = kvm_vcpu_block(vcpu);
+
+    /* Phase 3: 自适应调整 */
+    if (!vcpu_valid_wakeup(vcpu))
+        shrink_halt_poll_ns(vcpu);  /* 无效唤醒 → 缩小窗口 */
+    else if (halt_ns > max_halt_poll_ns)
+        shrink_halt_poll_ns(vcpu);  /* 远超窗口 → 缩小 */
+    else if (halt_ns < max_halt_poll_ns)
+        grow_halt_poll_ns(vcpu);    /* 稍超窗口 → 增大 */
 }
-EOF
-
-gcc -O2 -o /tmp/vmexit-overhead /tmp/vmexit-overhead.c
-/tmp/vmexit-overhead
 ```
 
-**思考题**:
-- CPUID 的开销主要来自哪里？
-- 如何减少 VM-Exit 开销？
+### 思考题
+
+1. **为什么 idle VM 调大 halt_poll_ns 会显著增加 CPU 占用？**
+   - idle VM 频繁 halt，polling 窗口内没有事件
+   - 忙等消耗 CPU，但没有收益（唤醒源是定时器，时间确定）
+   - 对照 phase0 README.md 的实测结论
+
+2. **halt-polling 的收益在哪里？**
+   - 唤醒源随机且大概率落在窗口内时
+   - 如网络包到达、中断触发
+   - 对照 phase0 README.md「陷阱1」
+
+3. **为什么窗口超过某个值后收益饱和？**
+   - 窗口盖住了典型 halt 时间后，再大也无法让唤醒更早
+   - 对照 phase9-performance/index.md §1.2 的实测数据
 
 ---
 
-## 📊 实验报告模板
+## 提交检查清单
 
-完成练习后，填写以下报告：
+完成练习后，确认：
 
-```markdown
-# Phase 1 实验报告
-
-## 练习 1: VMX 支持验证
-- CPU 型号: _______________
-- VMX 支持: ✓/✗
-- EPT 支持: ✓/✗
-- VPID 支持: ✓/✗
-
-## 练习 2: CPUID Faulting
-- CPUID Faulting 支持: ✓/✗
-- 启用前 CPUID: 成功/失败
-- 启用后 CPUID: 成功/失败
-- 禁用后 CPUID: 成功/失败
-
-## 练习 3: MSR Bitmap
-- IA32_TSC 访问时间: _____ ns
-- IA32_EFER 访问时间: _____ ns
-- 开销差异: _____ x
-
-## 练习 4: 嵌套虚拟化
-- KVM 模块加载: 成功/失败
-- /dev/kvm 设备: 存在/不存在
-
-## 练习 5: VM-Exit 开销
-- CPUID 开销: _____ ns
-- RDTSC 开销: _____ ns
-- MOV 基线: _____ ns
-
-## 总结
-- 学到的关键概念: _______________
-- 遇到的问题: _______________
-- 解决方案: _______________
-```
+- [ ] 读过 `../annotations.md` 对应章节
+- [ ] 查过 Linux 内核源码（文件路径 + 行号）
+- [ ] 查过 Intel SDM（章节号）
+- [ ] 思考题已回答
+- [ ] 输出数据已记录
+- [ ] 未重犯 `CLAUDE.md` 已知陷阱
 
 ---
 
-## 🎓 参考答案
+## 参考
 
-### 练习 1 思考题
-
-**Q: VMCS 的作用是什么？**  
-A: VMCS (Virtual Machine Control Structure) 是 VMX 的核心数据结构，存储：
-- Guest 状态（寄存器、段选择子等）
-- Host 状态（VM-Exit 后恢复）
-- VM-Execution 控制（哪些事件触发 VM-Exit）
-- VM-Exit 信息（退出原因、质量等）
-
-**Q: 为什么需要 EPT 和 VPID？**  
-A: 
-- EPT (Extended Page Table): 实现 Guest 物理地址到 Host 物理地址的转换，避免软件影子页表的开销
-- VPID (Virtual Processor ID): 标记 TLB 条目属于哪个 vCPU，避免 VM-Entry/Exit 时刷新 TLB
-
-### 练习 2 思考题
-
-**Q: CPUID Faulting 在什么场景下有用？**  
-A: 
-- 安全场景：防止用户态程序探测 CPU 特性（侧信道攻击）
-- 虚拟化场景：在嵌套虚拟化中控制 Guest 看到的 CPU 特性
-- 兼容性场景：模拟不同 CPU 型号
-
-**Q: 为什么 Ring 0 不受 CPUID Faulting 影响？**  
-A: CPUID Faulting 只影响 Ring 3 (CPL=3) 的 CPUID 执行。Ring 0 (CPL=0) 的 CPUID 仍然会触发 VM-Exit（在 VMX 中），但不会触发 #GP。
-
-### 练习 3 思考题
-
-**Q: 为什么透传的 MSR 比拦截的 MSR 快？**  
-A: 
-- 透传：直接读取物理 MSR，无 VM-Exit，~50-100 ns
-- 拦截：触发 VM-Exit → KVM 处理 → VM-Entry，~1000-2000 ns
-- 开销差异主要来自 VM-Exit/Entry 的上下文切换
-
-**Q: VM-Exit 的开销主要来自哪里？**  
-A: 
-- 保存/恢复 CPU 状态（寄存器、段选择子等）
-- 切换 VMCS（Guest/Host 状态）
-- KVM 处理逻辑
-- VM-Entry 重新加载状态
-
-### 练习 5 思考题
-
-**Q: CPUID 的开销主要来自哪里？**  
-A: 
-- VM-Exit 触发和处理
-- KVM 模拟 CPUID 返回值
-- VM-Entry 恢复执行
-
-**Q: 如何减少 VM-Exit 开销？**  
-A: 
-- 使用 MSR Bitmap 透传不敏感的 MSR
-- 使用 CPUID Faulting 减少 CPUID VM-Exit
-- 使用 VPID 避免 TLB 刷新
-- 使用 Posted Interrupts 减少中断 VM-Exit
-- 使用 APICv 虚拟化中断控制器
-
----
-
-## 🚀 下一步
-
-完成这些练习后，你可以：
-1. 进入 Phase 2: 内存虚拟化（EPT）
-2. 进入 Phase 4: 中断虚拟化（APICv）
-3. 深入源码阅读 KVM 实现
-
----
-
-**提示**: 如果在练习中遇到问题，可以：
-- 查看 VM 的 dmesg 日志
-- 使用 strace 跟踪系统调用
-- 阅读 KVM 源码（arch/x86/kvm/）
-- 参考 Intel SDM Volume 3 (VMX)
+- `../annotations.md` — 源码精读
+- `../../scripts/trace/` — 宿主侧追踪脚本
+- Intel SDM Vol 3, Chapter 24-31 — VMX 架构
+- Linux 6.12.93 源码 — `arch/x86/kvm/vmx/`

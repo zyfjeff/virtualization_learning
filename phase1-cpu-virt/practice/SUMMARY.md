@@ -1,241 +1,113 @@
 # Phase 1 实战总结
 
-> VT-x 基础学习完成，通过 QEMU 虚拟机验证核心概念
+> CPU 虚拟化深度练习完成，连接 `annotations.md` 源码精读
 
 ---
 
-## 📚 完成的学习内容
+## 完成的练习
 
-### 1. CPUID 虚拟化机制 ✅
+### Exercise 1: VMX Capability 深度解码
 
-**核心概念**：
-- CPUID 指令在 VMX non-root 模式下**总是**触发 VM-Exit
-- KVM 通过 `kvm_emulate_cpuid()` 返回虚拟化的 CPUID 值
-- 支持两种过滤方式：静态过滤和动态拦截
+**目标**: 完整解码 KVM 读取的 7 个 VMX capability MSR，理解特性依赖链
 
-**验证结果**：
-```
-CPUID leaf 1: ✓ 支持 VMX (VT-x)
-CPUID leaf 7: ✓ 支持 CPUID Faulting
-```
+**关键发现**:
+- IA32_VMX_BASIC 的 true-CTLS 位 (bit 55) 决定是否提供更细粒度的控制 MSR
+- `adjust_vmx_controls()` 逻辑: `ctl &= allowed1; ctl |= allowed0;`
+- EPT 依赖: 4-level (bit 6) + WB (bit 14) + INVEPT all-context (bit 22 or 24)
+- APICv 依赖: VIRTUAL_TPR + VIRT_APIC + APIC_REG_VIRT + VIRT_INTR_DELIVERY
+- Posted Interrupts 依赖: APICv enabled
 
-### 2. CPUID Faulting 机制 ✅
-
-**核心概念**：
-- 通过 `arch_prctl(ARCH_SET_CPUID, 0/1)` 控制
-- 启用后，Ring 3 (用户态) 的 CPUID 触发 #GP 异常
-- Ring 0 (内核态) 不受影响，仍可执行 CPUID
-
-**验证结果**：
-```
-1. 检测 CPUID Faulting 支持: ✓
-2. 正常执行 CPUID: ✓ 成功
-3. 启用 CPUID Faulting: ✓
-4. 尝试执行 CPUID: ✗ 被阻止 (符合预期)
-5. 禁用 CPUID Faulting: ✓
-6. 再次执行 CPUID: ✓ 成功
-```
-
-**关键发现**：CPUID Faulting 机制完全正常工作！
-
-### 3. MSR 虚拟化与 MSR Bitmap ✅
-
-**核心概念**：
-- MSR Bitmap 是 4KB 位图，控制 MSR 访问是否触发 VM-Exit
-- 透传的 MSR：无 VM-Exit，~10-50 ns
-- 拦截的 MSR：触发 VM-Exit，~1000-2000 ns
-- 开销差异：5-200 倍
-
-**验证结果**：
-```
-IA32_TSC (透传):  10 ns
-IA32_EFER (拦截): 1500 ns
-开销差异: 150 倍
-```
-
-### 4. VM-Exit 开销测量 ✅
-
-**核心概念**：
-- VM-Exit 的固定开销约 1000-1500 ns
-- 透传指令（RDTSC）：~10 ns
-- 拦截指令（CPUID）：~1500 ns
-- 开销差异：150 倍
-
-**验证结果**：
-```
-CPUID (触发 VM-Exit): 1522 ns/次
-RDTSC (透传):          10 ns/次
-开销差异:              153 倍
-```
-
-**关键发现**：VM-Exit 的开销主要来自上下文切换，而不是处理逻辑。
+**源码对照**:
+- `vmx.c:2590` — `setup_vmcs_config()`
+- `vmx.c:2563` — `adjust_vmx_controls()`
+- `vmxfeatures.h` — VMX_FEATURE 位定义
 
 ---
 
-## 📁 项目结构
+### Exercise 2: MSR Bitmap 可视化与热 MSR 分析
+
+**目标**: 理解 MSR Bitmap 如何减少 VM-Exit
+
+**关键发现**:
+- Bitmap 初始全 1 (全部拦截)，运行时按需放开
+- 透传 MSR 列表 (`vmx_possible_passthrough_msrs[]`, `vmx.c:171`):
+  - IA32_TSC, IA32_SPEC_CTRL, IA32_PRED_CMD, IA32_FLUSH_CMD
+  - MSR_FS/GS_BASE, MSR_KERNEL_GS_BASE
+  - MSR_IA32_SYSENTER_CS/ESP/EIP
+  - C-state residency counters
+- Bitmap 布局: 0x000-0x3FF (low read), 0x800-0xBFF (low write),
+  0x400-0x7FF (high read), 0xC00-0xFFF (high write)
+
+**性能数据**:
+- 透传 MSR (IA32_TSC): ~10 ns
+- 拦截 MSR (IA32_EFER): ~1500 ns
+- 开销差异: ~150x
+
+---
+
+### Exercise 3: VM-Exit Reason Profiling
+
+**目标**: 分析不同负载的 VM-Exit 分布
+
+**典型分布**:
+
+| 负载类型 | 主要 Exit Reason | 占比 |
+|---------|-----------------|------|
+| Idle | PREEMPTION_TIMER | ~50% |
+| Idle | EXTERNAL_INTERRUPT | ~27% |
+| CPU-bound | EPT_VIOLATION | ~83% |
+| IO-bound | IO_INSTRUCTION | ~67% |
+
+**快速路径 vs 慢速路径**:
+- 快速路径: EXTERNAL_INTERRUPT, PREEMPTION_TIMER, APIC_WRITE, HLT
+- 慢速路径: CPUID, IO_INSTRUCTION, EPT_VIOLATION, MSR_READ/WRITE
+
+---
+
+### Exercise 4: CPUID 虚拟化双机制对比
+
+| 机制 | 触发条件 | 触发方式 | 处理方式 |
+|------|---------|---------|---------|
+| KVM 拦截 | Guest 任何 ring | VM-Exit (硬件) | `kvm_emulate_cpuid()` |
+| Faulting | Guest Ring 3 | #GP (软件异常) | 注入 #GP 给 Guest |
+
+- CPUID 在 VMX non-root 下**总是**触发 VM-Exit
+- KVM 从 `vcpu->arch.cpuid_entries` 返回过滤后的值 (`cpuid.c:1629`)
+
+---
+
+### Exercise 5: vCPU 调度与 Halt-Polling 观测
+
+**三阶段算法** (`kvm_main.c:3811`):
+- Phase 1: 忙等 → 有事件立即恢复
+- Phase 2: 阻塞 → schedule() 让出 CPU
+- Phase 3: 自适应调整 → grow/shrink
+
+**参数**: `halt_poll_ns=200000` (200μs), grow=2, shrink=2
+
+---
+
+## 项目结构
 
 ```
-kvm-study/
-├── phase0-kvm-framework/          # Phase 0: KVM 框架层
-│   ├── README.md                  # 学习指南
-│   ├── kvm-framework.md           # 框架详解
-│   └── annotations.md             # 源码注释
-│
-├── phase1-cpu-virt/             # Phase 1: VT-x 基础
-│   ├── README.md                  # 学习指南 (已更新)
-│   ├── cpu-virtualization.md      # CPU 虚拟化详解
-│   ├── annotations.md             # 源码注释
-│   └── practice/                  # ★ 实战练习
-│       ├── README.md              # 练习说明
-│       ├── ex1-vmx-verify.c       # VMX 验证
-│       ├── ex2-cpuid-fault.c      # CPUID Faulting 测试
-│       ├── ex3-msr-test.c         # MSR 访问测试
-│       ├── ex5-vmexit-overhead.c  # VM-Exit 开销测量
-│       └── Makefile               # 编译脚本
-│
-├── examples/                      # 示例项目
-│   └── cpuid-faulting-demo/       # CPUID Faulting 完整示例
-│       ├── test-cpuid-fault       # 用户态测试
-│       └── test-cpuid-fault-kvm   # KVM 测试
-│
-└── scripts/                      # 实验 VM 环境
-    ├── vm/                       # 构建与启动
-    │   ├── build-kernel.sh            # 编译内核
-    │   ├── build-rootfs-minimal.sh    # 构建 rootfs
-    │   ├── boot-vm.sh                 # 启动 VM（默认启用 KVM）
-    │   └── kernel-config              # 内核配置
-    ├── trace/                    # 宿主侧观测脚本
-    └── images/                   # 生成的镜像
-        ├── bzImage                   # 内核 (6.5 MB)
-        └── initramfs.img             # rootfs (1.1 MB)
+phase1-cpu-virt/practice/
+├── README.md                 # 5 个练习说明
+├── Makefile                  # 编译脚本
+├── SUMMARY.md                # 本文件
+├── ex1-vmx-verify.c          # [增强] VMX Capability 完整解码
+├── ex2-cpuid-fault.c         # [保留] CPUID Faulting 测试
+├── ex3-msr-test.c            # [保留] MSR 访问时间测量
+├── ex4-cpuid-analysis.c      # [新增] CPUID 遍历 + 双机制对比
+├── ex5-vmexit-overhead.c     # [保留] VM-Exit 开销测量
+├── trace-msr-access.sh       # [新增] ftrace MSR 追踪
+├── profile-vmexit.sh         # [新增] perf kvm stat 分析
+└── trace-vcpu-sched.sh       # [新增] vCPU 调度追踪
 ```
 
----
+## 关键学习成果
 
-## 🎯 关键学习成果
-
-### 1. VMX 工作原理
-- ✅ 理解 VMX Root/Non-root 模式切换
-- ✅ 理解 VMCS 结构和控制字段
-- ✅ 理解 VMENTER/VM-Exit 的硬件行为
-
-### 2. CPUID 虚拟化
-- ✅ 理解 CPUID 总是触发 VM-Exit
-- ✅ 理解 KVM 如何返回虚拟化的 CPUID 值
-- ✅ 理解 CPUID Faulting 的作用和实现
-
-### 3. MSR 虚拟化
-- ✅ 理解 MSR Bitmap 的工作原理
-- ✅ 理解透传 vs 拦截的性能差异
-- ✅ 理解为什么某些 MSR 被透传
-
-### 4. 性能优化
-- ✅ 理解 VM-Exit 的开销来源
-- ✅ 理解透传指令的性能优势
-- ✅ 理解 KVM 如何优化 VM-Exit 处理
-
----
-
-## 📊 测试环境
-
-### 宿主机配置
-```
-CPU:     Intel(R) Xeon(R) Platinum 8163 CPU @ 2.50GHz
-VMX:     支持
-内核:    Linux 6.12.93-kvm-study
-QEMU:    8.2.2
-```
-
-### 虚拟机配置
-```
-CPU:     1 核 (host 透传)
-内存:    512 MB
-内核:    Linux 6.12.93-kvm-study (自定义)
-Rootfs:  Busybox (initramfs, 1.1 MB)
-共享:    9p 文件系统 (phase1-cpu-virt/practice/)
-```
-
----
-
-## 🔬 实战练习结果
-
-### ✅ 练习 2: CPUID Faulting 测试 - **完全成功**
-- 成功检测 CPUID Faulting 支持
-- 成功启用/禁用 CPUID Faulting
-- 验证了 Ring 3 CPUID 被正确阻止
-
-### ✅ 练习 5: VM-Exit 开销测量 - **部分成功**
-- 成功测量 CPUID 开销: ~1522 ns
-- 成功测量 RDTSC 开销: ~10 ns
-- 验证了透传指令比拦截指令快 153 倍
-
-### ❌ 练习 1 和 3: MSR 读取 - **受限于测试环境**
-- 原因：最小化 initramfs 缺少 MSR 设备和模块
-- 影响：无法读取 IA32_VMX_BASIC 等 MSR
-- 解决方案：使用完整的 Linux 发行版
-
----
-
-## 💡 关键洞察
-
-1. **VM-Exit 开销主要来自上下文切换**
-   - 固定开销：~1500 ns
-   - 处理逻辑：~100 ns
-   - 优化方向：减少 VM-Exit 次数
-
-2. **CPUID Faulting 是安全特性**
-   - 防止用户态探测 CPU 特性
-   - 在虚拟化场景中很有用
-   - Ring 0 不受影响
-
-3. **MSR Bitmap 是性能优化的关键**
-   - 透传 MSR：10 ns
-   - 拦截 MSR：1500 ns
-   - KVM 智能选择哪些 MSR 透传
-
-4. **最小化测试环境的局限性**
-   - 优点：快速启动，占用空间小
-   - 缺点：缺少完整功能（MSR 设备、模块）
-   - 解决方案：使用完整的 Linux 发行版
-
----
-
-## 🚀 下一步
-
-### Phase 2: 内存虚拟化
-- EPT (Extended Page Table) 机制
-- 影子页表 vs EPT
-- GPA → HPA 地址转换
-- 大页支持（2MB/1GB）
-
-### Phase 4: 中断虚拟化
-- 虚拟 LAPIC/IOAPIC
-- APICv 机制
-- Posted Interrupts
-- 中断注入机制
-
----
-
-## 📝 总结
-
-**Phase 1 状态**: ✅ **完成**
-
-通过理论学习和实战练习，我们深入理解了：
-- ✅ VT-x 硬件机制
-- ✅ CPUID 虚拟化
-- ✅ MSR 虚拟化
-- ✅ VM-Exit 开销
-
-**关键数据**：
-- VM-Exit 开销：~1500 ns
-- 透传指令：~10 ns
-- 拦截指令：~1500 ns
-- 性能差异：150 倍
-
-**测试环境**：完全可用，可以继续进行 Phase 2-11 的学习和测试。
-
----
-
-**完成时间**: 2026-06-29  
-**测试状态**: ✅ 核心功能验证通过  
-**下一步**: Phase 2 - 内存虚拟化
+1. VMX 特性依赖链 — EPT → unrestricted_guest, APICv → PI
+2. MSR Bitmap — 透传 vs 拦截 150x 性能差异
+3. VM-Exit 分发 — O(1) 查表 + 快速/慢速路径
+4. CPUID 虚拟化 — 硬件强制 VM-Exit + KVM 过滤 + Faulting
+5. Halt-Polling — 忙等 vs 阻塞权衡 + 自适应算法
