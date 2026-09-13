@@ -414,10 +414,10 @@ CPU-bound VM:
   MSR_WRITE              3000  (5.0%)
   ...
 
-IO-bound VM:
-  IO_INSTRUCTION        40000 (66.7%)
-  EPT_VIOLATION         15000 (25.0%)
-  PREEMPTION_TIMER       3000  (5.0%)
+IO-bound VM (Direct I/O, virtio-blk):
+  EPT_MISCONFIG         40000 (66.7%)  ← virtio MMIO 区域访问
+  IO_INSTRUCTION        10000 (16.7%)
+  PREEMPTION_TIMER       5000  (8.3%)
   ...
 ```
 
