@@ -181,6 +181,7 @@ echo "$TRACE_DATA" | grep "msr_" | \
         case "$msr" in
             10)          desc="IA32_TSC (不应出现=透传)" ;;
             1b)          desc="IA32_APIC_BASE" ;;
+            3b)          desc="IA32_TSC_ADJUST" ;;
             48)          desc="IA32_SPEC_CTRL" ;;
             49)          desc="IA32_PRED_CMD" ;;
             8b)          desc="IA32_BIOS_SIGN_ID" ;;
@@ -192,6 +193,7 @@ echo "$TRACE_DATA" | grep "msr_" | \
             1a4)         desc="IA32_PRIMASK" ;;
             1a6)         desc="IA32_SECPLMASK" ;;
             1a9)         desc="IA32_TERTPLMASK" ;;
+            6e0)         desc="IA32_TSC_DEADLINE (定时器)" ;;
             c0000080)    desc="IA32_EFER" ;;
             c0000081)    desc="IA32_STAR" ;;
             c0000082)    desc="IA32_LSTAR" ;;
