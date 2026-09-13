@@ -34,13 +34,17 @@ ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm
 # 输出应 >0；=0 说明走的是 TCG，所有 KVM 追踪实验结论都无效
 
 # 宿主侧：编译练习程序（如果还没有编译）
-cd /root/code/kvm-study/phase1-cpu-virt/practice
+cd practice
 make clean && make
 
 # 将编译好的程序复制到共享目录，供 Guest 访问
 cp ex* /root/code/kvm-study/scripts/shared/
 
-# Guest 侧：在 /mnt/shared 中访问程序
+# Guest 侧：手动挂载 9p 共享目录（ubuntu rootfs 不会自动挂载）
+sudo mkdir -p /mnt/shared
+sudo mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/shared
+
+# 验证挂载
 ls /mnt/shared/ex*
 # 应该能看到 ex1-vmx-verify, ex2-cpuid-fault 等
 
