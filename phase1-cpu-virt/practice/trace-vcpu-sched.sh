@@ -122,10 +122,20 @@ echo > "$TRACEFS/trace"
 echo 0 > "$TRACEFS/tracing_on"
 echo > "$TRACEFS/set_event"
 echo nop > "$TRACEFS/current_tracer"
+echo > "$TRACEFS/set_event_pid"
 
 # 设置事件
 echo kvm:kvm_vcpu_wakeup > "$TRACEFS/set_event"
-echo "$PID" > "$TRACEFS/set_event_pid"
+
+# PID 过滤 - 必须包括所有 vCPU 线程
+QEMU_TIDS=$(ls /proc/$PID/task/ 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+if [ -n "$QEMU_TIDS" ]; then
+    echo "$QEMU_TIDS" > "$TRACEFS/set_event_pid"
+    TID_COUNT=$(echo "$QEMU_TIDS" | wc -w)
+    echo "追踪 $TID_COUNT 个线程"
+else
+    echo -e "${YELLOW}警告: 无法获取线程列表${NC}"
+fi
 
 # 追踪
 echo 1 > "$TRACEFS/tracing_on"
@@ -135,9 +145,9 @@ echo 0 > "$TRACEFS/tracing_on"
 TRACE_DATA=$(cat "$TRACEFS/trace")
 
 # 分析 wakeup 事件
-POLL_COUNT=$(echo "$TRACE_DATA" | grep "polling" | grep -c "valid" || true)
-WAIT_COUNT=$(echo "$TRACE_DATA" | grep -c "wait" || true)
-INVALID_COUNT=$(echo "$TRACE_DATA" | grep -c "invalid" || true)
+POLL_COUNT=$(echo "$TRACE_DATA" | grep -c "polling valid" || true)
+WAIT_COUNT=$(echo "$TRACE_DATA" | grep -c "polling wait" || true)
+INVALID_COUNT=$(echo "$TRACE_DATA" | grep -c "polling invalid" || true)
 TOTAL_WAKE=$((POLL_COUNT + WAIT_COUNT + INVALID_COUNT))
 
 echo -e "${BLUE}=== Halt-Polling 统计 (${DURATION}秒) ===${NC}"
@@ -167,9 +177,9 @@ echo ""
 echo "  参考: phase0 annotations.md §7 — halt-polling 三阶段"
 echo ""
 
-# 提取等待时间
+# 提取等待时间（格式: "wait time 3992257 ns"）
 echo "$TRACE_DATA" | grep "kvm_vcpu_wakeup" | \
-    grep -oP 'time \K[0-9]+' | \
+    grep -oP 'wait time \K[0-9]+' | \
     sort -n | \
     awk '
     BEGIN { n=0; sum=0; min=999999999999; max=0; }
