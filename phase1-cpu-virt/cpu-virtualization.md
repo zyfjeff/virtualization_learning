@@ -1384,6 +1384,6 @@ grep -A 3 "define XFER_TO_GUEST_MODE_WORK" \
 - [ ] kvm_x86_ops 中 vcpu_run 和 handle_exit 的调用时机是什么？
 - [ ] kvmclock 用的 CPUID 叶号是什么？KVM 注入了哪些半虚拟化特性？
 - [ ] x2APIC MSR 在 APICv 启用时如何处理？ICR 为什么例外？
-- [ ] **immediate_exit 在什么时候被检查？为什么不能中断正在 guest 里运行的 vCPU？**
-- [ ] **信号如何中断 vCPU？_TIF_SIGPENDING 在哪个检查点被处理？**
-- [ ] **三种 VMM（QEMU/Firecracker/cloud-hypervisor）的 vCPU 唤醒策略有什么区别？各自的优缺点是什么？**
+- [ ] immediate_exit 在什么时候被检查？为什么不能中断正在 guest 里运行的 vCPU？
+- [ ] 信号如何中断 vCPU？_TIF_SIGPENDING 在哪个检查点被处理？
+- [ ] 三种 VMM（QEMU/Firecracker/cloud-hypervisor）的 vCPU 唤醒策略有什么区别？各自的优缺点是什么？
