@@ -335,12 +335,17 @@ stress --cpu 4 --timeout 30
 
 **负载 3: IO-bound**
 ```bash
-# Guest 内运行 stress（I/O 密集）
+# Guest 内运行 stress（I/O 密集，Buffered I/O）
 # 注意：确保当前目录不是 tmpfs（如 /tmp），否则还是写内存
 cd /root  # 或 df -T . 确认是真实磁盘
 stress --io 4 --timeout 30
+
+# 如果要测试 Direct I/O（绕过 page cache）：
+stress --hdd 4 --hdd-bytes 1G --hdd-opts direct --timeout 30
 ```
-预期：IO_INSTRUCTION 主导
+预期：
+- Buffered I/O：EPT_VIOLATION（写 page cache）+ 少量 IO_INSTRUCTION（fsync）
+- Direct I/O：IO_INSTRUCTION 主导（每次 write 都到设备）
 
 **负载 4: Memory-bound**（可选）
 ```bash
