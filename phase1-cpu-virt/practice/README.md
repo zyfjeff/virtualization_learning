@@ -33,9 +33,16 @@ cd ../../scripts/vm
 ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm
 # 输出应 >0；=0 说明走的是 TCG，所有 KVM 追踪实验结论都无效
 
-# Guest 侧：编译练习程序
-cd /mnt/shared
+# 宿主侧：编译练习程序（如果还没有编译）
+cd /root/code/kvm-study/phase1-cpu-virt/practice
 make clean && make
+
+# 将编译好的程序复制到共享目录，供 Guest 访问
+cp ex* /root/code/kvm-study/scripts/shared/
+
+# Guest 侧：在 /mnt/shared 中访问程序
+ls /mnt/shared/ex*
+# 应该能看到 ex1-vmx-verify, ex2-cpuid-fault 等
 
 # 宿主侧：确认 tracefs 可用
 ls /sys/kernel/tracing/events/kvm/ | head
