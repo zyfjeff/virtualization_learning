@@ -317,23 +317,44 @@ sudo ./profile-vmexit.sh -p $(pgrep -f qemu-system) -d 30
 
 #### 3.2 运行 3 种负载
 
+使用 `stress` 统一测试不同负载类型，观察 VM-Exit 分布差异。
+
 **负载 1: idle**
 ```bash
 # Guest 内什么都不做，或运行 sleep
 sleep 30
 ```
+预期：HLT + PREEMPTION_TIMER 主导
 
 **负载 2: CPU-bound**
 ```bash
-# Guest 内运行 stress
+# Guest 内运行 stress（纯 CPU 计算）
 stress --cpu 4 --timeout 30
 ```
+预期：CPUID 主导（glibc 运行时检测 CPU 特性）
 
 **负载 3: IO-bound**
 ```bash
-# Guest 内运行 dd
-dd if=/dev/zero of=/tmp/test bs=1M count=1000 oflag=direct
+# Guest 内运行 stress（I/O 密集）
+# 注意：确保当前目录不是 tmpfs（如 /tmp），否则还是写内存
+cd /root  # 或 df -T . 确认是真实磁盘
+stress --io 4 --timeout 30
 ```
+预期：IO_INSTRUCTION 主导
+
+**负载 4: Memory-bound**（可选）
+```bash
+# Guest 内运行 stress（内存密集）
+stress --vm 4 --vm-bytes 512M --timeout 30
+```
+预期：EPT_VIOLATION 主导
+
+**负载 5: 综合负载**（可选）
+```bash
+# 混合 CPU + IO + Memory
+stress --cpu 2 --io 2 --vm 2 --timeout 30
+```
+预期：各种 Exit 均衡分布
 
 #### 3.3 分析 VM-Exit 分布
 
