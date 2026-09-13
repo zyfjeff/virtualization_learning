@@ -1,8 +1,14 @@
 /*
  * 练习 3: MSR 访问测试
  *
- * 目标: 观察 MSR Bitmap 的作用，测量不同 MSR 的访问时间
- * 注意: 使用 /dev/cpu/0/msr 读取 MSR
+ * 目标: 观察不同 MSR 的访问
+ * 方法: 使用 /dev/cpu/0/msr 读取 MSR
+ *
+ * 注意: 这个程序测量的是"系统调用 + RDMSR"的总开销，
+ *       系统调用开销 (~2000-3000 ns) 会淹没 VM-Exit 差异。
+ *       要准确测量 VM-Exit 开销，请使用：
+ *       1. 宿主侧 trace-msr-access.sh（观察哪些 MSR 被拦截）
+ *       2. ex5-vmexit-overhead（测量 CPUID vs RDTSC 开销）
  */
 
 #include <stdio.h>
