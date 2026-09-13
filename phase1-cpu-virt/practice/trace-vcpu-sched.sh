@@ -145,8 +145,10 @@ echo 0 > "$TRACEFS/tracing_on"
 TRACE_DATA=$(cat "$TRACEFS/trace")
 
 # 分析 wakeup 事件
-POLL_COUNT=$(echo "$TRACE_DATA" | grep -c "polling valid" || true)
-WAIT_COUNT=$(echo "$TRACE_DATA" | grep -c "polling wait" || true)
+# 实际格式: "wait time X ns, polling valid" 或 "poll time X ns, polling invalid"
+# waited=true 时输出 "wait time"，waited=false 时输出 "poll time"
+POLL_COUNT=$(echo "$TRACE_DATA" | grep -c "poll time.*polling valid" || true)
+WAIT_COUNT=$(echo "$TRACE_DATA" | grep -c "wait time" || true)
 INVALID_COUNT=$(echo "$TRACE_DATA" | grep -c "polling invalid" || true)
 TOTAL_WAKE=$((POLL_COUNT + WAIT_COUNT + INVALID_COUNT))
 

@@ -35,8 +35,11 @@
   - MSR_FS/GS_BASE, MSR_KERNEL_GS_BASE
   - MSR_IA32_SYSENTER_CS/ESP/EIP
   - C-state residency counters
-- Bitmap 布局: 0x000-0x3FF (low read), 0x800-0xBFF (low write),
-  0x400-0x7FF (high read), 0xC00-0xFFF (high write)
+- Bitmap 布局: 4 个 128 字节区域（共 4KB）
+  - 0x000-0x07F: MSR 0x0000-0x1FFF 读拦截
+  - 0x080-0x0FF: MSR 0xC0000000-0xC0001FFF 读拦截
+  - 0x100-0x17F: MSR 0x0000-0x1FFF 写拦截
+  - 0x180-0x1FF: MSR 0xC0000000-0xC0001FFF 写拦截
 
 **性能数据**:
 - 透传 MSR (IA32_TSC): ~10 ns

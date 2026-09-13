@@ -280,10 +280,11 @@ void vmx_disable_intercept_for_msr(struct kvm_vcpu *vcpu, u32 msr, int type)
    - 对照 `vmx_set_msr()` 里的处理逻辑
 
 2. **MSR Bitmap 的布局是什么？**
-   - 低 1024 字节：MSR 0x00000000 - 0x00001FFF 的读拦截
-   - 接下来 1024 字节：MSR 0x00000000 - 0x00001FFF 的写拦截
-   - 接下来 1024 字节：MSR 0xC0000000 - 0xC0001FFF 的读拦截
-   - 最后 1024 字节：MSR 0xC0000000 - 0xC0001FFF 的写拦截
+   - 总共 4KB，分为 4 个 128 字节区域（每个区域 1024 bits，覆盖 8192 个 MSR）
+   - 偏移 0x000-0x07F (128B)：MSR 0x00000000 - 0x00001FFF 的**读**拦截
+   - 偏移 0x080-0x0FF (128B)：MSR 0xC0000000 - 0xC0001FFF 的**读**拦截
+   - 偏移 0x100-0x17F (128B)：MSR 0x00000000 - 0x00001FFF 的**写**拦截
+   - 偏移 0x180-0x1FF (128B)：MSR 0xC0000000 - 0xC0001FFF 的**写**拦截
    - 对照 Intel SDM Vol 3, Section 24.6.9, Figure 24-11
 
 3. **如果 Guest 访问不在 bitmap 范围内的 MSR（如 0x2000），会怎样？**
@@ -389,13 +390,14 @@ stress --cpu 2 --io 2 --vm 2 --timeout 30
 程序直接测量不同指令的开销：
 - **CPUID**：每次触发 VM-Exit
 - **RDTSC**：透传，无 VM-Exit
-- **RDMSR IA32_TSC**：透传
-- **RDMSR IA32_EFER**：拦截，触发 VM-Exit
+
+**为什么没有 RDMSR？**
+RDMSR 是特权指令，用户态执行会触发 #GP。要测量 MSR 的 VM-Exit 开销，请使用宿主侧的 `trace-msr-access.sh`。
 
 **预期结果**：
-- 透传指令（RDTSC, RDMSR TSC）：~50-200 ns
-- 拦截指令（CPUID, RDMSR EFER）：~1000-3000 ns
-- 差异：10-50 倍
+- RDTSC（透传）：~10-50 ns
+- CPUID（拦截）：~1000-2000 ns
+- 差异：50-100 倍
 
 **注意**：这个程序使用内联汇编直接执行指令，避免了系统调用开销，能准确测量 VM-Exit 的真实开销。
 

@@ -100,7 +100,7 @@ CPUID Faulting 是一个独立于 VMX 的 CPU 特性，用于控制 CPUID 指令
 │                                                                      │
 │  第一步: 确认 CPU 支持                                              │
 │    读 MSR_PLATFORM_INFO (0xCE) bit 31                              │
-│    或 CPUID leaf 7, sub-leaf 0, EBX bit 31                        │
+│    或 CPUID leaf 7, sub-leaf 0, ECX bit 3                         │
 │    = 1 表示支持                                                     │
 │                                                                      │
 │  第二步: 启用                                                       │
