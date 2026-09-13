@@ -197,13 +197,29 @@ IA32_VMX_PINBASED_CTLS (0x481) = 0xXXXXXXXXXXXXXXXX
 
 ### 步骤
 
-#### 2.1 在 Guest 内运行 ex3-msr-test
+#### 2.1 理解正确的测量方法
+
+**⚠️ 常见陷阱**：在 Guest 中通过 `/dev/cpu/0/msr` 测量 MSR 访问时间
 
 ```bash
+# 错误方法（不推荐）
 ./ex3-msr-test
 ```
 
-测量不同 MSR 的访问时间。透传的 MSR（如 IA32_TSC）比拦截的 MSR（如 IA32_EFER）快 10-100 倍。
+**问题**：
+- 系统调用开销（~2000-3000 ns）淹没了 VM-Exit 差异
+- 结果：透传 vs 拦截只有 1-2x 差异（误导）
+
+**正确方法**：在宿主侧追踪 `kvm:kvm_msr` 事件
+
+```bash
+# 正确方法
+sudo ./trace-msr-access.sh -d 5
+```
+
+**原理**：
+- **透传 MSR**：**不出现**在 `kvm:kvm_msr` trace 中（无 VM-Exit，直接读物理 MSR）
+- **拦截 MSR**：**出现**在 trace 中（每次 VM-Exit，开销 ~1500-3000 ns）
 
 #### 2.2 在宿主侧用 ftrace 追踪 MSR 访问
 
