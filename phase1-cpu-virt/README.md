@@ -197,7 +197,7 @@ cd ../../scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
 - **启动脚本**: `scripts/vm/boot-vm.sh`（前台运行 QEMU）
 - **详细说明**: 参见 `scripts/README.md` 与 `practice/README.md`
 
-### 快速实验（不需要 VM）
+### 快速体验（不需要 VM）
 
 如果只是想快速了解 VT-x 基础，可以运行不需要 VM 的实验：
 

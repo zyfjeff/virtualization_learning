@@ -20,9 +20,9 @@
 
 set -euo pipefail
 
+TRACEFS=""
 PID=""
 DURATION=30
-OUTPUT=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -30,6 +30,19 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+
+# Cleanup function to restore tracefs state
+cleanup() {
+    if [ -n "$TRACEFS" ] && [ -d "$TRACEFS" ]; then
+        echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+        echo > "$TRACEFS/set_event" 2>/dev/null || true
+        echo nop > "$TRACEFS/current_tracer" 2>/dev/null || true
+        echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+        echo > "$TRACEFS/set_event_pid" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
 
 usage() {
     echo "用法: sudo $0 [选项]"
@@ -39,16 +52,14 @@ usage() {
     echo "选项:"
     echo "  -p PID     QEMU 进程 PID (不指定则自动检测)"
     echo "  -d SECS    分析持续时间（默认 30 秒）"
-    echo "  -o FILE    输出文件"
     echo "  -h         显示帮助"
     exit 0
 }
 
-while getopts "p:d:o:h" opt; do
+while getopts "p:d:h" opt; do
     case $opt in
         p) PID="$OPTARG" ;;
         d) DURATION="$OPTARG" ;;
-        o) OUTPUT="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -196,11 +207,6 @@ if [ -n "$TRACEFS" ] && [ -d "$TRACEFS/events/kvm/kvm_exit" ]; then
     echo > "$TRACEFS/set_event_pid"
 else
     echo -e "${YELLOW}tracefs 不可用，跳过 ftrace 分析${NC}"
-fi
-
-# 输出到文件
-if [ -n "$OUTPUT" ]; then
-    echo "报告已保存到: $OUTPUT"
 fi
 
 echo -e "${GREEN}完成！${NC}"

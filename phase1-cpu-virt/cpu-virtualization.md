@@ -1,4 +1,4 @@
-# 补充章节：CPU 虚拟化深度
+# CPU 虚拟化深度
 
 > 基于 Linux 6.12.93 源码
 >
@@ -1355,18 +1355,21 @@ fn wait_until_signal_acknowledged(&self) -> Result<()> {
 ### 6.7 源码对照
 
 ```bash
+# 假设 LINUX_SRC=/root/code/linux-6.12.93
+LINUX_SRC=${LINUX_SRC:-/root/code/linux-6.12.93}
+
 # wants_to_run 只在 KVM_RUN 入口检查
-grep -n "wants_to_run" /root/code/linux-6.12.93/arch/x86/kvm/x86.c
+grep -n "wants_to_run" $LINUX_SRC/arch/x86/kvm/x86.c
 # 11597:  if (!vcpu->wants_to_run) {  # KVM_RUN 入口
 # 11676:  if (!vcpu->wants_to_run) {  # KVM_RUN 主入口
 
 # vcpu_run 主循环不检查 wants_to_run
-sed -n '11343,11391p' /root/code/linux-6.12.93/arch/x86/kvm/x86.c | grep wants_to_run
+sed -n '11343,11391p' $LINUX_SRC/arch/x86/kvm/x86.c | grep wants_to_run
 # （无输出）
 
 # XFER_TO_GUEST_MODE_WORK 包含 _TIF_SIGPENDING
 grep -A 3 "define XFER_TO_GUEST_MODE_WORK" \
-    /root/code/linux-6.12.93/include/linux/entry-kvm.h
+    $LINUX_SRC/include/linux/entry-kvm.h
 # _TIF_NEED_RESCHED | _TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL | ...
 ```
 
