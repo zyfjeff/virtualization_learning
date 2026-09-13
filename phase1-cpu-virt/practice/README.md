@@ -344,8 +344,13 @@ stress --io 4 --timeout 30
 stress --hdd 4 --hdd-bytes 1G --hdd-opts direct --timeout 30
 ```
 预期：
-- Buffered I/O：EPT_VIOLATION（写 page cache）+ 少量 IO_INSTRUCTION（fsync）
-- Direct I/O：IO_INSTRUCTION 主导（每次 write 都到设备）
+- **Buffered I/O**：EPT_VIOLATION（写 page cache）+ 少量 IO_INSTRUCTION（fsync）
+- **Direct I/O（virtio-blk）**：
+  - **EPT_MISCONFIG 主导**（virtio MMIO 区域访问，内存类型配置触发）
+  - 少量 IO_INSTRUCTION（legacy 端口 I/O）
+  - MSR_WRITE（定时器）
+
+**注意**：EPT_MISCONFIG 通常表示 EPT 页表内存类型配置问题，但对于 virtio MMIO 区域，这是**正常的 MMIO 处理机制**——KVM 故意将 MMIO 区域配置为特殊内存类型，Guest 访问时触发 VM-Exit 由 KVM 模拟。
 
 **负载 4: Memory-bound**（可选）
 ```bash
