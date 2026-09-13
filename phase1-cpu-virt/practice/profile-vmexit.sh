@@ -81,49 +81,9 @@ echo "源码: vmx.c:6095 — kvm_vmx_exit_handlers[]"
 echo ""
 
 # ==========================================
-# Part 1: perf kvm stat record
+# Part 1: ftrace VM-Exit 分析
 # ==========================================
-echo -e "${CYAN}[1] 收集 perf kvm 数据 (${DURATION}秒)...${NC}"
-echo ""
-
-PERF_DATA=$(mktemp /tmp/kvm-perf-XXXXXX.data)
-
-# 检查 perf 是否可用
-if ! command -v perf &>/dev/null; then
-    echo -e "${RED}错误: perf 不可用${NC}"
-    echo "安装: apt install linux-tools-$(uname -r)"
-    exit 1
-fi
-
-perf kvm stat record -p "$PID" -o "$PERF_DATA" -- sleep "$DURATION" 2>&1 || {
-    echo -e "${YELLOW}perf kvm stat record 失败${NC}"
-    rm -f "$PERF_DATA"
-    exit 1
-}
-
-# ==========================================
-# Part 2: perf kvm stat report
-# ==========================================
-echo -e "${CYAN}[2] 分析 VM-Exit 分布...${NC}"
-echo ""
-
-REPORT_DATA=$(mktemp /tmp/kvm-report-XXXXXX.txt)
-perf kvm stat report -i "$PERF_DATA" --stdio > "$REPORT_DATA" 2>&1 || true
-
-if [ -f "$REPORT_DATA" ] && [ -s "$REPORT_DATA" ]; then
-    # 解析 perf kvm stat report 输出
-    echo -e "${BLUE}=== VM-Exit Reason 分布 ===${NC}"
-    echo ""
-    cat "$REPORT_DATA" | head -60
-    echo ""
-else
-    echo -e "${YELLOW}perf kvm stat report 无数据${NC}"
-fi
-
-# ==========================================
-# Part 3: ftrace 补充分析
-# ==========================================
-echo -e "${CYAN}[3] ftrace 补充分析 (kvm:kvm_exit + kvm:kvm_entry)...${NC}"
+echo -e "${CYAN}[1] ftrace VM-Exit 分析 (kvm:kvm_exit + kvm:kvm_entry)...${NC}"
 echo ""
 
 TRACEFS=""
@@ -140,11 +100,23 @@ if [ -n "$TRACEFS" ] && [ -d "$TRACEFS/events/kvm/kvm_exit" ]; then
     echo 0 > "$TRACEFS/tracing_on"
     echo > "$TRACEFS/set_event"
     echo nop > "$TRACEFS/current_tracer"
+    echo > "$TRACEFS/set_event_pid"
 
     # 设置事件
     echo kvm:kvm_exit > "$TRACEFS/set_event"
     echo kvm:kvm_entry >> "$TRACEFS/set_event"
-    echo "$PID" > "$TRACEFS/set_event_pid"
+
+    # 获取 QEMU 进程的所有线程（包括 vCPU 线程）
+    # KVM 事件在 vCPU 线程中触发，不是主线程
+    # set_event_pid 需要空格或换行分隔的 PID 列表
+    QEMU_TIDS=$(ls /proc/$PID/task/ 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+    if [ -n "$QEMU_TIDS" ]; then
+        echo "$QEMU_TIDS" > "$TRACEFS/set_event_pid"
+        TID_COUNT=$(echo "$QEMU_TIDS" | wc -w)
+        echo "  追踪 $TID_COUNT 个线程"
+    else
+        echo "  警告: 无法获取线程列表，将追踪所有 KVM 事件"
+    fi
 
     # 追踪
     echo 1 > "$TRACEFS/tracing_on"
@@ -225,9 +197,6 @@ if [ -n "$TRACEFS" ] && [ -d "$TRACEFS/events/kvm/kvm_exit" ]; then
 else
     echo -e "${YELLOW}tracefs 不可用，跳过 ftrace 分析${NC}"
 fi
-
-# 清理
-rm -f "$PERF_DATA" "$REPORT_DATA"
 
 # 输出到文件
 if [ -n "$OUTPUT" ]; then

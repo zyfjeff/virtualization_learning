@@ -124,9 +124,17 @@ echo nop > "$TRACEFS/current_tracer"
 # 设置 MSR 事件
 echo kvm:kvm_msr > "$TRACEFS/set_event"
 
-# PID 过滤
+# PID 过滤 - 必须包括所有 vCPU 线程，不仅仅是主线程
+# KVM tracepoint 在 vCPU 线程中触发，不是 QEMU 主线程
 if [ -n "$PID" ]; then
-    echo "$PID" > "$TRACEFS/set_event_pid"
+    QEMU_TIDS=$(ls /proc/$PID/task/ 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+    if [ -n "$QEMU_TIDS" ]; then
+        echo "$QEMU_TIDS" > "$TRACEFS/set_event_pid"
+        TID_COUNT=$(echo "$QEMU_TIDS" | wc -w)
+        echo "追踪 $TID_COUNT 个线程 (主线程 + vCPU 线程)"
+    else
+        echo -e "${YELLOW}警告: 无法获取线程列表，将追踪所有 KVM MSR 访问${NC}"
+    fi
 fi
 
 # 开始追踪
@@ -140,11 +148,11 @@ echo ""
 # 分析结果
 TRACE_DATA=$(cat "$TRACEFS/trace")
 
-# 统计总数
-TOTAL=$(echo "$TRACE_DATA" | grep "msr_" | wc -l)
-READS=$(echo "$TRACE_DATA" | grep "msr_read" | wc -l)
-WRITES=$(echo "$TRACE_DATA" | grep "msr_write" | wc -l)
-EXCEPTIONS=$(echo "$TRACE_DATA" | grep "#GP" | wc -l)
+# 统计总数 - 使用 || true 防止 grep 找不到匹配时脚本退出
+TOTAL=$(echo "$TRACE_DATA" | grep -c "msr_" || true)
+READS=$(echo "$TRACE_DATA" | grep -c "msr_read" || true)
+WRITES=$(echo "$TRACE_DATA" | grep -c "msr_write" || true)
+EXCEPTIONS=$(echo "$TRACE_DATA" | grep -c "#GP" || true)
 
 echo -e "${BLUE}=== MSR 访问统计 (${DURATION}秒) ===${NC}"
 echo ""

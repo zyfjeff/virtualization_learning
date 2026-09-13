@@ -244,6 +244,46 @@ return kvm_vmx_exit_handlers[exit_handler_index](vcpu);
 
 *注：`handle_io()` 和 `handle_cpuid()` 在内核态处理后可能返回 1（重入）或 0（回用户空间），取决于是否模拟完成。
 
+### Q: MSR 访问一定在内核处理吗？`user_space_msr` 机制是什么？
+
+**文件**: `arch/x86/kvm/x86.c:2032` — `kvm_msr_user_space()`
+
+**不一定**。KVM 提供了 `user_space_msr` 机制，允许将特定的 MSR 访问传递给用户空间 VMM（如 QEMU）处理。
+
+**工作流程**：
+```
+Guest RDMSR/WRMSR
+    ↓ VM-Exit (MSR_READ/WRITE)
+kvm_emulate_rdmsr/wrmsr()
+    ↓ KVM 无法处理
+kvm_msr_user_space()
+    ↓ 检查是否启用了 MSR 过滤
+KVM_EXIT_X86_RDMSR/WRMSR
+    ↓ 返回用户空间
+QEMU: kvm_handle_rdmsr/wrmsr()
+    ↓ 调用注册的 handler
+返回模拟结果给 Guest
+```
+
+**QEMU 中的实现** (`target/i386/kvm/kvm.c`)：
+```c
+/* 1. 启用 MSR 过滤能力 */
+kvm_vm_enable_cap(s, KVM_CAP_X86_USER_SPACE_MSR, 0,
+                  KVM_MSR_EXIT_REASON_FILTER);
+
+/* 2. 注册特定 MSR 的处理函数 */
+kvm_filter_msr(s, MSR_CORE_THREAD_COUNT,   /* 0x35: CPU 拓扑 */
+               kvm_rdmsr_core_thread_count, NULL);
+kvm_filter_msr(s, MSR_PKG_ENERGY_STATUS,   /* 0x611: RAPL 能耗 */
+               kvm_rdmsr_pkg_energy_status, NULL);
+```
+
+**哪些 MSR 需要在 VMM 层模拟**：
+- `MSR_CORE_THREAD_COUNT` (0x35) — 返回虚拟 CPU 拓扑，依赖 `-smp` 配置
+- RAPL 系列 (0x606/0x610/0x611/0x614) — 虚拟化能耗监控，多 VM 共享物理 CPU
+
+**为什么需要这个机制**：某些 MSR 的值依赖 VMM 配置（如 CPU 拓扑）或需要跨 VM 聚合（如能耗数据），KVM 内核无法独立处理。
+
 ### Q: `exit_fastpath` 有几种？
 
 **文件**: `arch/x86/include/asm/kvm_host.h:215`
