@@ -379,6 +379,26 @@ stress --cpu 2 --io 2 --vm 2 --timeout 30
 | CPUID | `handle_cpuid()` | 否 | 回用户空间 |
 | IO_INSTRUCTION | `handle_io()` | 可能 | 回用户空间 |
 
+#### 3.4 测量 VM-Exit 开销
+
+```bash
+# Guest 内运行
+./ex5-vmexit-overhead
+```
+
+程序直接测量不同指令的开销：
+- **CPUID**：每次触发 VM-Exit
+- **RDTSC**：透传，无 VM-Exit
+- **RDMSR IA32_TSC**：透传
+- **RDMSR IA32_EFER**：拦截，触发 VM-Exit
+
+**预期结果**：
+- 透传指令（RDTSC, RDMSR TSC）：~50-200 ns
+- 拦截指令（CPUID, RDMSR EFER）：~1000-3000 ns
+- 差异：10-50 倍
+
+**注意**：这个程序使用内联汇编直接执行指令，避免了系统调用开销，能准确测量 VM-Exit 的真实开销。
+
 ### 思考题
 
 1. **为什么 idle VM 的 PREEMPTION_TIMER 占比最高？**
