@@ -623,7 +623,7 @@ kvm_is_mmio_pfn(pfn)
 
 ### 7.2 内存类型决策（完整逻辑）
 
-**实际代码**（`arch/x86/kvm/vmx/vmx.c:7676`）：
+**实际代码**（`arch/x86/kvm/vmx/vmx.c:7679`）：
 
 ```c
 u8 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
@@ -632,11 +632,19 @@ u8 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
     if (is_mmio)
         return MTRR_TYPE_UNCACHABLE << VMX_EPT_MT_EPTE_SHIFT;
     
-    // 非 MMIO 区域
-    if (!kvm_arch_has_noncoherent_dma(vcpu->kvm))
+    // 非 MMIO 区域：根据是否忽略 Guest PAT 决定
+    if (vmx_ignore_guest_pat(vcpu->kvm))
         return (MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT) | VMX_EPT_IPAT_BIT;
     
     return MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT;
+}
+
+// vmx_ignore_guest_pat() 的实现（vmx.c:7668）
+static inline bool vmx_ignore_guest_pat(struct kvm *kvm)
+{
+    // 有非一致性 DMA 设备时，必须信任 Guest PAT
+    return !kvm_arch_has_noncoherent_dma(kvm) &&
+           kvm_check_has_quirk(kvm, KVM_X86_QUIRK_IGNORE_GUEST_PAT);
 }
 ```
 
@@ -645,30 +653,95 @@ u8 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
 ```
 vmx_get_mt_mask(vcpu, gfn, is_mmio)
     ↓
-┌─ is_mmio = true
+┌─ is_mmio = true（MMIO 区域）
 │   └─ 返回 UC（强制，无 IPAT 位）
 │      防止缓存导致 Machine Check
+│      Guest PAT 不适用（MMIO 必须 UC）
 │
-└─ is_mmio = false
+└─ is_mmio = false（RAM 区域）
     ↓
-    检查：kvm_arch_has_noncoherent_dma(vcpu->kvm)
+    检查：vmx_ignore_guest_pat(kvm)
+    = !has_noncoherent_dma && has_quirk(IGNORE_GUEST_PAT)
     ↓
-    ├─ false（无 VFIO 非一致性 DMA 设备）
+    ├─ true（忽略 Guest PAT）
     │   └─ 返回 WB + IPAT
-    │      忽略 Guest PAT 设置
+    │      IPAT=1 → 硬件忽略 Guest PAT
+    │      条件：无非一致性 DMA + 启用了 quirk
     │
-    └─ true（有 VFIO 非一致性 DMA 设备）
+    └─ false（不忽略 Guest PAT）
         └─ 返回 WB（无 IPAT 位）
-           允许 Guest 控制内存类型
+           IPAT=0 → 硬件考虑 Guest PAT
+           条件：有非一致性 DMA（如 VFIO GPU）
 ```
 
 **三种场景总结**：
 
-| 场景 | 条件 | 返回值 | IPAT 位 | Guest PAT |
-|------|------|--------|---------|-----------|
+| 场景 | 条件 | EPT 内存类型 | IPAT 位 | Guest PAT |
+|------|------|-------------|---------|-----------|
 | **MMIO 区域** | `is_mmio = true` | `UC` | N/A | 不适用（强制 UC） |
-| **普通 VM** | `noncoherent_dma_count = 0` | `WB + IPAT` | **1** | **忽略** |
-| **VFIO VM** | `noncoherent_dma_count > 0` | `WB` | **0** | **考虑** |
+| **普通 VM** | 无非一致性 DMA + quirk 启用 | `WB + IPAT` | **1** | **忽略** |
+| **VFIO VM** | 有非一致性 DMA 设备 | `WB` | **0** | **考虑** |
+
+### 7.2.1 内存属性的完整优先级
+
+内存属性由多个层面共同决定，优先级从高到低：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  优先级 1: 硬件强制（不可覆盖）                              │
+│  ─────────────────────────────                              │
+│  • MMIO 区域：强制 UC（Uncacheable）                        │
+│    - 原因：缓存 MMIO 会导致 Machine Check                   │
+│    - 实现：vmx_get_mt_mask() 直接返回 UC                    │
+│    - Guest 无法覆盖                                         │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  优先级 2: VMM 控制（EPT + IPAT）                           │
+│  ─────────────────────────                                  │
+│  • EPT 页表项中的内存类型字段（bit 3-5）                    │
+│  • IPAT 位（bit 6）：是否忽略 Guest PAT                     │
+│    - IPAT=1：硬件完全忽略 Guest PAT，使用 EPT 中的类型      │
+│    - IPAT=0：硬件结合 EPT 类型和 Guest PAT                  │
+│  • VMM 通过 KVM_X86_QUIRK_IGNORE_GUEST_PAT 控制             │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  优先级 3: Guest 控制（仅当 IPAT=0）                        │
+│  ───────────────────────────────                            │
+│  • Guest 页表中的 PAT 位（bit 3, 4, 7）                     │
+│  • Guest MSR_IA32_PAT 定义 8 种内存类型                     │
+│  • 仅在 IPAT=0 时生效（VFIO 场景）                          │
+│  • Guest OS 可以通过 mtrr_add() 或 ioremap() 设置           │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  优先级 4: 设备驱动（Guest 内部）                           │
+│  ─────────────────────────────                              │
+│  • 设备驱动通过 ioremap() 请求内存类型                      │
+│    - ioremap() → UC（MMIO 设备寄存器）                      │
+│    - ioremap_wc() → WC（帧缓冲区）                          │
+│    - ioremap_cache() → WB（缓存设备）                       │
+│  • 驱动的请求最终反映在 Guest 页表的 PAT 位                 │
+│  • 仅在 IPAT=0 时影响硬件行为                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**典型场景分析**：
+
+| 场景 | 设备驱动 | Guest PAT | VMM (EPT) | 最终类型 |
+|------|---------|-----------|-----------|---------|
+| 普通 VM 访问 RAM | 请求 WB | WB | WB + IPAT=1 | **WB**（IPAT 忽略 Guest） |
+| VFIO VM 访问 RAM | 请求 WB | WB | WB + IPAT=0 | **WB**（Guest PAT 生效） |
+| 任何 VM 访问 MMIO | 请求 UC | UC | UC | **UC**（硬件强制） |
+| VFIO VM GPU BAR | 请求 UC | UC | WB + IPAT=0 | **UC**（Guest PAT 生效） |
+
+**关键结论**：
+
+1. **MMIO 始终 UC**：无论 Guest 如何设置，MMIO 区域硬件强制 UC
+2. **普通 VM 中 Guest PAT 无效**：IPAT=1，Guest 的内存类型设置被忽略
+3. **VFIO VM 中 Guest PAT 有效**：IPAT=0，Guest 可以控制内存类型（用于缓存一致性）
+4. **设备驱动的请求只是"建议"**：最终是否生效取决于 VMM 和硬件
 
 ### 7.3 GPU BAR 的典型处理流程
 
