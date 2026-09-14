@@ -4,6 +4,26 @@
 
 ---
 
+## 📚 前置知识
+
+本阶段假设你已经完成 Phase 1（CPU 虚拟化），掌握了：
+- ✅ VMX Root/Non-root 模式切换（Phase 1 §1-2）
+- ✅ VMCS 结构和 VM-Exit 处理流程（Phase 1 §2）
+- ✅ vCPU 唤醒机制（Phase 1 §6）
+
+如果你还没有完成 Phase 1，建议先学习 `../phase1-cpu-virt/README.md`。
+
+---
+
+## 从 CPU 虚拟化到内存虚拟化
+
+在 Phase 1 中，我们学习了如何让 Guest 代码在 CPU 上运行。但还有一个关键问题：
+**Guest 访问的内存地址（GPA）如何映射到宿主机的物理地址（HPA）？**
+
+这就是 EPT（Extended Page Table）要解决的问题。
+
+---
+
 ## 📋 学习目标
 
 本阶段聚焦 KVM 内存虚拟化的核心机制——**扩展页表（Extended Page Table, EPT）**。
@@ -523,6 +543,14 @@ echo kvm_page_fault >> /sys/kernel/debug/tracing/set_event
 perf record -e kvm:kvm_page_fault -a -g -- sleep 10
 perf report
 ```
+
+### 练习 3：使用 GDB 调试 KVM MMU
+
+```bash
+# 在 Host 上启动 GDB
+sudo gdb vmlinux /proc/<qemu_pid>/mem
+
+# 查看 KVM MMU 结构
 (gdb) p *(struct kvm_mmu *)0x...
 ```
 
