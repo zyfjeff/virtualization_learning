@@ -736,12 +736,54 @@ vmx_get_mt_mask(vcpu, gfn, is_mmio)
 | 任何 VM 访问 MMIO | 请求 UC | UC | UC | **UC**（硬件强制） |
 | VFIO VM GPU BAR | 请求 UC | UC | WB + IPAT=0 | **UC**（Guest PAT 生效） |
 
-**关键结论**：
+**关键结论（经源码事实核查）**：
 
-1. **MMIO 始终 UC**：无论 Guest 如何设置，MMIO 区域硬件强制 UC
-2. **普通 VM 中 Guest PAT 无效**：IPAT=1，Guest 的内存类型设置被忽略
-3. **VFIO VM 中 Guest PAT 有效**：IPAT=0，Guest 可以控制内存类型（用于缓存一致性）
-4. **设备驱动的请求只是"建议"**：最终是否生效取决于 VMM 和硬件
+1. **MMIO 始终 UC** ✅
+   - **源码**：`vmx_get_mt_mask()` 中 `if (is_mmio) return UC;`（`vmx.c:7685-7686`）
+   - **说明**：无条件强制 UC，Guest 无法覆盖，因为缓存 MMIO 会导致 Machine Check
+
+2. **普通 VM 中 Guest PAT 无效** ⚠️ 需补充条件
+   - **源码**：`vmx_ignore_guest_pat()` 返回 true 时设置 IPAT=1（`vmx.c:7689-7690`）
+   - **前提条件**：
+     - CPU 必须有 `SELFSNOOP` 特性（现代 CPU 通常都有，检查 `/proc/cpuinfo` 的 `ss` 标志）
+     - `KVM_X86_QUIRK_IGNORE_GUEST_PAT` quirk 未被禁用
+   - **默认行为**：VMX 初始化时从 `inapplicable_quirks` 移除该 quirk（`vmx.c:8608`），默认启用
+   - **结果**：IPAT=1，Guest PAT 被忽略，所有 RAM 映射为 WB
+
+3. **VFIO VM 中 Guest PAT 有效** ✅
+   - **源码**：
+     - VFIO 添加设备时调用 `kvm_vfio_update_coherency()`（`virt/kvm/vfio.c:120-141`）
+     - 检查设备是否强制一致性：`kvm_vfio_file_enforced_coherent()`
+     - 非一致性设备 → `kvm_arch_register_noncoherent_dma()` → `noncoherent_dma_count++`
+     - `vmx_ignore_guest_pat()` 检查 `!kvm_arch_has_noncoherent_dma()` → 返回 false
+     - 不设置 IPAT → Guest PAT 生效
+   - **条件**：VFIO 设备必须是非强制一致性的（大多数 GPU 设备）
+   - **结果**：IPAT=0，Guest 可以控制内存类型（用于缓存一致性）
+
+4. **设备驱动的请求只是"建议"** ✅
+   - **源码**：Guest 驱动通过 `ioremap()` 设置 Guest 页表 PAT 位
+   - **最终决定因素**：
+     1. EPT 是否设置 IPAT（VMM 控制）
+     2. 硬件如何结合 EPT 类型和 Guest PAT（Intel SDM 定义）
+   - **说明**：驱动请求必须通过 VMM 和硬件两层验证才能生效
+
+**源码引用汇总**：
+
+| 功能 | 文件 | 行号 | 说明 |
+|------|------|------|------|
+| MMIO 强制 UC | `arch/x86/kvm/vmx/vmx.c` | 7685-7686 | `if (is_mmio) return UC;` |
+| IPAT 决策 | `arch/x86/kvm/vmx/vmx.c` | 7689-7690 | `vmx_ignore_guest_pat()` 返回 true 时设置 IPAT |
+| Quirk 检查 | `arch/x86/kvm/vmx/vmx.c` | 7668-7677 | `vmx_ignore_guest_pat()` 实现 |
+| VFIO 注册 | `virt/kvm/vfio.c` | 120-141 | `kvm_vfio_update_coherency()` |
+| Quirk 默认值 | `arch/x86/kvm/vmx/vmx.c` | 8606-8608 | VMX 初始化时移除 `inapplicable_quirks` |
+
+**默认行为总结（现代系统，CPU 有 SELFSNOOP）**：
+
+| 场景 | IPAT | Guest PAT | 最终内存类型 |
+|------|------|-----------|-------------|
+| 普通 VM 访问 RAM | **1** | 被忽略 | **WB**（EPT 决定） |
+| VFIO VM 访问 RAM（非一致性设备） | **0** | 生效 | **由 Guest PAT 决定** |
+| 任何 VM 访问 MMIO | N/A | 不适用 | **UC**（硬件强制） |
 
 ### 7.3 GPU BAR 的典型处理流程
 
