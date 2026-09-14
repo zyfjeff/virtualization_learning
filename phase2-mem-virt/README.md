@@ -88,8 +88,7 @@ EPT 实现了 **GPA → HPA** 的硬件翻译，与 Guest 自身的 **GVA → GP
 |------|----------|-------------|
 | **缺页（Missing）** | EPT 叶条目 Present=0 | 分配物理页，建立 SPTE |
 | **权限违规** | 访问类型与权限位不匹配 | 检查是否为脏页/访问位更新 |
-| **Misconfiguration** | EPT 条目包含保留位组合（如 W+X 无 R） | **MMIO 实现机制**（故意设置无效组合触发 VM-Exit） |
-| **MMIO 访问** | GPA 映射到设备 MMIO 区域 | 交由设备模拟处理 |
+| **Misconfiguration** | EPT 条目包含保留位组合（如 W+X 无 R） | **MMIO 实现机制**：KVM 故意设置无效组合，Guest 访问时触发 VM-Exit，由 `handle_ept_misconfig()` 识别并模拟 MMIO |
 
 ### 1.3 EPTP（EPT Pointer）
 
