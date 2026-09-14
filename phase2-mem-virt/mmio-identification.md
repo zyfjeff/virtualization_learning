@@ -682,7 +682,70 @@ vmx_get_mt_mask(vcpu, gfn, is_mmio)
 | **普通 VM** | 无非一致性 DMA + quirk 启用 | `WB + IPAT` | **1** | **忽略** |
 | **VFIO VM** | 有非一致性 DMA 设备 | `WB` | **0** | **考虑** |
 
-### 7.2.1 内存属性的完整优先级
+### 7.2.1 SELFSNOOP 与非一致性 DMA
+
+#### SELFSNOOP（CPU Self-Snoop）
+
+**定义**：CPUID leaf 1, ECX bit 27（`/proc/cpuinfo` 中的 `ss` 标志）
+
+**作用**：CPU 自动 snoop 自己的缓存，保证 DMA 一致性
+- 设备 DMA 写入内存时，CPU 自动使对应缓存行失效
+- 无需软件手动刷新缓存（WBINVD）
+
+**为什么 KVM 关心**：
+- 有 SELFSNOOP → KVM 可以安全忽略 Guest PAT，强制 WB
+- 无 SELFSNOOP → 必须尊重 Guest PAT，让 Guest 管理缓存一致性
+
+**源码**：
+```c
+// arch/x86/kvm/vmx/vmx.c:8606-8608
+if (!static_cpu_has(X86_FEATURE_SELFSNOOP))
+    kvm_caps.supported_quirks &= ~KVM_X86_QUIRK_IGNORE_GUEST_PAT;
+// CPU 无 SELFSNOOP → 禁用 quirk → 无法忽略 Guest PAT
+```
+
+#### 非一致性 DMA 设备
+
+**判断标准**：IOMMU 是否支持 `IOMMU_CAP_ENFORCE_CACHE_COHERENCY`
+
+```c
+// drivers/iommu/intel/iommu.c:3887-3888
+case IOMMU_CAP_ENFORCE_CACHE_COHERENCY:
+    return ecap_sc_support(iommu->ecap);  // ECAP bit 7 (SC - Snooping Control)
+```
+
+**常见设备分类**：
+
+| 设备类型 | 是否强制一致性 | 原因 |
+|---------|--------------|------|
+| **Intel 集成显卡** | ✅ 通常 | IOMMU 支持 SC |
+| **NVIDIA/AMD GPU** | ❌ 通常 | 使用 PCIe No-Snoop 优化性能 |
+| **网卡** (Intel/Mellanox) | ✅ 通常 | 标准设备，支持一致性 |
+| **NVMe SSD** | ✅ 通常 | 标准设备，支持一致性 |
+| **FPGA/加速卡** | ❌ 可能 | 取决于实现 |
+
+**为什么 GPU 通常是非一致性的？**
+
+性能优化：
+- **一致性 DMA**：每次 DMA 都要 snoop CPU 缓存，性能下降
+- **非一致性 DMA**：不 snoop，性能更好，但 Guest 必须手动刷新缓存
+
+**决策链**：
+
+```
+VFIO 设备附加
+  ↓
+检查 IOMMU_CAP_ENFORCE_CACHE_COHERENCY
+  ↓
+├─ 支持（SC=1）→ 强制一致性 → IPAT=1 → 忽略 Guest PAT
+└─ 不支持（SC=0）→ 非一致性 → IPAT=0 → 尊重 Guest PAT
+```
+
+**实际影响**：
+- 附加 NVIDIA GPU → `noncoherent_dma_count++` → IPAT=0 → Guest 可以设置 UC/WC
+- 附加网卡/NVMe → `noncoherent_dma_count` 不变 → IPAT=1 → Guest PAT 被忽略
+
+### 7.2.2 内存属性的完整优先级
 
 内存属性由多个层面共同决定，优先级从高到低：
 
