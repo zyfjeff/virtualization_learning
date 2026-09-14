@@ -150,11 +150,15 @@ SPTE 解码: 0x8000000123456067
 ```bash
 # 启用 KVM 页表相关 tracepoint
 echo 1 > /sys/kernel/tracing/events/kvm/kvm_page_fault/enable
-echo 1 > /sys/kernel/tracing/events/kvm/kvm_mmu_get_page/enable
-echo 1 > /sys/kernel/tracing/events/kvm/kvm_tdp_mmu_map/enable
+echo 1 > /sys/kernel/tracing/events/kvm/kvm_mmio/enable
 
 # 清空 trace 缓冲区
 echo > /sys/kernel/tracing/trace
+
+# 设置 PID 过滤（使用所有 vCPU 线程）
+PID=$(pgrep -f '^qemu-system')
+QEMU_TIDS=$(ls /proc/$PID/task/ 2>/dev/null | tr '\n' ' ')
+echo "$QEMU_TIDS" > /sys/kernel/tracing/set_event_pid
 ```
 
 #### 2.2 在 Guest 内触发 EPT Violation
@@ -222,9 +226,23 @@ int kvm_tdp_mmu_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 ### 预期 trace 输出
 
 ```
-kvm_page_fault: address 0x7f1234560000 error_code 0x2 (write)
-kvm_mmu_get_page: gfn 0x123456 role 0x1
-kvm_tdp_mmu_map: gfn 0x123456 spte 0x8000000123456707
+# kvm_page_fault 格式: vcpu %u rip 0x%lx address 0x%016llx error_code 0x%llx
+kvm_page_fault: vcpu 0 rip 0x7f1234560100 address 0x00007f1234560000 error_code 0x0000000000000002
+
+# error_code 含义:
+# bit 0: P (Present) - 页不存在
+# bit 1: W (Write) - 写操作
+# bit 2: U (User) - 用户态访问
+```
+
+**注意**：KVM 没有 `kvm_mmu_get_page` 和 `kvm_tdp_mmu_map` tracepoints。
+要观察完整的页表映射过程，需要使用 ftrace function tracer 或 kprobe：
+
+```bash
+# 使用 function tracer（需要 debugfs）
+echo function > /sys/kernel/tracing/current_tracer
+echo kvm_tdp_mmu_map > /sys/kernel/tracing/set_ftrace_filter
+echo 1 > /sys/kernel/tracing/tracing_on
 ```
 
 ---
@@ -259,8 +277,16 @@ kvm_tdp_mmu_map: gfn 0x123456 spte 0x8000000123456707
 echo 1 > /sys/kernel/tracing/events/kvm/kvm_mmio/enable
 echo 1 > /sys/kernel/tracing/events/kvm/kvm_page_fault/enable
 
+# 设置 PID 过滤
+PID=$(pgrep -f '^qemu-system')
+QEMU_TIDS=$(ls /proc/$PID/task/ 2>/dev/null | tr '\n' ' ')
+echo "$QEMU_TIDS" > /sys/kernel/tracing/set_event_pid
+
 # 在 Guest 内访问 MMIO 区域（如 GPU BAR）
 # 这需要先配置 VFIO 直通，或使用模拟的 MMIO 区域
+
+# 查看 trace 输出
+cat /sys/kernel/tracing/trace | grep kvm_mmio
 ```
 
 #### 3.3 对照源码理解 MMIO 识别
@@ -340,10 +366,19 @@ MMIO 识别结果:
 ```bash
 # 启用 page fault 追踪
 echo 1 > /sys/kernel/tracing/events/kvm/kvm_page_fault/enable
-echo 1 > /sys/kernel/tracing/events/kvm/kvm_tdp_mmu_map/enable
+
+# 设置 PID 过滤
+PID=$(pgrep -f '^qemu-system')
+QEMU_TIDS=$(ls /proc/$PID/task/ 2>/dev/null | tr '\n' ' ')
+echo "$QEMU_TIDS" > /sys/kernel/tracing/set_event_pid
 
 # 观测并发映射
-cat /sys/kernel/tracing/trace_pipe | grep -E "kvm_page_fault|kvm_tdp_mmu_map"
+cat /sys/kernel/tracing/trace_pipe | grep kvm_page_fault
+
+# 如果要观察 SPTE 设置，使用 function tracer
+echo function > /sys/kernel/tracing/current_tracer
+echo kvm_tdp_mmu_map >> /sys/kernel/tracing/set_ftrace_filter
+echo 1 > /sys/kernel/tracing/tracing_on
 ```
 
 #### 4.3 对照源码理解原子更新
