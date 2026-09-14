@@ -47,9 +47,7 @@
 | `ept-violation-handling.md` | ★ EPT Violation 完整处理流程 |
 | `tdp-mmu-concurrency.md` | ★ TDP MMU 的并发模型与根页面管理 |
 | `mmio-identification.md` | ★ MMIO 识别机制与 IPAT / Guest 内存类型控制 |
-| `mmio-identification-factcheck.md` | 上文的源码与规范核查记录 |
 | `practice/` | ★ 实战练习：EPT Violation 演示 / 内存类型分析（`make` 后运行） |
-| `archive/` | 已归档的过程性文档（进度总结、旧索引等） |
 
 ---
 
