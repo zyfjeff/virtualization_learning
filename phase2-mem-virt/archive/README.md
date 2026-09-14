@@ -9,5 +9,6 @@
 | `phase2-completion.md` | 阶段完成总结，验收内容已并入 README 的验证清单 |
 | `practical-exercises.md` | 早期练习说明，已被 `../practice/` 取代 |
 | `mmio-identification-update-summary.md` | 一次文档更新的变更记录，改动已落进 `../mmio-identification.md` |
+| `mmio-identification-factcheck.md` | MMIO 识别文档的事实核查报告，核查结果已整合进正文 |
 
 > 注意：这些文档移入 `archive/` 后下沉了一层，正文里形如 `practice/xxx.c` 的相对路径需按 `../practice/xxx.c` 理解。归档内容不再维护，故未改动原文。
