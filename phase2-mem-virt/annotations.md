@@ -530,15 +530,93 @@ else {
 
 **文件**: `arch/x86/include/asm/vmx.h:534-544`（不是 `spte.h`！）
 
-```c
-#define VMX_EPT_READABLE_MASK           0x1ull          /* bit 0: R */
-#define VMX_EPT_WRITABLE_MASK           0x2ull          /* bit 1: W */
-#define VMX_EPT_EXECUTABLE_MASK         0x4ull          /* bit 2: X */
-#define VMX_EPT_IPAT_BIT                (1ull << 6)    /* bit 6: IPAT */
-#define VMX_EPT_ACCESS_BIT              (1ull << 8)    /* bit 8: A */
-#define VMX_EPT_DIRTY_BIT               (1ull << 9)    /* bit 9: D */
-#define VMX_EPT_SUPPRESS_VE_BIT         (1ull << 63)   /* bit 63: Suppress #VE */
+**EPT 页表项的完整位布局**（叶节点，4KB 页）：
+
 ```
+63      52 51      12 11 10 9 8 7 6 5 4 3 2 1 0
+┌───────┬──────────┬───┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐
+│Suppress│ Reserved │D  │A│ │ │I│M│M│M│X│W│R│
+│  #VE   │          │   │ │ │ │P│T│T│T│ │ │ │
+│        │          │   │ │ │ │A│2│1│0│ │ │ │
+└───────┴──────────┴───┴─┴─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘
+                         T T T
+```
+
+**详细位定义**：
+
+| 位 | 宏定义 | 含义 | 说明 |
+|----|--------|------|------|
+| 0 | `VMX_EPT_READABLE_MASK` | Read | 可读权限 |
+| 1 | `VMX_EPT_WRITABLE_MASK` | Write | 可写权限 |
+| 2 | `VMX_EPT_EXECUTABLE_MASK` | Execute | 可执行权限 |
+| 3-5 | - | Memory Type | 内存类型（见下表） |
+| 6 | `VMX_EPT_IPAT_BIT` | Ignore PAT | 忽略 Guest PAT |
+| 7 | - | Reserved | 保留位（必须为 0） |
+| 8 | `VMX_EPT_ACCESS_BIT` | Accessed | 已访问位（硬件自动设置） |
+| 9 | `VMX_EPT_DIRTY_BIT` | Dirty | 已修改位（硬件自动设置） |
+| 10 | - | Reserved | 保留位 |
+| 11 | - | Reserved | 保留位 |
+| 12-51 | - | Physical Address | 物理地址（40 位） |
+| 52-62 | - | Reserved | 保留位 |
+| 63 | `VMX_EPT_SUPPRESS_VE_BIT` | Suppress #VE | 抑制 #VE 异常 |
+
+**Memory Type 字段**（bits 3-5）：
+
+| 值 | 类型 | 说明 | 使用场景 |
+|----|------|------|---------|
+| 0 | UC | Uncacheable | MMIO 设备寄存器 |
+| 1 | WC | Write Combining | 帧缓冲区 |
+| 2 | - | Reserved | - |
+| 3 | - | Reserved | - |
+| 4 | WT | Write Through | - |
+| 5 | WP | Write Protect | - |
+| 6 | WB | Write Back | 普通 RAM（默认） |
+| 7 | - | Reserved | - |
+
+**IPAT 位的作用**：
+
+```c
+// IPAT = 0：使用 Memory Type 字段（bits 3-5）
+// IPAT = 1：忽略 Memory Type 和 Guest PAT，强制 UC
+
+if (spte & VMX_EPT_IPAT_BIT) {
+    // 强制 UC，用于 MMIO 区域
+    // Guest 设置的内存类型被忽略
+} else {
+    // 使用 bits 3-5 的 Memory Type
+    // 结合 Guest PAT 决定最终内存类型
+}
+```
+
+**Suppress #VE 位**（bit 63）：
+
+```c
+// #VE = Virtualization Exception（虚拟化异常）
+// 当 EPT violation 发生时，可以注入 #VE 异常给 Guest
+
+// Suppress #VE = 0：发生 EPT violation 时注入 #VE
+// Suppress #VE = 1：抑制 #VE，直接触发 EPT violation VM-Exit
+```
+
+**与普通页表的对比**：
+
+| 位 | 普通页表 | EPT 页表 |
+|----|---------|---------|
+| 0 | Present（存在） | Read（读） |
+| 1 | RW（读写） | Write（写） |
+| 2 | User（用户态） | Execute（执行） |
+| 3-5 | PAT/PWT/PCD | Memory Type |
+| 6 | D/A | IPAT |
+| 7 | PAT/Page Size | Reserved |
+| 8 | Global | Accessed |
+| 9 | D/A | Dirty |
+| 63 | NX（不可执行） | Suppress #VE |
+
+**关键区别**：
+1. **权限位语义不同**：普通页表 bit 0 是 Present，EPT bit 0 是 Read
+2. **内存类型**：EPT 有独立的 Memory Type 字段，普通页表用 PAT/PWT/PCD 组合
+3. **IPAT**：EPT 独有，可以忽略 Guest PAT
+4. **Suppress #VE**：EPT 独有，控制虚拟化异常注入
 
 ### Q: SPTE 位布局全景图
 
