@@ -14,27 +14,125 @@
 
 ### Q: 基础页表位定义在哪？
 
-**文件**: `arch/x86/kvm/mmu.h:15-29`（不是 `spte.h`！）
+**背景：x86 页表项的结构**
+
+x86 页表（PTE/PDE/PDPT）是一个 64 位的值，包含：
+- **控制位**（低位）：权限、状态等
+- **物理地址**（中间位）：指向下一级页表或物理页
+- **扩展位**（高位）：NX、扩展属性等
+
+**定义位置**：`arch/x86/kvm/mmu.h:15-29`
 
 ```c
-#define PT_PRESENT_MASK         (1ULL << 0)     /* 存在位 */
-#define PT_WRITABLE_MASK        (1ULL << 1)     /* 可写位 */
-#define PT_USER_MASK            (1ULL << 2)     /* 用户态位 */
-#define PT_ACCESSED_MASK        (1ULL << 5)     /* 已访问位 */
-#define PT_DIRTY_MASK           (1ULL << 6)     /* 脏页位 */
-#define PT_PAGE_SIZE_MASK       (1ULL << 7)     /* 大页位 (2MB/1GB) */
-#define PT64_NX_MASK            (1ULL << 63)    /* No-Execute 位 */
+// 基础控制位（所有页表通用）
+#define PT_PRESENT_MASK         (1ULL << 0)     // 存在位：0=无效，1=有效
+#define PT_WRITABLE_MASK        (1ULL << 1)     // 可写位：0=只读，1=可读写
+#define PT_USER_MASK            (1ULL << 2)     // 用户态位：0=仅内核，1=用户+内核
+#define PT_ACCESSED_MASK        (1ULL << 5)     // 已访问位：硬件自动设置
+#define PT_DIRTY_MASK           (1ULL << 6)     // 脏页位：写入时硬件自动设置
+#define PT_PAGE_SIZE_MASK       (1ULL << 7)     // 大页位：0=4KB，1=2MB/1GB
+#define PT64_NX_MASK            (1ULL << 63)    // No-Execute：1=不可执行
 ```
 
-这些位同时适用于 Guest 页表和 EPT（EPT 的 bit 0/1/2 恰好也对应 R/W/X）。
+**为什么这些位重要？**
+
+```
+Guest 访问内存时的权限检查：
+
+CPU 读取页表项
+  ↓
+检查 Present 位
+  ├─ 0 → 触发 Page Fault（缺页）
+  └─ 1 → 继续检查
+      ↓
+      检查权限位（根据访问类型）
+      ├─ 读访问 → 检查 Present
+      ├─ 写访问 → 检查 Present + Writable
+      └─ 执行 → 检查 Present + NX（NX=1 则拒绝）
+          ↓
+          检查用户/内核权限
+          ├─ Ring 3（用户态）→ 检查 User 位
+          └─ Ring 0（内核态）→ 跳过 User 检查
+              ↓
+              更新 A/D 位（硬件自动）
+              ├─ 访问 → 设置 Accessed 位
+              └─ 写入 → 设置 Dirty 位
+```
+
+**Guest 页表 vs EPT 的位定义**
+
+有趣的是，Guest 页表和 EPT 使用相同的位定义（bit 0/1/2）：
+
+| 位 | Guest 页表含义 | EPT 含义 |
+|----|---------------|---------|
+| bit 0 | Present（存在） | Read（可读） |
+| bit 1 | Writable（可写） | Write（可写） |
+| bit 2 | User（用户态） | Execute（可执行，仅非叶节点） |
+
+**为什么位定义相同？**
+
+历史巧合 + 设计简化：
+- x86 页表的 bit 0/1/2 最初就是 R/W/U（读/写/用户）
+- EPT 设计时沿用了这些位，但语义略有不同
+- 这样 KVM 可以用相同的代码处理两种页表
+
+**实际影响**：
+
+```c
+// KVM 设置 SPTE 时
+spte = PT_PRESENT_MASK;      // bit 0 = 1（存在）
+if (writable)
+    spte |= PT_WRITABLE_MASK; // bit 1 = 1（可写）
+if (user)
+    spte |= PT_USER_MASK;     // bit 2 = 1（用户态）
+if (executable)
+    spte |= PT64_NX_MASK;     // bit 63 = 0（可执行，NX=0）
+```
 
 ### Q: 物理地址放在哪几位？
 
-**文件**: `arch/x86/kvm/mmu/spte.h:42`
+**物理地址的位置**：bits 51:12
 
 ```c
+// arch/x86/kvm/mmu/spte.h:42
 #define SPTE_BASE_ADDR_MASK (((1ULL << 52) - 1) & ~(u64)(PAGE_SIZE-1))
-/* 等价于 bits 51:12，即 PFN << 12 */
+```
+
+**拆解这个宏**：
+
+```c
+(1ULL << 52) - 1              // 0x000FFFFFFFFFFFFF（低 52 位全 1）
+~(u64)(PAGE_SIZE-1)           // 0xFFFFFFFFFFFFF000（清除低 12 位）
+// 结果：0x000FFFFFFFFFFFFF & 0xFFFFFFFFFFFFF000
+//     = 0x000FFFFFFFFFFFFF000
+//     = bits 51:12
+```
+
+**为什么是 bits 51:12？**
+
+```
+64 位 SPTE 的布局：
+
+63    52 51        12 11     0
+┌──────┬────────────┬────────┐
+│扩展位│ 物理地址    │控制位   │
+│(12位)│ (40位)     │(12位)  │
+└──────┴────────────┴────────┘
+
+物理地址 = 40 位 = 支持最大 1PB 物理内存
+低 12 位 = 页内偏移（4KB 页），不需要存储
+高 12 位 = 控制位和扩展属性
+```
+
+**实际使用**：
+
+```c
+// 从 SPTE 提取物理地址
+u64 paddr = spte & SPTE_BASE_ADDR_MASK;
+
+// 从物理页帧号（PFN）构造 SPTE 的地址部分
+u64 spte_addr = (u64)pfn << PAGE_SHIFT;  // PFN << 12
+spte |= spte_addr;
 ```
 
 ### Q: 软件位（KVM 元数据）分布在哪？
