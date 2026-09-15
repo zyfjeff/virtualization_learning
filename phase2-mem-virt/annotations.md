@@ -431,14 +431,83 @@ bool is_present = (spte & shadow_present_mask) != 0;
 | **EPT（无 exec-only）** | `0x1`（bit 0） | 必须 bit 0 = 1 才有效 |
 | **Shadow/NPT** | `0x1`（bit 0） | 必须 bit 0 = 1 才有效 |
 
-**为什么 EPT 支持 exec-only 时 mask = 0？**
+**什么是 Exec-Only？**
 
-因为 EPT 硬件只需要 entry 非零就认为有效。如果设置 mask = 0：
-- `spte & 0` 永远 = 0
-- `0 != 0` = false
-- 所以 KVM 改用 `spte != 0` 来判断
+Exec-Only = 只可执行，不可读不可写。用于安全场景（防止代码被逆向工程）。
 
-这样就能实现"只可执行"的页：设置 bit 1（Write）和 bit 2（Execute）为 1，bit 0（Read）为 0。传统页表做不到（bit 0 必须是 1），但 EPT 可以。
+**传统页表为什么做不到 Exec-Only？**
+
+传统 x86 页表的权限检查逻辑：
+
+```c
+if (spte & PT_PRESENT_MASK) {  // bit 0 = Present
+    // 页存在，继续检查权限
+    if (write_access && !(spte & PT_WRITABLE_MASK))
+        fault();  // 写保护
+    if (exec_access && (spte & PT64_NX_MASK))
+        fault();  // 不可执行
+} else {
+    // bit 0 = 0，页不存在
+    page_fault();  // 缺页
+}
+```
+
+**问题**：如果 bit 0 = 0（不可读），硬件认为页不存在，直接触发缺页异常，根本不会检查执行权限。所以传统页表**无法实现**"不可读但可执行"的组合。
+
+**EPT 如何做到 Exec-Only？**
+
+EPT 的权限检查逻辑不同：
+
+```c
+if (spte != 0) {  // 只要整个 entry 非零就有效
+    // EPT entry 有效，检查权限
+    if (read_access && !(spte & VMX_EPT_READABLE_MASK))
+        ept_violation();  // 不可读
+    if (write_access && !(spte & VMX_EPT_WRITABLE_MASK))
+        ept_violation();  // 不可写
+    if (exec_access && !(spte & VMX_EPT_EXECUTABLE_MASK))
+        ept_violation();  // 不可执行
+} else {
+    // entry 全零，EPT violation
+    ept_violation();
+}
+```
+
+**关键区别**：
+- 传统页表：bit 0（Present）必须为 1，否则页不存在
+- EPT：只要整个 entry 非零就有效，不依赖特定位
+
+**实现 Exec-Only**：
+
+```
+EPT 权限位：bit 0 = Read, bit 1 = Write, bit 2 = Execute
+
+设置 exec-only：bit 0 = 0, bit 1 = 0, bit 2 = 1
+整个 entry = 0x4（非零）→ EPT 认为有效
+权限检查：
+  - 读访问：bit 0 = 0 → 拒绝
+  - 写访问：bit 1 = 0 → 拒绝
+  - 执行访问：bit 2 = 1 → 允许
+```
+
+**shadow_present_mask 的作用**：
+
+KVM 用 `shadow_present_mask` 统一两种判断逻辑：
+
+| 模式 | shadow_present_mask | 判断逻辑 |
+|------|---------------------|---------|
+| 传统页表 / EPT 无 exec-only | 0x1（bit 0） | `spte & 0x1 != 0` → 必须 bit 0 = 1 |
+| EPT 支持 exec-only | 0 | KVM 特殊处理：直接用 `spte != 0` 判断 |
+
+**为什么 mask = 0 时改用 `spte != 0`？**
+
+```c
+// 当 shadow_present_mask = 0 时
+bool is_present = (spte & 0) != 0;  // 永远 false，没意义
+
+// KVM 的特殊处理：直接用 spte != 0 判断
+bool is_present = (spte != 0);  // 只要非零就有效
+```
 
 **初始化位置**：
 
