@@ -70,21 +70,67 @@ ignore 位太少 —— bit 0/1/2 是 R/W/X，bit 3:5 是 Memory Type，bit 6 �
 
 ### Q: `shadow_present_mask` 是什么？
 
-**文件**: `arch/x86/kvm/mmu/spte.h:180`（声明），`spte.c:37`（定义）
+**一句话回答**：SPTE 中用来表示"这个页表项有效"的位掩码。
 
-```c
-extern u64 __read_mostly shadow_present_mask;
+**为什么需要它？**
+
+硬件页表（无论是 Guest 页表还是 EPT）都需要一种方式判断"这个 entry 是否有效"。不同硬件的判断方式不同：
+
+```
+传统页表（x86 4-level）:
+  ┌─────────────────────────────────────┐
+  │ Entry 有效 = Present 位 (bit 0) = 1 │
+  │ 如果 bit 0 = 0 → 页不存在           │
+  └─────────────────────────────────────┘
+
+EPT（支持 exec-only）:
+  ┌─────────────────────────────────────┐
+  │ Entry 有效 = 整个 entry 非零         │
+  │ 不需要特定位，只要不是全 0 就有效     │
+  │ 这样可以实现"只可执行"（无读无写）   │
+  └─────────────────────────────────────┘
 ```
 
-这是一个**运行时初始化**的变量，不是常量。它根据 EPT 还是 shadow paging 取不同值：
+**KVM 的抽象**：
 
-| 模式 | 值 | 初始化位置 |
-|------|----|-----------|
-| EPT（支持 exec-only） | `0` | `spte.c:439`（`kvm_mmu_set_ept_masks`） |
-| EPT（不支持 exec-only） | `VMX_EPT_READABLE_MASK` | 同上 |
-| Shadow/NPT | `PT_PRESENT_MASK` | `spte.c:495`（`kvm_mmu_reset_all_pte_masks`） |
+KVM 用 `shadow_present_mask` 统一这两种行为：
 
-EPT 支持 exec-only 时，present 不需要任何 RWX 位 —— 硬件只需要 entry 非零就认为有效。
+```c
+// 检查 SPTE 是否有效
+bool is_present = (spte & shadow_present_mask) != 0;
+```
+
+| 模式 | shadow_present_mask | 含义 |
+|------|---------------------|------|
+| **EPT（exec-only）** | `0` | 只要 SPTE 非零就有效（检查 `spte != 0`） |
+| **EPT（无 exec-only）** | `0x1`（bit 0） | 必须 bit 0 = 1 才有效 |
+| **Shadow/NPT** | `0x1`（bit 0） | 必须 bit 0 = 1 才有效 |
+
+**为什么 EPT 支持 exec-only 时 mask = 0？**
+
+因为 EPT 硬件只需要 entry 非零就认为有效。如果设置 mask = 0：
+- `spte & 0` 永远 = 0
+- `0 != 0` = false
+- 所以 KVM 改用 `spte != 0` 来判断
+
+这样就能实现"只可执行"的页：设置 bit 1（Write）和 bit 2（Execute）为 1，bit 0（Read）为 0。传统页表做不到（bit 0 必须是 1），但 EPT 可以。
+
+**初始化位置**：
+
+```c
+// EPT 模式（vmx.c）
+if (enable_ept) {
+    if (cpu_has_vmx_ept_execute_only())
+        shadow_present_mask = 0;       // exec-only：非零即有效
+    else
+        shadow_present_mask = 0x1;     // 无 exec-only：必须 bit 0
+}
+
+// Shadow/NPT 模式
+else {
+    shadow_present_mask = PT_PRESENT_MASK;  // 传统：必须 bit 0
+}
+```
 
 ### Q: EPT 位定义在哪？
 
