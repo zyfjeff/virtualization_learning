@@ -618,28 +618,73 @@ if (spte & VMX_EPT_IPAT_BIT) {
 3. **IPAT**：EPT 独有，可以忽略 Guest PAT
 4. **Suppress #VE**：EPT 独有，控制虚拟化异常注入
 
-### Q: SPTE 位布局全景图
+### Q: KVM 在 EPT 上添加了哪些软件位？
+
+**硬件位 vs 软件位**：
+
+前面介绍了 Intel 定义的**硬件 EPT 位**（R/W/X、Memory Type、A/D 等）。KVM 在这些硬件位的基础上，还添加了**软件位**用于内部管理。
+
+**KVM 软件位分布**：
 
 ```
-  63       58 57 55  53 52 51          12 11 10  9  8  7  6  5  4  3 2 1 0
- ┌──────────┬──┬──┬───┬───┬──────────────┬───┬──┬──┬──┬──┬──┬──┬──┬─┴─┴─┐
- │NX/Suppress│EPT│Saved│AD │  PFN         │MMU│HW│HW│A │PS│D │A │  MT  │X W R│
- │  VE (63) │MW │Bits │Typ│ (51:12)      │Pre│MW│Wr│  │  │  │  │  │(5:3)│(2)(1)│
- │          │(58)│(54) │(52)│             │(11)│(10)│(9)│  │(7)│  │  │   │     │
- └──────────┴──┴──┴───┴───┴──────────────┴───┴──┴──┴──┴──┴──┴──┴──┴─────┴────┘
+64 位 SPTE 布局：
 
-非 EPT 模式:
-  - bit 9 = DEFAULT_SPTE_HOST_WRITABLE
-  - bit 10 = DEFAULT_SPTE_MMU_WRITABLE
-  - bit 11 = SPTE_MMU_PRESENT_MASK
+63       58 57 55  53 52 51          12 11 10  9  8  7  6  5  4  3 2 1 0
+┌──────────┬──┬──┬───┬───┬──────────────┬───┬──┬──┬──┬──┬──┬──┬──┬─────┐
+│Suppress  │EPT│Saved│AD │  PFN         │MMU│HW│HW│A │PS│D │A │  MT │ R/W │
+│  #VE     │MW │Bits │Typ│ (51:12)      │Pre│MW│Wr│  │  │  │  │(5:3)│  X  │
+│(硬件位)   │(软)│(软) │(软)│(硬件位)     │(软)│(软)│(软)│  │  │  │  │(硬件位)│
+└──────────┴──┴──┴───┴───┴──────────────┴───┴──┴──┴──┴──┴──┴──┴──┴─────┘
 
-EPT 模式:
-  - bit 57 = EPT_SPTE_HOST_WRITABLE
-  - bit 58 = EPT_SPTE_MMU_WRITABLE
-  - bit 11 = SPTE_MMU_PRESENT_MASK（共用）
-  - bits 52:53 = SPTE_TDP_AD_MASK（A/D 跟踪类型）
-  - bits 54:55 = 访问跟踪时保存的原始 R/X 位
+软件位（KVM 添加）：
+  - bit 11: SPTE_MMU_PRESENT_MASK（KVM 认为"存在"）
+  - bit 52:53: SPTE_TDP_AD_MASK（A/D 位跟踪类型）
+  - bit 54:55: SHADOW_ACC_TRACK_SAVED_MASK（访问跟踪保存的 R/X 位）
+  - bit 57: EPT_SPTE_HOST_WRITABLE（宿主认为可写）
+  - bit 58: EPT_SPTE_MMU_WRITABLE（KVM MMU 认为可写）
 ```
+
+**为什么需要这些软件位？**
+
+| 软件位 | 用途 | 为什么需要 |
+|--------|------|-----------|
+| `SPTE_MMU_PRESENT_MASK` (11) | KVM 内部标记 | 区分有效 SPTE 和 MMIO SPTE |
+| `SPTE_TDP_AD_MASK` (52:53) | A/D 位跟踪 | 当硬件不支持 A/D 时，软件跟踪 |
+| `SHADOW_ACC_TRACK_SAVED_MASK` (54:55) | 访问跟踪 | 保存原始 R/X 位，用于内存回收 |
+| `EPT_SPTE_HOST_WRITABLE` (57) | 宿主写保护 | 跟踪宿主是否允许写 |
+| `EPT_SPTE_MMU_WRITABLE` (58) | MMU 写保护 | 跟踪 KVM MMU 是否允许写 |
+
+**软件位的选择原则**：
+
+- **避开硬件位**：不能与 Intel 定义的位冲突
+- **避开保留位**：某些位硬件要求必须为 0
+- **选择高位**：EPT 低位（0-11）被硬件位占用，软件位只能放在高位
+
+**与非 EPT 模式的对比**：
+
+```
+非 EPT 模式（Shadow MMU）：
+  - bit 9: DEFAULT_SPTE_HOST_WRITABLE
+  - bit 10: DEFAULT_SPTE_MMU_WRITABLE
+  - bit 11: SPTE_MMU_PRESENT_MASK
+
+EPT 模式：
+  - bit 57: EPT_SPTE_HOST_WRITABLE  ← 为什么用高位？
+  - bit 58: EPT_SPTE_MMU_WRITABLE   ← 因为 EPT 低位不够用
+  - bit 11: SPTE_MMU_PRESENT_MASK   ← 共用
+```
+
+**为什么 EPT 模式的软件位在高位（57/58）而非低位（9/10）？**
+
+EPT 的低位（0-11）被硬件位占用了：
+- bit 0-2: R/W/X（权限）
+- bit 3-5: Memory Type
+- bit 6: IPAT
+- bit 7: Reserved
+- bit 8-9: A/D
+- bit 10-11: Reserved（但硬件可能在未来使用）
+
+EPT 的叶条目几乎没有空闲低位可以借用，所以 KVM 只能使用高位（52-58）。
 
 ---
 
