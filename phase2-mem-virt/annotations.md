@@ -112,14 +112,25 @@ if (executable)
 
 ### Q: 物理地址放在哪几位？
 
-**物理地址的位置**：bits 51:12
+**物理地址的位置**：**默认 bits 51:12**，但可能动态调整
 
 ```c
-// arch/x86/kvm/mmu/spte.h:42
+// arch/x86/kvm/mmu/spte.h:39-43
+#ifdef CONFIG_DYNAMIC_PHYSICAL_MASK
+#define SPTE_BASE_ADDR_MASK (physical_mask & ~(u64)(PAGE_SIZE-1))
+#else
 #define SPTE_BASE_ADDR_MASK (((1ULL << 52) - 1) & ~(u64)(PAGE_SIZE-1))
+#endif
 ```
 
-**拆解这个宏**：
+**两种模式**：
+
+| 模式 | 条件 | 物理地址范围 | 使用场景 |
+|------|------|-------------|---------|
+| **固定模式** | 未启用 CONFIG_DYNAMIC_PHYSICAL_MASK | bits 51:12（52 位） | 普通 VM |
+| **动态模式** | 启用 CONFIG_DYNAMIC_PHYSICAL_MASK | 由 `physical_mask` 决定 | TDX/Hyper-V IVM/SME |
+
+**拆解固定模式的宏**：
 
 ```c
 (1ULL << 52) - 1              // 0x000FFFFFFFFFFFFF（低 52 位全 1）
@@ -127,6 +138,24 @@ if (executable)
 // 结果：0x000FFFFFFFFFFFFF & 0xFFFFFFFFFFFFF000
 //     = 0x000FFFFFFFFFFFFF000
 //     = bits 51:12
+```
+
+**动态模式下 physical_mask 的初始化**：
+
+```c
+// 默认初始化（arch/x86/mm/pgtable.c:11）
+phys_addr_t physical_mask = (1ULL << 52) - 1;  // 默认 52 位
+
+// 特殊场景下会被缩小：
+
+// 1. TDX 安全虚拟机（arch/x86/coco/tdx/tdx.c:1040）
+physical_mask &= cc_mask - 1;  // 缩小到安全内存范围
+
+// 2. Hyper-V IVM 隔离虚拟机（arch/x86/hyperv/ivm.c:675）
+physical_mask &= ms_hyperv.shared_gpa_boundary - 1;
+
+// 3. SME 内存加密（arch/x86/mm/mem_encrypt_identity.c:565）
+physical_mask &= ~me_mask;  // 排除加密位
 ```
 
 **为什么是 bits 51:12？**
@@ -144,6 +173,19 @@ if (executable)
 低 12 位 = 页内偏移（4KB 页），不需要存储
 高 12 位 = 控制位和扩展属性
 ```
+
+**关键理解：SPTE 存储的是 Host HPA，不是 Guest GPA**
+
+```
+Guest GPA → EPT 转换 → Host HPA
+                        ↑
+                   SPTE 存储这个地址
+```
+
+- SPTE 中的物理地址字段存储的是**宿主物理地址（HPA）**
+- 使用**宿主的物理地址宽度**，不是 Guest 的物理地址宽度
+- Guest GPA 的物理地址位数**不直接影响** SPTE 布局
+- 影响 SPTE 的是**宿主的物理地址宽度**，在特殊场景下会被缩小
 
 **实际使用**：
 
