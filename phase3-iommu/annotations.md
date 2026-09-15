@@ -447,6 +447,31 @@ static ssize_t iommu_group_store_type(struct iommu_group *group,
 **`DMA → DMA-FQ` 是唯一在线切换** —— 同一个域对象上长出 flush queue，不需要拆域
 重建。其余方向都要先解绑组内所有驱动。
 
+### 为什么 DMA → DMA-FQ 是唯一可以在线切换的？
+
+**设计动机**：
+
+```
+DMA 域        → 立即失效（unmap 后立即 flush IOTLB）
+DMA-FQ 域     → 批量失效（unmap 后放入 flush queue，延迟 flush）
+
+两者的区别只在失效策略，域对象本身完全相同！
+所以可以在线切换：只需初始化 flush queue，不需要重建域。
+
+其他方向为什么不行？
+  DMA → IDENTITY: 需要删除所有页表（DMA 有页表，IDENTITY 没有）
+  IDENTITY → DMA: 需要创建页表（IDENTITY 没有页表）
+  DMA → BLOCKED:  需要切换到"全部阻断"的域
+  
+这些都需要销毁旧域、创建新域，必须解绑所有驱动才能安全操作。
+```
+
+**实际场景**：
+- 系统启动时默认用 DMA（立即失效，安全性高）
+- 运行中发现性能瓶颈（频繁 unmap 导致 IOTLB flush 过多）
+- 在线切换到 DMA-FQ（批量失效，性能更好）
+- 不需要重启 VM 或解绑驱动
+
 ---
 
 ## 8. Intel VT-d 后端实现
@@ -492,6 +517,43 @@ attach 把域的页表根指针写进 VT-d 的 **Context Entry**。Context Entry
 - Domain ID（用于 IOTLB tag）
 - 地址翻译模式（legacy / scalable / PT）
 - 页表根地址（DAG 指针）
+
+### 为什么 Context Entry 要区分不同的翻译模式？
+
+**设计动机**：
+
+```
+VT-d 支持三种翻译模式（Translation Type）：
+
+1. CONTEXT_TT_MULTI_LEVEL (legacy)
+   - 传统的两级翻译：First-stage + Second-stage
+   - 适用于大多数设备
+   - 页表结构：root → context → page table
+
+2. CONTEXT_TT_DEV_IOTLB
+   - 启用 Device-TLB（ATS）
+   - 设备可以缓存翻译结果
+   - 需要在 Context Entry 中设置特殊标志
+
+3. CONTEXT_TT_PASS_THROUGH (PT)
+   - 直通模式（identity）
+   - 不进行地址翻译
+   - 用于 iommu.passthrough=1 的场景
+
+为什么要区分？
+  - 不同设备的能力不同（有的支持 ATS，有的不支持）
+  - 不同的使用场景（DMA 映射 vs identity 直通）
+  - 性能优化（Device-TLB 可以减少 IOTLB miss）
+
+KVM 如何选择？
+  - 根据域类型（DMA/IDENTITY）和设备能力（ATS 支持）
+  - 在 intel_iommu_attach_device() 中决定
+```
+
+**实际影响**：
+- 翻译模式影响 IOTLB 的 tag 方式（Domain ID + PASID）
+- 影响失效的粒度（device-level vs page-level）
+- 影响性能（Device-TLB 命中率高时性能更好）
 
 ---
 
