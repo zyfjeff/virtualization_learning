@@ -1,12 +1,25 @@
 # 第3阶段：IOMMU 层
 
 > 基于 Linux 6.12.93 内核源码 | 预计学习时间：2-3 周
->
+
+---
+
+## 📚 前置知识
+
+本阶段假设你已经完成 Phase 2（内存虚拟化 EPT），掌握了：
+- ✅ EPT 两级翻译（GPA → HPA）
+- ✅ SPTE 位布局与 `make_spte()` 流程
+- ✅ TDP MMU 的根页面管理
+
+如果你还没有完成 Phase 2，建议先学习 `../phase2-mem-virt/README.md`。
+
+**建议阅读顺序**：phase2 → phase3（本章）→ phase4 → phase6。
+
+---
+
 > **前置依赖**:
 > - 第二阶段（内存虚拟化 EPT）：本阶段"框架"一节直接用 EPT 做类比，没读过会失去最大的一个杠杆
 > - 不需要先读第六阶段；**反过来，本阶段是第六阶段的地基**
->
-> **建议阅读顺序：phase2 → phase3（本章）→ phase4 → phase6。**
 
 ---
 
@@ -286,18 +299,36 @@ identity 的硬件表达各不相同。
 
 ---
 
-# 五、怎么读这个阶段
+# 五、推荐阅读顺序
 
-**第一遍（半天）**：只读本文件的"框架 → 概念 → 主流程 → 8 问"，不点进任何深入文档。目标
-是能在脑子里画出 3.2 节那条旅程，并知道 8 个问题各自挂在哪一步。
+```
+第1步: README.md (本文件) — 半天
+  → 理解框架、概念、主流程、8 问清单
+  → 目标：能在脑中画出 3.2 节的旅程
 
-**第二遍（按需）**：带着具体问题点进对应文档。每篇文档都以"问题 + 为什么值得问"开头，
-可以独立读；但建议顺序是 Q1 → Q3 → Q4 → Q5（机制主线），再读 Q2、Q6、Q7、Q8（边界与
-对照）。
+第2步: annotations.md — 按需
+  → probe→选域→attach→map→unmap 完整调用链
+  → 目标：读懂每行代码的"为什么"
 
-**第三遍（动手）**：做 `practice/` 里的 4 个实验，用 `scripts/trace/iommu-analysis.sh`
-观测。实验前提是按 [AGENTS.md 陷阱 7](../AGENTS.md) 用 `scripts/vm/boot-vm.sh` 启动 VM
-（默认已带 `-enable-kvm -cpu host`）。
+第3步: 深入文档（按问题驱动）
+  → Q1 translation.md: 硬件翻译机制
+  → Q3 domains.md: iommu.passthrough 真相
+  → Q4 iova.md: IOVA 分配器
+  → Q5 invalidation.md: 失效同步语义
+
+第4步: practice/ — 动手实验（4 个）
+  → ex1: 域类型可见性
+  → ex2: 总线地址 ≠ 物理地址
+  → ex3: strict vs lazy 失效代价
+  → ex4: bypass fault
+```
+
+**建议深入文档顺序**：
+- **机制主线**：Q1 → Q3 → Q4 → Q5
+- **边界与对照**：Q2、Q6、Q7、Q8
+
+**实验准备**：用 `scripts/vm/boot-vm.sh` 启动 VM（默认已带 `-enable-kvm -cpu host`），
+用 `scripts/trace/iommu-analysis.sh` 观测。
 
 ---
 
