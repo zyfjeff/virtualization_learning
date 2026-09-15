@@ -198,6 +198,97 @@ u64 spte_addr = (u64)pfn << PAGE_SHIFT;  // PFN << 12
 spte |= spte_addr;
 ```
 
+### Q: Guest GPA 位数会影响 EPT 页表吗？
+
+**答案**：**会影响 EPT 页表级数**
+
+**EPT 页表级数与 GPA 覆盖范围**：
+
+| 页表级数 | 覆盖 GPA 位数 | 覆盖范围 | EPTP 配置 |
+|---------|--------------|---------|-----------|
+| 4 级 | 48 位 | 256 TB | `VMX_EPTP_PWL_4` |
+| 5 级 | 57 位 | 128 PB | `VMX_EPTP_PWL_5` |
+
+**KVM 如何选择 EPT 页表级数？**
+
+```c
+// arch/x86/kvm/mmu/mmu.c:5465-5476
+static inline int kvm_mmu_get_tdp_level(struct kvm_vcpu *vcpu)
+{
+    /* tdp_root_level is architecture forced level, use it if nonzero */
+    if (tdp_root_level)
+        return tdp_root_level;
+
+    /* Use 5-level TDP if and only if it's useful/necessary. */
+    if (max_tdp_level == 5 && cpuid_maxphyaddr(vcpu) <= 48)
+        return 4;  // Guest GPA <= 48 位，4 级页表足够
+
+    return max_tdp_level;  // 否则使用最大支持的级数
+}
+```
+
+**决策逻辑**：
+
+```
+Guest MAXPHYADDR（CPUID 配置）
+  ↓
+├─ <= 48 位 → 使用 4 级 EPT 页表
+│   原因：4 级页表可覆盖 256TB，足够
+│   优势：减少一级页表遍历，性能更好
+│
+└─ > 48 位 → 使用 5 级 EPT 页表（如果宿主支持）
+    原因：需要覆盖更大的 GPA 空间
+    限制：需要宿主支持 5 级页表（la57）
+```
+
+**EPTP 中的 Page Walk Length 配置**：
+
+```c
+// arch/x86/kvm/vmx/vmx.c:3411-3423
+u64 construct_eptp(struct kvm_vcpu *vcpu, hpa_t root_hpa, int root_level)
+{
+    u64 eptp = VMX_EPTP_MT_WB;
+
+    eptp |= (root_level == 5) ? VMX_EPTP_PWL_5 : VMX_EPTP_PWL_4;
+
+    if (enable_ept_ad_bits &&
+        (!is_guest_mode(vcpu) || nested_ept_ad_enabled(vcpu)))
+        eptp |= VMX_EPTP_AD_ENABLE_BIT;
+    eptp |= root_hpa;
+
+    return eptp;
+}
+```
+
+**EPTP 格式**（bits 7:3 = Page Walk Length）：
+
+```
+63    52 51    12 11 8 7   5 4 3 2 0
+┌──────┬────────┬─────┬───┬─┴─┬─┴─┐
+│ Host │ Root   │ 保留 │PWL│ AD │MT │
+│ GPA  │ HPAddr │     │   │   │   │
+└──────┴────────┴─────┴───┴───┴───┘
+
+PWL (Page Walk Length):
+  0x18 (3) = 4 级页表
+  0x20 (4) = 5 级页表
+```
+
+**实际影响**：
+
+| 场景 | Guest MAXPHYADDR | EPT 级数 | 性能影响 |
+|------|-----------------|---------|---------|
+| 普通 VM（48 位 GPA） | 48 位 | 4 级 | 最优 |
+| 大内存 VM（57 位 GPA） | 57 位 | 5 级 | 多一级遍历 |
+| 嵌套虚拟化 | 取决于 L1 | 可能降级 | L0 需要匹配 L1 配置 |
+
+**关键理解**：
+
+1. **Guest GPA 位数影响 EPT 页表级数**，但不影响 SPTE 布局
+2. **4 级 EPT 页表**覆盖 48 位 GPA（256TB），足够大多数场景
+3. **5 级 EPT 页表**覆盖 57 位 GPA（128PB），用于超大内存 VM
+4. KVM 会**自动选择**最优的页表级数，无需手动配置
+
 ### Q: 软件位（KVM 元数据）分布在哪？
 
 **文件**: `arch/x86/kvm/mmu/spte.h:18-91`
