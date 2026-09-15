@@ -57,16 +57,84 @@ ignore 位太少 —— bit 0/1/2 是 R/W/X，bit 3:5 是 Memory Type，bit 6 �
 
 ### Q: `SPTE_TDP_AD_MASK` 的三种取值是什么？
 
-**文件**: `arch/x86/kvm/mmu/spte.h:33-36`
+**一句话回答**：控制 SPTE 中 Accessed/Dirty（A/D）位的行为模式。
+
+**背景：什么是 A/D 位？**
+
+x86 页表项（PTE）有两个硬件自动维护的位：
+- **Accessed（A）位**：CPU 访问这个页时，硬件自动设为 1
+- **Dirty（D）位**：CPU 写这个页时，硬件自动设为 1
+
+这些位用于：
+- 内存管理（页面置换算法需要知道哪些页被访问过）
+- 写时复制（COW，需要知道哪些页被修改过）
+- 实时迁移（需要知道哪些页是脏的，需要传输）
+
+**问题：EPT 的 A/D 位**
+
+EPT 也支持 A/D 位（如果硬件支持），但 KVM 有时需要控制是否启用：
+- 启用 A/D：硬件自动维护，性能好
+- 禁用 A/D：KVM 手动跟踪，用于特殊场景
+- 仅写保护：只跟踪脏页，不跟踪访问
+
+**三种模式**：
 
 ```c
-#define SPTE_TDP_AD_ENABLED       (0ULL << 52)   /* A/D 位启用（默认） */
-#define SPTE_TDP_AD_DISABLED      (1ULL << 52)   /* A/D 位禁用 */
-#define SPTE_TDP_AD_WRPROT_ONLY   (2ULL << 52)   /* 仅写保护跟踪 */
+// arch/x86/kvm/mmu/spte.h:33-36
+#define SPTE_TDP_AD_ENABLED       (0ULL << 52)   // 默认：A/D 启用
+#define SPTE_TDP_AD_DISABLED      (1ULL << 52)   // A/D 禁用
+#define SPTE_TDP_AD_WRPROT_ONLY   (2ULL << 52)   // 仅写保护
 ```
 
-`AD_ENABLED` 值为 0 —— 这样默认路径不需要在 SPTE 里设置额外位。`AD_DISABLED` 对应
-硬件不支持 A/D 位（或嵌套虚拟化 L2 使用 PML 时的写保护模式）。
+| 模式 | 值 | 含义 | 使用场景 |
+|------|----|------|---------|
+| **AD_ENABLED** | 0 | 硬件自动维护 A/D 位 | 默认模式，性能最好 |
+| **AD_DISABLED** | 1 | 硬件不维护 A/D 位 | 老硬件不支持，或嵌套虚拟化 L2 使用 PML |
+| **AD_WRPROT_ONLY** | 2 | 只跟踪脏页（D 位） | 写保护模式，用于内存快照、迁移优化 |
+
+**为什么 AD_ENABLED = 0？**
+
+性能优化！默认路径不需要设置额外位：
+
+```c
+// 创建 SPTE 时
+if (ad_mode == SPTE_TDP_AD_ENABLED) {
+    // 不需要设置 bit 52-53，默认就是 0
+    // 硬件自动维护 A/D 位
+    spte |= PT_ACCESSED_MASK;  // 只设置 A 位
+} else {
+    // 需要设置 bit 52-53 来标记模式
+    spte |= ad_mode;
+}
+```
+
+**实际使用场景**：
+
+1. **AD_ENABLED（默认）**：
+   - 普通 VM 运行
+   - 硬件自动维护 A/D 位
+   - 性能最好
+
+2. **AD_DISABLED**：
+   - 老 CPU 不支持 EPT A/D 位（2010 年前的 CPU）
+   - 嵌套虚拟化：L1 KVM 的 L2 Guest 使用 PML（Page Modification Logging）
+   - PML 需要手动跟踪脏页，不能依赖硬件 A/D 位
+
+3. **AD_WRPROT_ONLY**：
+   - 内存快照：需要知道哪些页被修改过
+   - 写时复制（COW）优化：只跟踪写操作
+   - 实时迁移优化：只传输脏页
+
+**源码位置**：
+
+```c
+// arch/x86/kvm/mmu/spte.c:175-178
+if (sp->role.ad_disabled)
+    spte |= SPTE_TDP_AD_DISABLED;
+else if (kvm_mmu_page_ad_need_write_protect(sp))
+    spte |= SPTE_TDP_AD_WRPROT_ONLY;
+// 否则默认是 AD_ENABLED（值为 0，不需要设置）
+```
 
 ### Q: `shadow_present_mask` 是什么？
 
