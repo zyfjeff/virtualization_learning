@@ -61,20 +61,41 @@ CPU 读取页表项
 
 **Guest 页表 vs EPT 的位定义**
 
-有趣的是，Guest 页表和 EPT 使用相同的位定义（bit 0/1/2）：
+虽然位位置相同，但语义不同：
 
-| 位 | Guest 页表含义 | EPT 含义 |
-|----|---------------|---------|
-| bit 0 | Present（存在） | Read（可读） |
-| bit 1 | Writable（可写） | Write（可写） |
-| bit 2 | User（用户态） | Execute（可执行，仅非叶节点） |
+| 位 | Guest 页表含义 | EPT 含义 | 关键区别 |
+|----|---------------|---------|---------|
+| bit 0 | **Present**（存在） | **Read**（可读） | Guest：0=完全不可访问；EPT：0=不可读但可写/执行 |
+| bit 1 | Writable（可写） | Write（可写） | 相同 |
+| bit 2 | User（用户态权限） | Execute（可执行） | **完全不同**！ |
 
-**为什么位定义相同？**
+**为什么位定义相似但语义不同？**
 
-历史巧合 + 设计简化：
-- x86 页表的 bit 0/1/2 最初就是 R/W/U（读/写/用户）
-- EPT 设计时沿用了这些位，但语义略有不同
-- 这样 KVM 可以用相同的代码处理两种页表
+历史原因 + 设计简化：
+- x86 页表最初设计：Present/Writable/User
+- EPT 设计时沿用了 bit 位置，但改为 Read/Write/Execute
+- KVM 需要同时处理两种语义
+
+**实际影响**：
+
+```c
+// 设置 SPTE 时需要根据页表类型使用不同的语义
+if (is_ept) {
+    // EPT 语义：R/W/X
+    spte = VMX_EPT_READABLE_MASK;    // bit 0 = Read
+    if (writable)
+        spte |= VMX_EPT_WRITABLE_MASK; // bit 1 = Write
+    if (executable)
+        spte |= VMX_EPT_EXECUTABLE_MASK; // bit 2 = Execute
+} else {
+    // Guest 页表语义：Present/Writable/User
+    spte = PT_PRESENT_MASK;          // bit 0 = Present
+    if (writable)
+        spte |= PT_WRITABLE_MASK;    // bit 1 = Writable
+    if (user)
+        spte |= PT_USER_MASK;        // bit 2 = User
+}
+```
 
 **实际影响**：
 
