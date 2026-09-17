@@ -6,6 +6,17 @@
 
 ---
 
+## 📚 前置知识
+
+本阶段假设你已经完成 Phase 1-3，掌握了：
+- ✅ VMCS 与 VM-Entry/Exit（Phase 1 §1-2）
+- ✅ EPT 与 GPA→HPA 翻译（Phase 2 §3-4）
+- ✅ IOMMU 中断重映射基础、IRTE 概念（Phase 3 `interrupts.md`）
+
+如果你还没有完成 Phase 3，建议先学习 `../phase3-iommu/interrupts.md`（Q6: 直通设备的中断怎么穿过 IOMMU）。
+
+---
+
 ## 📋 学习目标
 
 本阶段覆盖从**物理设备中断**到 **Guest vCPU** 的完整路径：
@@ -34,7 +45,35 @@
 | `msi-affinity-migration.md` | ★ MSI 地址格式与亲和性迁移（Remapped vs Posted 的迁移路径差异） |
 | `practice/` | ★ 6 个实验脚本：环境检查 / IRTE 观察 / PI 追踪 / 性能对比 / ON-SN / vCPU 迁移 |
 
-> 数据结构与桥梁函数在本文件中只作速览，字段级细节以 `posted-interrupts.md` 为准。
+> 数据结构与桥梁函数在本文件中只作速览，字段级细节以 `annotations.md` 为准。
+
+---
+
+## 📖 推荐阅读顺序
+
+```
+第1步: README.md (本文件) — 技术全景
+  → 理解中断虚拟化两层架构
+  → 掌握完整数据路径：设备MSI → IOMMU → PI描述符 → vCPU
+  → 目标：能画出传统模式和PI模式的中断路径
+
+第2步: posted-interrupts.md — PI 机制深入
+  → PI Descriptor 硬件结构
+  → 零 VM-Exit 机制的原理
+  → 目标：理解 PI 的硬件工作原理
+
+第3步: msi-affinity-migration.md — MSI 与亲和性迁移
+  → Remapped vs Posted 的迁移路径差异
+  → 目标：理解 vCPU 迁移时 IRTE 的更新
+
+第4步: annotations.md — 源码精读
+  → PI 描述符、IRTE、PIR→IRR 同步
+  → vmx_pi_update_irte() 桥梁函数
+  → 目标：读懂每行代码的"为什么"
+
+第5步: practice/ — 动手实验（6 个）
+  → 环境检查 / IRTE 观察 / PI 追踪 / 性能对比
+```
 
 ---
 
@@ -275,7 +314,7 @@ MSI 中断投递:
 
 
 
-```### 1.7 源码阅读顺序（按数据流）
+### 1.7 源码阅读顺序（按数据流）
 
 ```
 第1步: 理解PI描述符 (两个层的交汇点)
