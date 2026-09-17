@@ -223,8 +223,12 @@ vCPU 迁移:
 集中管理：每个 vCPU 一个 NDST
 更新高效：vCPU 迁移只更新一个字段
 自动路由：所有设备中断自动路由到新 pCPU
-无需更新 IRTE：IRTE 的 PDA 不变，指向同一个 PI Descriptor
+IRTE 的 PDA 不变：指向同一个 PI Descriptor（但 Dest_ID 必须更新）
 ```
+
+**注意**：vCPU 迁移时，虽然 IRTE 的 PDA（指向 PI Descriptor）不变，但 IRTE 的
+**Dest_ID 必须更新**为新的 pCPU，否则通知中断仍会发往旧 pCPU。这是 PI 的运维开销
+之一（见 annotations.md §5）。
 
 ### 1.4 IOMMU 的原子操作
 
@@ -503,68 +507,91 @@ PI 模式:
 
 ### 4.1 PI Descriptor 结构定义
 
-**来源**: `arch/x86/include/asm/posted_intr.h`
+**来源**: `arch/x86/include/asm/posted_intr.h:12`
 
 ```c
+/* 来源: arch/x86/include/asm/posted_intr.h:12 */
 struct pi_desc {
-    /* Posted Interrupt Request bitmap (256 bits) */
+    union {
+        u32 pir[8];         /* 256-bit PIR 位图，IOMMU 硬件写 */
+        u64 pir64[4];
+    };
     union {
         struct {
-            DECLARE_BITMAP(pir, 256);  /* PIR 位图 */
+            u16 notifications;  /* ON(bit 0) + SN(bit 1) + 保留 */
+            u8  nv;             /* Notification Vector */
+            u8  rsvd_2;
+            u32 ndst;           /* 目标 pCPU 的物理 APIC ID */
         };
-        u32 pir_32[8];
-        u64 pir_64[4];
+        u64 control;            /* 8 字节，cmpxchg64 原子操作用 */
     };
-    
-    /* Control fields */
-    union {
-        struct {
-            u8  on      : 1,  /* Outstanding Notification */
-                sn      : 1,  /* Suppress Notification */
-                rsvd_1  : 6;  /* Reserved */
-            u8  nv;           /* Notification Vector */
-            u32 ndst;         /* Notification Destination (pCPU APIC ID) */
-        };
-        u64 control;          /* 用于原子操作 */
-    };
-    
-    u8  rsvd_2[28];          /* Reserved to 64 bytes */
+    u32 rsvd[6];               /* 填充到 64 字节 */
 } __aligned(64);
+```
+
+**关键设计：`notifications` 是 u16，不是独立 bitfield**
+
+ON 和 SN 是 `notifications` (u16) 的最低两个 bit：
+
+| Bit | 名称 | 含义 |
+|-----|------|------|
+| 0 | ON (Outstanding Notification) | 有中断 pending 在 PIR 中，需要同步 |
+| 1 | SN (Suppress Notification) | 抑制通知中断（vCPU 被抢占/blocking 时置位） |
+
+**为什么不用 `sn`/`on` 位域？** 因为 ON/SN 操作需要原子性保障。`struct pi_desc` 用
+`u64 control` 联合，允许 `try_cmpxchg64(&pi_desc->control, ...)` 一次性原子更新整个
+control 字段（含 NDST + NV + ON + SN），防止 IOMMU 在修改中间读到半更新状态。
+
+辅助函数通过 `set_bit`/`test_bit` 操作 `control` 的对应位：
+
+```c
+/* 来源: arch/x86/include/asm/posted_intr.h */
+#define POSTED_INTR_ON  0                     /* control 的 bit 0 */
+#define POSTED_INTR_SN  1                     /* control 的 bit 1 */
+
+static inline bool pi_test_on(struct pi_desc *pi_desc)
+{ return test_bit(POSTED_INTR_ON, (unsigned long *)&pi_desc->control); }
+
+static inline void pi_set_sn(struct pi_desc *pi_desc)
+{ set_bit(POSTED_INTR_SN, (unsigned long *)&pi_desc->control); }
+
+/* 非原子版本 — 仅用于 cmpxchg 循环内部（已持有 old 值） */
+static inline void __pi_clear_sn(struct pi_desc *pi_desc)
+{ pi_desc->notifications &= ~BIT(POSTED_INTR_SN); }
 ```
 
 ### 4.2 关键函数：vmx_pi_update_irte()
 
-**来源**: `arch/x86/kvm/vmx/vmx.c`
+**来源**: `arch/x86/kvm/vmx/posted_intr.c:272`
+
+**重要**：`vmx_pi_update_irte()` **不直接操作 IRTE 字段**。它构建 `struct vcpu_data`
+传给 IOMMU 层，由 `intel_ir_set_vcpu_affinity()` 完成实际的 IRTE 写入。
 
 ```c
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:272（简化） */
 void vmx_pi_update_irte(struct kvm_vcpu *vcpu,
-                        struct kvm_kernel_irq_routing_entry *e,
-                        int dest_id)
+                        u32 gvec, u32 girq, bool set)
 {
     struct vcpu_vmx *vmx = to_vmx(vcpu);
-    struct pi_desc *pi_desc = &vmx->pi_desc;
-    struct irte irte;
-    
-    /* 构造 Posted 模式 IRTE */
-    irte.p_present = 1;
-    irte.p_pst = 1;                    /* IM=1, Posted 模式 */
-    irte.p_vector = POSTED_INTR_VECTOR; /* 通知向量 */
-    irte.p_urgent = 0;
-    
-    /* 设置 PDA (PI Descriptor 物理地址) */
-    irte.pda_l = virt_to_phys(pi_desc) >> 6;
-    irte.pda_h = (u64)virt_to_phys(pi_desc) >> 32;
-    
-    /* 设置 Source ID (设备 BDF) */
-    irte.sid = kvm_assigned_dev_interrupt_msix_get_sid(e);
-    
-    /* 设置目标 pCPU */
-    irte.dest_id = dest_id;
-    
-    /* 写入 IOMMU */
-    modify_irte(&irte);
+    struct vcpu_data vcpu_info;
+
+    if (!set)
+        return;
+
+    /* 构建 vCPU 信息，传给 IOMMU 层 */
+    vcpu_info.pi_desc_addr = __pa(&vmx->pi_desc);  /* PI 描述符物理地址 */
+    vcpu_info.vector = vmx->pi_desc.nv;             /* 通知向量 */
+
+    host_irq = kvm_irq_to_host_irq(girq);
+    irq_set_vcpu_affinity(host_irq, &vcpu_info);    /* → IOMMU 层 */
 }
 ```
+
+**分层设计**：
+- **KVM 层** (`vmx_pi_update_irte`): 构建 `vcpu_data`，包含 PI 描述符地址和向量
+- **IOMMU 层** (`intel_ir_set_vcpu_affinity`): 实际写入 IRTE 的 Posted 模式字段
+
+这种分层允许 KVM 和 IOMMU 解耦，KVM 不需要知道 IRTE 的具体格式。
 
 ### 4.3 关键函数：vmx_sync_pir_to_irr()
 
@@ -624,48 +651,49 @@ if (kvm_lapic_enabled(vcpu))
 
 ### 4.4 PI 调度相关代码
 
-**来源**: `arch/x86/kvm/vmx/posted_intr.c`
+**来源**: `arch/x86/kvm/vmx/posted_intr.c:53`
 
 ```c
-/* vCPU 加载到 pCPU 时 */
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:53（简化） */
 void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
 {
     struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
-    struct vcpu_vmx *vmx = to_vmx(vcpu);
     struct pi_desc old, new;
     unsigned int dest;
-    
-    if (!enable_apicv || !lapic_in_kernel(vcpu))
-        return;
-    
-    /* 如果 vCPU 没有被迁移且不在 wakeup 列表上，只需清除 SN */
+
+    /* 快速路径：没迁移 + 不在 wakeup 列表 → 只需清 SN */
     if (pi_desc->nv != POSTED_INTR_WAKEUP_VECTOR && vcpu->cpu == cpu) {
         if (pi_test_and_clear_sn(pi_desc))
             goto after_clear_sn;
     }
-    
-    /* 原子更新整个 control 字段 */
+
+    /* 慢路径：try_cmpxchg64 原子更新整个 control 字段 */
+    old.control = READ_ONCE(pi_desc->control);
     do {
-        old.control = READ_ONCE(pi_desc->control);
-        new = old;
-        
-        new.sn = 0;    /* 清除 SN，允许通知 */
-        
+        new.control = old.control;
+        __pi_clear_sn(&new);              /* 清除 SN（control 的 bit 1） */
+
         /* 设置 NDST = 当前 pCPU 的物理 APIC ID */
         dest = per_cpu(x86_cpu_to_physical_apicid, cpu);
         new.ndst = dest;
-        
+
         /* 设置通知向量 */
         new.nv = POSTED_INTR_VECTOR;
-        
-    } while (cmpxchg64(&pi_desc->control,
-                       old.control, new.control) != old.control);
+
+    } while (!try_cmpxchg64(&pi_desc->control,
+                            &old.control, new.control));
 
 after_clear_sn:
     /* 如果 PIR 非空，触发 KVM_REQ_EVENT */
     if (!pi_is_pir_empty(pi_desc))
         kvm_make_request(KVM_REQ_EVENT, vcpu);
 }
+```
+
+**关键点**：
+- 使用 `__pi_clear_sn(&new)` 而非 `new.sn = 0`（因为 `sn` 不是独立字段）
+- 使用 `try_cmpxchg64` 原子更新整个 control 字段
+- 快速路径避免了 cmpxchg 循环的开销
 
 /* vCPU 从 pCPU 卸载时 */
 void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
@@ -826,25 +854,35 @@ echo 1 > /sys/module/kvm_intel/parameters/enable_apicv
 
 ```
 误解 1: "PI 模式在某些情况下会有 VM-Exit"
-  ✗ 错误！
-  ✓ 正确：PI 模式在所有情况下都可以实现零 VM-Exit
-    - vCPU 在 Guest 模式 → 硬件特殊处理，0 次 VM-Exit
-    - vCPU 在 Host 模式 → 直接处理，0 次 VM-Exit
-    - vCPU 被阻塞 → 唤醒处理，0 次 VM-Exit
+  ⚠️ 部分正确！
+  ✓ 准确表述：vCPU 在 Guest 中运行且 SN=0 时，PI 路径零 VM-Exit
+  
+  正常路径（零 VM-Exit）：
+    - vCPU 在 Guest 模式 + SN=0 → 硬件自动 PIR→VIRR，0 次 VM-Exit
+  
+  旁路情况（会触发 VM-Exit）：
+    - vCPU 不在运行（halted/blocking）→ pi_wakeup_handler() 处理
+    - SN=1（通知被抑制）→ 恢复后可能走软件路径
+    - 嵌套虚拟化 → L1 VMM 需要拦截
+    - 通知向量不匹配 → handle_external_interrupt_irqoff() 处理
+  
+  参见 AGENTS.md 核心原则 #6："正常 PI 路径 0 次 VM-Exit"（关键词：正常）
 
 误解 2: "通知中断会触发 VM-Exit"
-  ✗ 错误！
-  ✓ 正确：当向量 = posted-interrupt notification vector 时
-    · 硬件特殊处理
+  ⚠️ 部分正确！
+  ✓ 准确表述：当向量 = posted-interrupt notification vector 且 vCPU 在 Guest 时
+    · 硬件特殊处理（Intel SDM Section 30.6）
     · 不触发 VM-Exit
     · 自动完成 PIR→VIRR 同步
+  
+  但如果向量不匹配或 vCPU 不在运行，会触发 VM-Exit 走旁路处理。
 
 误解 3: "PI 模式需要 KVM 干预"
-  ✗ 错误！
-  ✓ 正确：
-    · 硬件自动处理通知中断
-    · 不需要 KVM 干预
-    · sync_pir_to_irr 只在特殊情况下使用
+  ⚠️ 部分正确！
+  ✓ 准确表述：
+    · 正常路径：硬件自动处理，不需要 KVM 干预
+    · 旁路情况：KVM 需要介入（pi_wakeup_handler, sync_pir_to_irr 等）
+    · vCPU 迁移：需要更新 IRTE Dest_ID（见 annotations.md §5）
 
 误解 4: "PI 模式延迟 ~1-2μs"
   ✗ 错误！

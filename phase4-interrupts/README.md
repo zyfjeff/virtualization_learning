@@ -772,7 +772,7 @@ modprobe kvm_intel enable_apicv=1
 /* 设置PI模式IRTE */
 irte.IM = 1;                    /* Posted模式 */
 irte.PDA = __pa(&vmx->pi_desc); /* PI描述符地址 */
-irte.NV = POSTED_INTR_VECTOR;   /* 通知向量 */
+irte.VV = POSTED_INTR_VECTOR;   /* 虚拟向量 (Virtual Vector) */
 ```
 
 **配置**：
@@ -865,7 +865,7 @@ cat /sys/module/kvm_intel/parameters/enable_apicv
 // vmx_pi_update_irte() 中配置
 irte.IM = 1;                    /* Posted模式 */
 irte.PDA = __pa(&vmx->pi_desc); /* PI描述符物理地址 */
-irte.NV = POSTED_INTR_VECTOR;   /* 通知向量 */
+irte.VV = POSTED_INTR_VECTOR;   /* 虚拟向量 (Virtual Vector) */
 irte.Dest_ID = cpu;             /* 目标pCPU */
 ```
 
