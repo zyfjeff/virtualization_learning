@@ -4,6 +4,18 @@
 
 ---
 
+## 📚 前置知识
+
+本阶段假设你已经完成 Phase 1-9，掌握了：
+- ✅ ftrace 基础（Phase 1/2 练习）
+- ✅ perf kvm stat（Phase 9）
+- ✅ KVM tracepoints（Phase 0）
+- ✅ VM-Exit 机制（Phase 1-4）
+
+如果你还没有完成 Phase 9，建议先学习 `../phase9-performance/README.md`。
+
+---
+
 ## 📋 阶段概述
 
 本阶段聚焦 **KVM 内核侧的运行时调试** —— 当 VMM 拉起失败、vCPU 异常退出、或运行时性能不及预期时，如何用 ftrace / perf / bpftrace / debugfs 定位根因。
@@ -240,8 +252,7 @@ dmesg | grep -A30 'VMCS'   # 如果 dump_invalid_vmcs 启用
 
 phase0-8 源码学习    → 用 ftrace 验证理解
 phase9 性能测量      → 测量纪律与观测成本看 phase9-performance/measurement.md
-                       本章提供场景诊断的工具和方法论
-phase11 MicroVM     → 用 selftests 测试 MicroVM 功能
+                       本章提供场景诊断的工具和方法
 
 跨 phase 指针（不复制内容）：
 - 模块参数默认值      → phase9-performance/parameters.md

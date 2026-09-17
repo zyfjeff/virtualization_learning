@@ -7,6 +7,18 @@
 
 ---
 
+## 📚 前置知识
+
+本阶段假设你已经完成 Phase 1-6，掌握了：
+- ✅ TSC 与 RDTSC 指令（Phase 1 §6）
+- ✅ VMCS 中的 TSC_OFFSET / TSC_MULTIPLIER 字段（Phase 1 §2）
+- ✅ Posted Interrupts 机制（Phase 4 §3-4）
+- ✅ IOMMU 中断重映射基础（Phase 3 interrupts.md）
+
+如果你还没有完成 Phase 4，建议先学习 `../phase4-interrupts/posted-interrupts.md`。
+
+---
+
 ## 📂 本章文件
 
 | 文件 | 内容 |
@@ -2878,3 +2890,20 @@ modprobe -r kvm_intel kvm && modprobe kvm lapic_timer_advance=0
 # 观察当前自动调整值（每 vCPU 的 debugfs，只读; debugfs.c:67）
 cat /sys/kernel/debug/kvm/<pid>-<fd>/vcpu0/lapic_timer_advance_ns
 ```
+
+---
+
+## ✅ 阶段检验清单
+
+完成本阶段后，你应该能够回答以下问题：
+
+- [ ] 区分 clocksource 和 clockevent，解释为什么 TSC 是前者、TSC-deadline 是后者
+- [ ] 画出 x86 平台时钟设备的演进与归属关系
+- [ ] 解释 KVM 如何虚拟化 PIT / APIC Timer / TSC / kvmclock
+- [ ] 理解 TSC Offset 和 TSC Scaling 在 VMCS 中的工作方式
+- [ ] 解释 TSC-deadline 为什么是最高效的定时器
+- [ ] 理解 kvmclock 的两部分机制（wall clock + system time）
+- [ ] 解释 PTP KVM 的工作原理和精度
+- [ ] 理解 Timer Advance 的自动调整算法
+- [ ] 解释迁移时如何处理时间跳变
+- [ ] 用 ftrace 观察 KVM 时钟虚拟化的关键路径

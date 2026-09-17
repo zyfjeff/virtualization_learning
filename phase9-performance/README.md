@@ -6,6 +6,19 @@
 
 ---
 
+## 📚 前置知识
+
+本阶段假设你已经完成 Phase 1-8，掌握了：
+- ✅ halt-polling 机制（Phase 0/8）
+- ✅ PLE 退出机制（Phase 1 §8）
+- ✅ EPT A/D 位与 PML（Phase 2 §4）
+- ✅ Posted Interrupts 与定时器（Phase 4 §3-4）
+- ✅ VFIO 直通与中断（Phase 6）
+
+如果你还没有完成 Phase 8，建议先学习 `../phase8-capstone/README.md`。
+
+---
+
 ## 0. 本章只负责三件事
 
 | 职责 | 载体 | 为什么归这里 |
@@ -57,3 +70,18 @@ sudo ./bench-observer-cost.sh --arms O0,O2,O3,O0e --sample-s 20
 `ple-load/` 在宿主编译后经 9p 送进 guest。VM 用
 `../scripts/vm/boot-vm.sh`（默认带 `-enable-kvm -cpu host` 并自检 ——
 缺 `-enable-kvm` 时 QEMU **静默**回退 TCG，所有退出类测量都会归零）。
+
+---
+
+## ✅ 阶段检验清单
+
+完成本阶段后，你应该能够回答以下问题：
+
+- [ ] 解释 PLE（Pause Loop Exiting）的工作原理和 SDM 约束
+- [ ] 理解 PML（Page Modification Logging）的代价模型
+- [ ] 解释主时钟失效的连锁反应
+- [ ] 区分观测者成本与实际开销
+- [ ] 使用 ftrace 测量 VM-Exit 延迟分布
+- [ ] 解释 halt-polling 的参数调优策略
+- [ ] 理解 TSC scaling 对性能的影响
+- [ ] 使用 perf kvm stat 分析 VM-Exit 分布
