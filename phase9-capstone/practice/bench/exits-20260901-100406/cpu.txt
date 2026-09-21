@@ -1,0 +1,2 @@
+minivmm idle cpu%=0.3
+minivmm busy cpu%=100.0

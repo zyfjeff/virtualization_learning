@@ -1,0 +1,6 @@
+
+[boot] 首个串口字节 +32.707 ms
+
+[boot] guest 就绪 (MINIVMM_READY) +1289.019 ms
+[stats] 用户态 exit 计数: IO=39759 MMIO=342
+[vmm] 总运行时长 1289.040 ms

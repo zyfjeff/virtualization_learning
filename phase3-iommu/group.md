@@ -10,7 +10,7 @@
 > 就无法解释"为什么这台网卡不能单独直通"，也无法解释 [Q3](domains.md#d7-推论acs-决定了域的形状)
 > 里那条"ACS 改组成员 → 域的形状跟着变"的推论。
 >
-> **分工**：**判定规则在 [phase6 §1.4/§1.5](../phase6-vfio/README.md#14-iommu-组是怎么划出来的)，
+> **分工**：**判定规则在 [phase6 §1.4/§1.5](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)，
 > 构造机制在本篇。**
 
 ---
@@ -36,10 +36,10 @@
 不经过 IOMMU 就能互相发起请求的物理路径（典型是没有 ACS 的桥下游设备互发
 peer-to-peer），那么把它们放进不同域就是自欺——域 A 的页表管不住从域 B 的设备
 绕过来的请求。判定细节（四步判定、ACS 有效能力、三种真正会并组的情形）全部在
-[phase6 §1.4](../phase6-vfio/README.md#14-iommu-组是怎么划出来的)实测核过，本篇不重复。
+[phase6 §1.4](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)实测核过，本篇不重复。
 
 对直通的直接后果：VFIO 把设备交给用户态之前要独占整个组
-（[phase6 §1.4.5](../phase6-vfio/README.md#145-这对-vfio-意味着什么)）——组里只要还有一台
+（[phase6 §1.4.5](../phase7-vfio/README.md#145-这对-vfio-意味着什么)）——组里只要还有一台
 设备被别的驱动占着，直通就会失败。这就是"整组一起"的用户可见形态。
 
 本篇接下来讲的是边界定了之后的两件事：**设备怎么进组**（G.2）与**域怎么装到组上**（G.3）。
@@ -76,7 +76,7 @@ parallel and/or the 'replay' calls from ACPI/OF code" 是解释**为什么用全
 `iommu_probe_device_lock` 而不是 `device_lock`** 的，不要跟幂等判断混为一谈。
 
 这个幂等判断的实际后果是：**设备在 sysfs 里出现的 group 链接，不代表它的驱动已经
-attach 完成**。这跟 [phase6 corrections](../phase6-vfio/corrections.md) 里"VFIO 接管在
+attach 完成**。这跟 [phase6 corrections](../phase7-vfio/corrections.md) 里"VFIO 接管在
 sysfs 上看不见"是同一类观测盲区，成因不同但结论一致：sysfs 反映的是 core 的记账，
 不反映硬件状态。
 
@@ -125,8 +125,8 @@ SVA 走的就是后者。`struct dev_pasid_info` 因此和 `group_device` 是两
 
 `bus->iommu_ops->device_group()` 对 PCI 设备就是 `pci_device_group()`，它回答"这台机器上
 这个设备的隔离边界在哪里"，判据是 ACS 能力位与拓扑——那整段推理在
-[phase6 §1.4](../phase6-vfio/README.md#14-iommu-组是怎么划出来的)
-和 [§1.5.1–1.5.3](../phase6-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力)。
+[phase6 §1.4](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)
+和 [§1.5.1–1.5.3](../phase7-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力)。
 本阶段接手的是**边界定了之后**：这个 group 会拿到哪种域、域对象从哪来、失效由谁发起。
 
 反过来说，phase6 里"把 GPU 和 DDI 并进同一个 group"这类 ACS 配置，其内核侧的全部效果

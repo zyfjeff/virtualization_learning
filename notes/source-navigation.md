@@ -204,7 +204,7 @@ QEMU: ioctl(vfio_fd, VFIO_IOMMU_MAP_DMA)
 
 ★ 本页只列**开机时能传什么**。逐个参数的默认值、运行时权限（多数是 `0444` 只读，
 `echo` 会失败）、能不能在一轮实验里连续扫 —— 权威表只有一份，在
-[`../phase9-performance/parameters.md`](../phase9-performance/parameters.md)。
+[`../phase10-performance/parameters.md`](../phase10-performance/parameters.md)。
 
 ### kvm_intel 关键参数
 ```
@@ -237,9 +237,9 @@ mmio_caching=1         ← MMIO缓存（`0444` 只读，arch/x86/kvm/mmu/spte.c:
 ★ 本节只留"去哪找符号"的坐标。机制走读各有归属：halt-polling 在
 [`../phase0-kvm-framework/annotations.md`](../phase0-kvm-framework/annotations.md) §9，
 PLE / PML 与脏页 / 主时钟三块在
-[`../phase9-performance/annotations.md`](../phase9-performance/annotations.md) §1/§2/§3，
-参数表在 [`../phase9-performance/parameters.md`](../phase9-performance/parameters.md)，
-测量规范在 [`../phase9-performance/measurement.md`](../phase9-performance/measurement.md)。
+[`../phase10-performance/annotations.md`](../phase10-performance/annotations.md) §1/§2/§3，
+参数表在 [`../phase10-performance/parameters.md`](../phase10-performance/parameters.md)，
+测量规范在 [`../phase10-performance/measurement.md`](../phase10-performance/measurement.md)。
 
 ### halt-polling
 ```

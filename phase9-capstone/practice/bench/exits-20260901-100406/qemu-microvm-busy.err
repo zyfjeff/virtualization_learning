@@ -1,0 +1,2 @@
+qemu-system-x86_64: -serial pipe:bench/exits-20260901-100406/qp-busy: Could not open 'bench/exits-20260901-100406/qp-busy': No such file or directory
+qemu-system-x86_64: -serial pipe:bench/exits-20260901-100406/qp-busy: could not connect serial device to character backend 'pipe:bench/exits-20260901-100406/qp-busy'

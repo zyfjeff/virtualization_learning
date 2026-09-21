@@ -1,0 +1,8 @@
+[vfio] VFIO_DEVICE_RESET rc=0
+
+[boot] 首个串口字节 +474.192 ms
+[msix] vec0: addr=00000000:fee00000 data=000000ef
+[msix] vec1: addr=00000000:fee00000 data=000000ef
+[stats] 用户态 exit 计数: IO=45165 MMIO=19689
+[stats] pt: QUEUE_NOTIFY 写=19248（最后队列=0） ctrl 转发=23
+[vmm] 总运行时长 23047.824 ms

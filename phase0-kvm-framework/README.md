@@ -781,7 +781,7 @@ vcpu_run()循环
 - 减小：降低CPU占用，但增加中断延迟
 
 ★ 这对权衡在本机上**没有传说的那么灵**，实测结论（含"什么时候完全零收益"）见
-[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2。
+[`../phase10-performance/index.md`](../phase10-performance/index.md) §1.2。
 
 **VMM视角对比**：
 - 用户态VMM（特殊配置，如 `-kernel-irqchip off`）：ioctl返回KVM_EXIT_HLT，QEMU处理唤醒
@@ -962,7 +962,7 @@ Host内核中断处理 → kvm_set_irq(irq)
 **正确做法**：
 - 默认 200μs 通常是合理起点
 - 根据工作负载实测：只有"唤醒间隔 < polling 窗口"时才有收益
-- 详细实测数据见 [`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2
+- 详细实测数据见 [`../phase10-performance/index.md`](../phase10-performance/index.md) §1.2
 
 **源码位置**：`arch/x86/kvm/x86.c` → `kvm_vcpu_halt()` → halt-polling 循环
 
@@ -1013,12 +1013,12 @@ echo 400000 > /sys/module/kvm/parameters/halt_poll_ns
 **调优建议**：★ 这件事本仓已经实测过，结论与"按负载类型调窗口"的流传说法方向相反：
 **空闲场景零收益、flood 场景买不到延迟反而多付 CPU，且收益曲线在"窗口刚够盖住典型
 halt"处就饱和** —— 具体数值、样本量与实验条件只有一份，见
-[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2（本仓规则：
+[`../phase10-performance/index.md`](../phase10-performance/index.md) §1.2（本仓规则：
 别处只写指针，不复制数字）。
 
 机制侧的判据：只有"唤醒源随机且大概率落在 polling 窗口内"才有收益；唤醒事件早于
 窗口起点时 polling 无法让它更早。四个参数各自的作用域、默认值与自适应算法见
-[`../phase9-performance/parameters.md`](../phase9-performance/parameters.md) §1。
+[`../phase10-performance/parameters.md`](../phase10-performance/parameters.md) §1。
 
 ### 2. vCPU亲和性
 
@@ -1136,8 +1136,8 @@ echo "$ORIG" > /sys/module/kvm/parameters/halt_poll_ns
 ```
 
 ★ 这个 A/B 本仓已经做过，结论比"调大就更快"复杂，见
-[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2。
-自己做时要满足 [`../phase9-performance/measurement.md`](../phase9-performance/measurement.md)
+[`../phase10-performance/index.md`](../phase10-performance/index.md) §1.2。
+自己做时要满足 [`../phase10-performance/measurement.md`](../phase10-performance/measurement.md)
 的三条纪律：**有对照组、每档重复取中位数、两组同一观测档位**（一边开 trace 一边不开
 直接比耗时，测到的是 tracer 自己）。
 

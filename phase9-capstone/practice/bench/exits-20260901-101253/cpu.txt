@@ -1,0 +1,6 @@
+minivmm idle cpu%=0.3
+qemu-q35 idle cpu%=0.3
+qemu-microvm idle cpu%=0.3
+minivmm busy cpu%=100.3
+qemu-q35 busy cpu%=100.0
+qemu-microvm busy cpu%=100.0

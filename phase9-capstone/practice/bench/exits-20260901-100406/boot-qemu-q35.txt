@@ -1,0 +1,30 @@
+
+
+Analyze events for all VMs, all VCPUs:
+
+                                 VM-EXIT    Samples  Samples%     Time%    Min Time    Max Time         Avg time 
+
+                          IO_INSTRUCTION      72245    86.16%    51.64%      1.45us   3681.42us      7.05us ( +-   1.25% )
+                           EPT_MISCONFIG       5139     6.13%     9.07%      2.51us   4326.00us     17.42us ( +-   6.22% )
+                           EPT_VIOLATION       3387     4.04%     2.37%      1.33us    600.74us      6.89us ( +-  11.79% )
+                                   CPUID       1085     1.29%     0.11%      0.86us      6.74us      0.98us ( +-   0.83% )
+                               CR_ACCESS        676     0.81%     0.07%      0.94us      6.80us      1.06us ( +-   1.22% )
+                      EXTERNAL_INTERRUPT        402     0.48%     0.18%      1.55us     25.52us      4.33us ( +-   2.71% )
+                               MSR_WRITE        309     0.37%     0.06%      1.43us     10.13us      1.76us ( +-   2.47% )
+                                MSR_READ        293     0.35%     0.05%      1.40us      4.91us      1.57us ( +-   1.42% )
+                        PREEMPTION_TIMER        114     0.14%     0.01%      0.76us      1.94us      1.04us ( +-   2.06% )
+                                     HLT         91     0.11%    36.43%   1295.85us   4012.80us   3950.32us ( +-   0.79% )
+                              APIC_WRITE         47     0.06%     0.01%      0.70us     73.27us      2.78us ( +-  55.71% )
+                             EOI_INDUCED         21     0.03%     0.00%      1.12us      1.50us      1.25us ( +-   2.42% )
+                       PAUSE_INSTRUCTION         15     0.02%     0.00%      1.03us      3.96us      1.34us ( +-  14.66% )
+                           EXCEPTION_NMI         11     0.01%     0.01%      4.68us      8.85us      5.68us ( +-   7.80% )
+                        INTERRUPT_WINDOW          4     0.00%     0.00%      1.00us      2.37us      1.86us ( +-  16.33% )
+                                  WBINVD          2     0.00%     0.00%      0.98us      1.02us      1.00us ( +-   1.65% )
+                                  XSETBV          2     0.00%     0.00%      1.14us      3.44us      2.29us ( +-  50.22% )
+                               DR_ACCESS          1     0.00%     0.00%      2.17us      2.17us      2.17us ( +-   0.00% )
+                               GDTR_IDTR          1     0.00%     0.00%      5.97us      5.97us      5.97us ( +-   0.00% )
+                                   VMOFF          1     0.00%     0.00%     10.09us     10.09us     10.09us ( +-   0.00% )
+                                    VMON          1     0.00%     0.00%      9.80us      9.80us      9.80us ( +-   0.00% )
+
+Total Samples:83847, Total events handled time:986844.11us.
+

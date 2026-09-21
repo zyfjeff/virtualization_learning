@@ -15,7 +15,7 @@ HWPT），nested 翻译和脏页跟踪因此能挂在对象属性上。
 的域类型、谁选地址、谁管页面一次对齐。
 
 > 源码基线：`/root/code/linux-6.12.93`。VFIO 的用户态视角（container/group/fd、
-> 设备直通的完整用例）已在 [第六阶段](../phase6-vfio/README.md) §2 讲过，本文只讲
+> 设备直通的完整用例）已在 [第七阶段](../phase7-vfio/README.md) §2 讲过，本文只讲
 > "三套接口在 IOMMU 层各做什么"，不重复设备直通的用法。
 
 ## 📖 目录
@@ -142,7 +142,7 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
 ```
 
 这个文件就是 `/dev/vfio/vfio`（container fd）背后的 IOMMU 驱动。container /
-group / device 三层 fd 的组织见 [第六阶段](../phase6-vfio/README.md) §2，这里
+group / device 三层 fd 的组织见 [第七阶段](../phase7-vfio/README.md) §2，这里
 只追 MAP_DMA 一条线。
 
 ### U.3.2 map 链：pin 在前，map 在后

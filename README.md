@@ -20,8 +20,8 @@
 - EPT页表管理 (并发、大页、脏页跟踪)
 - 中断虚拟化 (Posted Interrupts零VM-Exit)
 - vhost内核态加速 (数据面卸载)
-- ★ KVM性能优化技术：PLE 与超卖自救 (phase9) / halt-polling (phase0) / VPID (phase1) / APICv (phase4)
-- ★ 性能测量方法论：观测者扰动预算 + 跨 phase 结论索引 (phase9)
+- ★ KVM性能优化技术：PLE 与超卖自救 (phase10) / halt-polling (phase0) / VPID (phase1) / APICv (phase5)
+- ★ 性能测量方法论：观测者扰动预算 + 跨 phase 结论索引 (phase10)
 - ★ KVM调试与测试 (ftrace, perf kvm stat, selftests, bpftrace)
 
 ## 环境信息
@@ -56,19 +56,24 @@ kvm-study/
 │   ├── mmio-identification.md   ← ★ MMIO 识别与 IPAT（含核查报告）
 │   ├── practice/                ← 2 个 C 练习程序（make 构建）
 │   └── archive/                 ← 已归档的过程性文档
-├── phase3-iommu/                ← 第三阶段：IOMMU 层（phase6 VFIO 的地基）
+├── phase3-iommu/                ← 第三阶段：IOMMU 层（phase7 VFIO 的地基）
 │   ├── README.md                ← 框架 + 概念 + 主流程 + 8 问清单
 │   ├── translation/…/backends.md← 8 篇问题深入文档
 │   ├── annotations.md           ← 源码注释
 │   ├── corrections.md           ← 勘误
 │   └── practice/                ← 4 个实验 + 引用核查脚本
-├── phase4-interrupts/           ← 第四阶段：中断虚拟化 + VT-d中断重映射
+├── phase4-pcie/                 ← 第四阶段：PCIe 总线与设备直通
+│   ├── README.md                ← 技术全景 + 学习路线
+│   ├── basics.md                ← PCIe 硬件基础（拓扑/BDF/配置空间/BAR）
+│   ├── annotations.md           ← 源码精读（设备发现/ACS/IOMMU group）
+│   └── corrections.md           ← 勘误
+├── phase5-interrupts/           ← 第五阶段：中断虚拟化 + VT-d中断重映射
 │   ├── README.md                ← 技术全景 + 中断路径 + 数据结构速览
 │   ├── annotations.md           ← pi_desc + IRTE + PIR→IRR + PI调度
 │   ├── posted-interrupts.md     ← ★ Posted 模式系统深入
 │   ├── msi-affinity-migration.md← ★ MSI 地址格式与亲和性迁移
 │   └── practice/                ← 6 个实验脚本 + PI 演示内核模块
-├── phase5-virtio/               ← 第五阶段：virtio / vhost / vhost-user
+├── phase6-virtio/               ← 第六阶段：virtio / vhost / vhost-user
 │   ├── README.md                ← 为什么需要vhost + 源码路线 + 本章文件导航
 │   ├── annotations.md           ← vhost源码注释
 │   ├── virtio-queue.md          ← ★ Virtqueue 深度解析
@@ -80,22 +85,22 @@ kvm-study/
 │   ├── vhost-user-new-features-usecases.md  ← 新特性使用场景
 │   ├── practice/                ← 全部练习与实测数据
 │   └── archive/                 ← 已被取代的过程性文档
-├── phase6-vfio/                 ← 第六阶段：VFIO设备直通
+├── phase7-vfio/                 ← 第七阶段：VFIO设备直通
 │   ├── README.md                ← VMM对比 + ACS/ATS + IOTLB/DMA批处理优化
 │   ├── corrections.md           ← 勘误
 │   └── practice/                ← VFIO 认领/DMA映射/MSI-X 实测练习
-├── phase7-timer-virt/           ← 第七阶段：时钟虚拟化
+├── phase8-timer-virt/           ← 第八阶段：时钟虚拟化
 │   ├── README.md                ← VMM对比 + TSC-deadline/kvmclock优化 + 概念区分
 │   ├── annotations.md           ← 源码级注释
 │   ├── corrections.md           ← 勘误
 │   └── practice/                ← 3 个可运行实验（TSC/kvmclock/LAPIC Timer）
-├── phase8-capstone/             ← ★ 第八阶段：毕业建造——最小 VMM
+├── phase9-capstone/             ← ★ 第九阶段：毕业建造——最小 VMM
 │   ├── README.md                ← 定位 + 项目阶梯 + 验收标准
 │   ├── project1-minivmm-boot.md ← ★ 可启动最小 VMM（bzImage 引导）
 │   ├── project2-minivmm-virtio.md← 自制 virtio-mmio 设备
 │   ├── project3-minivmm-vfio.md ← VFIO 直通进自己的 VMM
 │   └── project4-minivmm-bench.md← 与 QEMU/Firecracker 性能对标
-├── phase9-performance/          ← 第九阶段：性能测量方法论 + 独占机制 + 结论索引
+├── phase10-performance/          ← 第十阶段：性能测量方法论 + 独占机制 + 结论索引
 │   ├── README.md                ← 本章定位 + 文件清单 + 三条硬性规则
 │   ├── measurement.md           ← 测量纪律：重复/噪声/分辨率/观测者扰动/开跑前自检
 │   ├── parameters.md            ← ★ 参数默认值与权限的唯一来源（含"能不能运行时改"）
@@ -103,7 +108,7 @@ kvm-study/
 │   ├── index.md                 ← 跨 phase 性能结论索引（A/B/C/D 可信度分级）
 │   ├── corrections.md           ← 本章勘误
 │   └── practice/                ← E1–E5 五个实验（md + 可直接跑的 bench-*.sh）
-├── phase10-debugging/           ← 第十阶段：KVM运行时调试与诊断
+├── phase11-debugging/           ← 第十一阶段：KVM运行时调试与诊断
 │   ├── README.md                ← 场景驱动导航 + 决策树
 │   ├── annotations.md           ← trace events目录 + 12个bpftrace脚本
 │   ├── launch-failures.md       ← VM启动失败诊断

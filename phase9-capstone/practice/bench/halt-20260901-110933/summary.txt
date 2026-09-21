@@ -1,0 +1,10 @@
+poll-on cpu%=0.2
+poll-on 冷唤醒 n=20 timeout=0 med=175.7us min=173.0us p90=194.6us max=349.8us
+poll-on flood RTT n=800 timeout=0 med=165.9us min=92.7us p90=167.5us max=175.1us
+poll-on flood cpu%=74.9 耗时=0.2s
+poll-on flood haltpoll 轨迹: grow=4 shrink=4
+poll-off cpu%=0.4
+poll-off 冷唤醒 n=20 timeout=0 med=179.7us min=156.9us p90=182.4us max=347.6us
+poll-off flood RTT n=800 timeout=0 med=165.7us min=135.0us p90=166.8us max=174.8us
+poll-off flood cpu%=58.7 耗时=0.2s
+poll-off flood haltpoll 轨迹: grow=0 shrink=0

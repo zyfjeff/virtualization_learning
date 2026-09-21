@@ -2,21 +2,21 @@
 
 > 面向VMM专家的KVM内核态调试技巧
 >
-> **本文是快速参考卡片**，完整的调试参考手册见 [`phase10-debugging/annotations.md`](../phase10-debugging/annotations.md)
+> **本文是快速参考卡片**，完整的调试参考手册见 [`phase11-debugging/annotations.md`](../phase11-debugging/annotations.md)
 > （包含完整的 trace events 目录、selftests 框架、bpftrace 脚本集等）
 
 ---
 
-## 📖 本指南 vs phase10-debugging
+## 📖 本指南 vs phase11-debugging
 
-| 本指南 (debugging-guide.md) | phase10-debugging |
+| 本指南 (debugging-guide.md) | phase11-debugging |
 |----------------------------|------------------|
 | 快速参考卡片 | 完整参考手册 |
 | 常用命令速查 | trace events 完整目录 |
 | 典型问题处理 | 调试场景决策树 |
 | 现场排查技巧 | selftests + bpftrace |
 
-**建议**: 先看本指南快速上手，遇到问题再查阅 phase10-debugging 获取详细参考
+**建议**: 先看本指南快速上手，遇到问题再查阅 phase11-debugging 获取详细参考
 
 ---
 
@@ -429,10 +429,10 @@ stat -c %a /sys/module/kvm_intel/parameters/vpid  # → 444，只读（module_pa
 
 ★ 上面第 2 条**未必有效**：本仓实测过 halt-polling 调参，空闲场景零收益、
 flood 场景买不到延迟反而多付 CPU，结论见
-[`../phase9-performance/index.md`](../phase9-performance/index.md) §1.2；
+[`../phase10-performance/index.md`](../phase10-performance/index.md) §1.2；
 逐参数的权限与原值见
-[`../phase9-performance/parameters.md`](../phase9-performance/parameters.md)。
-任何"优化"都要按 [`../phase9-performance/measurement.md`](../phase9-performance/measurement.md)
+[`../phase10-performance/parameters.md`](../phase10-performance/parameters.md)。
+任何"优化"都要按 [`../phase10-performance/measurement.md`](../phase10-performance/measurement.md)
 的纪律**改前改后各测一遍**，别把建议当数据。
 
 ---

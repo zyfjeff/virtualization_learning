@@ -1,0 +1,20 @@
+# tracer: nop
+#
+# entries-in-buffer/entries-written: 8/8   #P:96
+#
+#                                _-----=> irqs-off/BH-disabled
+#                               / _----=> need-resched
+#                              | / _---=> hardirq/softirq
+#                              || / _--=> preempt-depth
+#                              ||| / _-=> migrate-disable
+#                              |||| /     delay
+#           TASK-PID     CPU#  |||||  TIMESTAMP  FUNCTION
+#              | |         |   |||||     |         |
+         minivmm-740186  [036] ..... 42698.048261: kvm_halt_poll_ns: vcpu 0: halt_poll_ns 10000 (grow 0)
+         minivmm-740186  [036] ..... 42698.048428: kvm_halt_poll_ns: vcpu 0: halt_poll_ns 20000 (grow 10000)
+         minivmm-740186  [036] ..... 42698.048596: kvm_halt_poll_ns: vcpu 0: halt_poll_ns 40000 (grow 20000)
+         minivmm-740186  [036] ..... 42698.048934: kvm_halt_poll_ns: vcpu 0: halt_poll_ns 80000 (grow 40000)
+         minivmm-740186  [036] ..... 42698.184614: kvm_halt_poll_ns: vcpu 0: halt_poll_ns 40000 (shrink 80000)
+         minivmm-740186  [036] ..... 42698.188613: kvm_halt_poll_ns: vcpu 0: halt_poll_ns 20000 (shrink 40000)
+         minivmm-740186  [036] ..... 42698.192614: kvm_halt_poll_ns: vcpu 0: halt_poll_ns 10000 (shrink 20000)
+         minivmm-740186  [036] ..... 42698.196615: kvm_halt_poll_ns: vcpu 0: halt_poll_ns 0 (shrink 10000)

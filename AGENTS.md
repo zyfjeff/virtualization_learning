@@ -10,14 +10,15 @@
 phase0-kvm-framework/   KVM 框架层
 phase1-cpu-virt/        VT-x 硬件基础 + CPU 虚拟化 (CPUID/MSR/指令)
 phase2-mem-virt/        内存虚拟化 (EPT/TDP MMU)
-phase3-iommu/           IOMMU 层 (phase6 VFIO 的地基)
-phase4-interrupts/      中断虚拟化 + VT-d IR
-phase5-virtio/          virtio / vhost / vhost-user
-phase6-vfio/            VFIO 设备直通
-phase7-timer-virt/      时钟虚拟化
-phase8-capstone/        毕业建造：最小 VMM
-phase9-performance/     性能测量方法论 + 独占机制 + 跨章结论索引
-phase10-debugging/       KVM 运行时调试与诊断
+phase3-iommu/           IOMMU 层 (phase7 VFIO 的地基)
+phase4-pcie/            PCIe 总线与设备直通 (拓扑/ACS/ATS/SR-IOV)
+phase5-interrupts/      中断虚拟化 + VT-d IR
+phase6-virtio/          virtio / vhost / vhost-user
+phase7-vfio/            VFIO 设备直通
+phase8-timer-virt/      时钟虚拟化
+phase9-capstone/        毕业建造：最小 VMM
+phase10-performance/     性能测量方法论 + 独占机制 + 跨章结论索引
+phase11-debugging/       KVM 运行时调试与诊断
 examples/  notes/  scripts/  shared/
 ```
 
@@ -81,9 +82,9 @@ examples/  notes/  scripts/  shared/
 11. **ACS 判定：`ACSCap` 里的 `-` 不算失败** — `pci_acs_flags_enabled()` 先按设备声明的 `ACSCap` 掩掉要求集（`drivers/pci/pci.c:3598`，`acs_flags &= (cap | PCI_ACS_EC)`），**没声明的能力被当作硬连线已启用**。只有「Cap 里有、Ctl 里没开」才算不通过。另外 `REQ_ACS_FLAGS` 只含 SV/RR/CR/UF（`drivers/iommu/iommu.c:1383`），`TransBlk-` / `EgressCtrl-` 与判定无关。更靠前的一层是 **quirk**：`pci_acs_enabled()` 开头先调 `pci_dev_specific_acs_enabled()`（`drivers/pci/pci.c:3624`），命中就直接定论、PCIe 类型判断根本不执行。x86 上 `{ PCI_VENDOR_ID_INTEL, PCI_ANY_ID, pci_quirk_rciep_acs }`（`drivers/pci/quirks.c:5122`）把**所有 Intel RCiEP** 判成隔离成立，即使它们没有 ACS capability —— 分析 Intel 平台的分组结果时必须先查这一层。
 12. **`pci_enable_acs()` 的 quirk 判据是反的** — 源码写的是 `if (pci_dev_specific_enable_acs(dev)) enable_acs = true;`（`drivers/pci/pci.c:1083`，外面还包着一层 `if (pci_acs_enable)` @ `:1082`）。`pci_dev_specific_enable_acs()` 命中 quirk 时返回 **0**、没命中返回 **-ENOTTY**（`drivers/pci/quirks.c:5438`），所以**「没有 quirk」才会走标准写入**，命中 quirk 反而跳过（quirk 自己写过寄存器了）。照返回值字面猜方向会得出完全相反的结论。另外 `pos = dev->acs_cap; if (!pos) return;`（`:1087-1089`）意味着没有 ACS capability 的设备根本走不到标准写入。
 13. **ACS 不是只读的，真有内核参数能改它** — 与「ACS 是硬件能力、没法用参数打开」这句流传的话相反：检测到 IOMMU 时 `pci_request_acs()`（`drivers/iommu/intel/dmar.c:935` 调用）会让 `pci_acs_init()` → `pci_std_enable_acs()`（`drivers/pci/pci.c:1052`）在每次 probe 时**主动写 `ACS Control`**（SV/RR/CR/UF 按 cap 掩码全开；`TB` 只给 `external_facing` / `untrusted` 设备或 `pci=noats`），复位恢复路径 `pci_restore_state()`（`:1963`）还会再写一次。上游真实存在的两个参数是 `pci=disable_acs_redir=`（`Documentation/admin-guide/kernel-parameters.txt:4657`，文档自己标注 "this **removes** isolation"）与 `pci=config_acs=`（`:4666`，"this **may remove** isolation"）；`pcie_acs_override=` 仍然不是上游代码。**`config_acs` 的标志串是从右往左解析的**（`__pci_config_acs()` 的 `end = delimit - p - 1` / `end--`，`pci.c:976-997`），文档示例 `pci=config_acs=10x` 表示的是「RR 开、TB 关、SV 不动」，从左往右读会配反。
-14. **ATS 的三个命名与时序坑** — (a) `STU` 是 **Smallest Translation Unit**，不是缓存粒度；寄存器里存的是位移量之差（`drivers/pci/ats.c:115`：`PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU)`，`PCI_ATS_MIN_STU`=12），字段值 `n` 表示 2^(12+n) 字节。(b) `PCI_ATS_CAP` 的 Page Aligned Request 在 **bit5**（`0x0020`，`include/uapi/linux/pci_regs.h`），不是 bit15。(c) Invalidate Queue Depth 的 `0` 有两种身份，别混：寄存器字段值 `0` 按 ATS spec 表示「可收 32 个 Invalidate Request」，`pci_ats_queue_depth()` 因此对 PF 返回 `PCI_ATS_MAX_QDEP` = 32（`ats.c:179`）；而**返回值** `0` 表示「该 function 不独占失效队列」，VF 走的就是这条路（`ats.c:175-176`：`if (dev->is_virtfn) return 0;`）。(d) VT-d spec Section 4.5.2 的关闭时序（quiesce → 清 `E` → global Device-TLB Invalidate + Wait → 改 context entry）用词是 "Recommended / should"，**Linux 的实现把第 3、4 步调换了**：`device_block_translation()`（`drivers/iommu/intel/iommu.c:3394`）在 `:3407` 清 `E`、`:3413` 清 context entry，Device-TLB 失效推迟到 `__context_flush_dev_iotlb()`（`pasid.c:885`），而它开头就有 `if (!info->ats_enabled) return;` —— 写文档时不要说成「Linux 严格按规范顺序做」。详见 [phase6 1.5](phase6-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力)。
-15. **VFIO 直通实验：设备被内核驱动挂着时，禁止 unbind、禁止 `/dev/mem` 摸 BAR** — 2026-08-31 实测挂死事故：直通存储设备（`4b:00.0`）绑 `virtio-pci` 做对照时，udev 扫描 I/O 在途（设备恰好停止完成请求），此时发 unbind → `virtblk_remove→del_gendisk` 等 opener/在途 I/O 死等并**持有 device_lock**，随后任何访问该设备 sysfs 的进程（连 `cat driver_override` 都算，`driver_override_show→mutex_lock`）级联进 D 状态，整机不可操作、只能硬重启。规则：① unbind/复位前先确认无在途 I/O、无 opener（`udevadm settle`、`/sys/block/vdX/inflight`、`fuser`）；② 绝不通过 `/dev/mem` 读写正被驱动着的设备的 BAR（读寄存器也可能扰动设备状态），要看寄存器走 VFIO device fd；③ 对可疑设备的一切 sysfs 访问用 `timeout` 包裹，发现 D 状态级联立刻停手，改用 `/proc/<pid>/stack` 定位、PCI 级复位（FLR / bus reset）恢复；④ 实验结束把直通设备恢复到安全绑定（`vfio-pci`）再收工。完整复盘见 `phase8-capstone/corrections.md` F 节。
-16. **直通设备的寄存器布局可能是动态的，禁止按"静态布局"做换算/截留** — `4b:00.0`（legacy virtio-pci）的 BAR0 布局随**自身** MSI-X Enable 切换：未启用时 config@0x14；`VFIO_DEVICE_SET_IRQS` 启用后 0x14/0x16 变为 config/queue 向量寄存器（默认 `0xFFFF`=NO_VECTOR）、config 移到 0x18（`msixdump -a` 实测，见 `phase8-capstone/corrections.md` G 节）。按静态布局做 `-4` 换算 + 截留向量寄存器曾同时造成两个故障：guest 容量低 32 位读成全 1（两个 `0xFFFF` 寄存器拼 32 位恰为 `0xFFFFFFFF`）、设备学不到队列→MSI-X 表项映射而「完成请求也不发中断」。规则：给直通设备写任何地址换算/截留逻辑前，先用 VFIO device fd 做「启用前/后」对照 dump 验证；本例的正确答案是**纯透传**。
+14. **ATS 的三个命名与时序坑** — (a) `STU` 是 **Smallest Translation Unit**，不是缓存粒度；寄存器里存的是位移量之差（`drivers/pci/ats.c:115`：`PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU)`，`PCI_ATS_MIN_STU`=12），字段值 `n` 表示 2^(12+n) 字节。(b) `PCI_ATS_CAP` 的 Page Aligned Request 在 **bit5**（`0x0020`，`include/uapi/linux/pci_regs.h`），不是 bit15。(c) Invalidate Queue Depth 的 `0` 有两种身份，别混：寄存器字段值 `0` 按 ATS spec 表示「可收 32 个 Invalidate Request」，`pci_ats_queue_depth()` 因此对 PF 返回 `PCI_ATS_MAX_QDEP` = 32（`ats.c:179`）；而**返回值** `0` 表示「该 function 不独占失效队列」，VF 走的就是这条路（`ats.c:175-176`：`if (dev->is_virtfn) return 0;`）。(d) VT-d spec Section 4.5.2 的关闭时序（quiesce → 清 `E` → global Device-TLB Invalidate + Wait → 改 context entry）用词是 "Recommended / should"，**Linux 的实现把第 3、4 步调换了**：`device_block_translation()`（`drivers/iommu/intel/iommu.c:3394`）在 `:3407` 清 `E`、`:3413` 清 context entry，Device-TLB 失效推迟到 `__context_flush_dev_iotlb()`（`pasid.c:885`），而它开头就有 `if (!info->ats_enabled) return;` —— 写文档时不要说成「Linux 严格按规范顺序做」。详见 [phase6 1.5](phase7-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力)。
+15. **VFIO 直通实验：设备被内核驱动挂着时，禁止 unbind、禁止 `/dev/mem` 摸 BAR** — 2026-08-31 实测挂死事故：直通存储设备（`4b:00.0`）绑 `virtio-pci` 做对照时，udev 扫描 I/O 在途（设备恰好停止完成请求），此时发 unbind → `virtblk_remove→del_gendisk` 等 opener/在途 I/O 死等并**持有 device_lock**，随后任何访问该设备 sysfs 的进程（连 `cat driver_override` 都算，`driver_override_show→mutex_lock`）级联进 D 状态，整机不可操作、只能硬重启。规则：① unbind/复位前先确认无在途 I/O、无 opener（`udevadm settle`、`/sys/block/vdX/inflight`、`fuser`）；② 绝不通过 `/dev/mem` 读写正被驱动着的设备的 BAR（读寄存器也可能扰动设备状态），要看寄存器走 VFIO device fd；③ 对可疑设备的一切 sysfs 访问用 `timeout` 包裹，发现 D 状态级联立刻停手，改用 `/proc/<pid>/stack` 定位、PCI 级复位（FLR / bus reset）恢复；④ 实验结束把直通设备恢复到安全绑定（`vfio-pci`）再收工。完整复盘见 `phase9-capstone/corrections.md` F 节。
+16. **直通设备的寄存器布局可能是动态的，禁止按"静态布局"做换算/截留** — `4b:00.0`（legacy virtio-pci）的 BAR0 布局随**自身** MSI-X Enable 切换：未启用时 config@0x14；`VFIO_DEVICE_SET_IRQS` 启用后 0x14/0x16 变为 config/queue 向量寄存器（默认 `0xFFFF`=NO_VECTOR）、config 移到 0x18（`msixdump -a` 实测，见 `phase9-capstone/corrections.md` G 节）。按静态布局做 `-4` 换算 + 截留向量寄存器曾同时造成两个故障：guest 容量低 32 位读成全 1（两个 `0xFFFF` 寄存器拼 32 位恰为 `0xFFFFFFFF`）、设备学不到队列→MSI-X 表项映射而「完成请求也不发中断」。规则：给直通设备写任何地址换算/截留逻辑前，先用 VFIO device fd 做「启用前/后」对照 dump 验证；本例的正确答案是**纯透传**。
 17. **VFIO 的 `SET_IRQS` 对 MSI-X 没有 MASK/UNMASK，mask 位只能直写物理表** — `drivers/vfio/pci/vfio_pci_intrs.c:854-857` 对 MSI/MSI-X 的 `ACTION_MASK/UNMASK` 直接留空（"XXX Need masking support exported"）。guest 的 Vector Control 写要由 VMM 直接 `pwrite` 到物理 MSI-X 表（宿主内核对自家设备也是直写：`pci_msix_write_vector_ctrl`，`drivers/pci/msi/msi.h:43-55`）；物理表的 addr/data 归内核（宿主 MSI 消息），VMM 永不覆写。另有两个时序要点：(a) 武装（`SET_IRQS` TRIGGER）时内核 `request_irq(flags=0)` → `irq_startup` → `pci_msix_unmask` 会**无条件放行**所有武装向量（`vfio_pci_intrs.c:510`），而 guest 清 MASKALL 那一刻恰好是 `msix_mask_all` 写的全 mask（`msix_capability_init` 顺序 `drivers/pci/msi/msi.c:725→740→756→758`），武装后需把影子表 ctrl 同步写回物理表拉齐。(b) guest 启用 MSI-X 的时序判据是**清 Function Mask（W2）**，不是置 Enable（W1 = ENABLE|MASKALL 只是让表可访问，`msi.c:720-726`）。
 
 ## 文档规范
@@ -116,9 +117,9 @@ int vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
 
 | 内容 | 唯一来源 | 其它章节怎么写 |
 |---|---|---|
-| 实测性能数字 | 该实验所属章节；跨章汇总在 `phase9-performance/index.md`（A/B/C/D 分级） | **只给指针，禁止复制数字**；没有实测就标"待实测" |
-| 模块参数默认值与权限 | `phase9-performance/parameters.md` | 只写"存在吗 / 运行时可改吗"+ `file:line`，不抄默认值 |
-| 测量方法（重复、噪声、观测者扰动、清场） | `phase9-performance/measurement.md` | 给指针 |
+| 实测性能数字 | 该实验所属章节；跨章汇总在 `phase10-performance/index.md`（A/B/C/D 分级） | **只给指针，禁止复制数字**；没有实测就标"待实测" |
+| 模块参数默认值与权限 | `phase10-performance/parameters.md` | 只写"存在吗 / 运行时可改吗"+ `file:line`，不抄默认值 |
+| 测量方法（重复、噪声、观测者扰动、清场） | `phase10-performance/measurement.md` | 给指针 |
 
 三条硬约束：
 
@@ -130,11 +131,11 @@ int vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
    `:4579-4581`，收尾 `:6438`/`:6478-6479`）；`set_event_pid` 清掉所有已有 PID
    （`kernel/trace/trace_events.c:2432` → `:2442-2444`，但 `:2167-2168` 对空写直接返回，
    所以纯 `: >` 截断就是干净清空）。加用 `>>`，清场要显式写并注明。
-   规则唯一来源：`phase9-performance/measurement.md` §5 第 3 条。
+   规则唯一来源：`phase10-performance/measurement.md` §5 第 3 条。
 3. `kvm:kvm_exit` 在 **trace 文本**里打的是符号名（`reason MSR_WRITE`），在 **BPF** 里
    `args->exit_reason` 才是数字；6.12.93 **没有** `exit_reason_full` 这个字段。
    按 `reason=[0-9]` 去 grep trace 永远抓不到东西。字段与译名链路唯一来源：
-   `phase10-debugging/annotations.md` §1.1。
+   `phase11-debugging/annotations.md` §1.1。
 
 ## 常用命令
 

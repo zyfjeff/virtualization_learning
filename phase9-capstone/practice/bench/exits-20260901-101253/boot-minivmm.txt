@@ -1,0 +1,26 @@
+
+
+Analyze events for all VMs, all VCPUs:
+
+                                 VM-EXIT    Samples  Samples%     Time%    Min Time    Max Time         Avg time 
+
+                          IO_INSTRUCTION      40560    66.89%    35.90%      1.50us     23.20us      4.30us ( +-   0.08% )
+                           EPT_VIOLATION      16693    27.53%     9.91%      1.40us    101.64us      2.88us ( +-   0.57% )
+                                   CPUID       1372     2.26%     0.27%      0.85us      7.24us      0.97us ( +-   0.98% )
+                      EXTERNAL_INTERRUPT       1067     1.76%     1.24%      1.29us   2131.85us      5.65us ( +-  35.29% )
+                           EPT_MISCONFIG        341     0.56%     0.37%      4.92us     20.80us      5.21us ( +-   1.10% )
+                                MSR_READ        274     0.45%     0.10%      1.40us     37.37us      1.70us ( +-   7.86% )
+                               MSR_WRITE        126     0.21%     0.05%      1.44us      7.14us      1.75us ( +-   4.11% )
+                        INTERRUPT_WINDOW         83     0.14%     0.03%      1.23us      7.64us      1.59us ( +-   5.05% )
+                                     HLT         64     0.11%    52.12%   2542.57us   3984.18us   3957.21us ( +-   0.57% )
+                              APIC_WRITE         23     0.04%     0.01%      0.70us     10.17us      1.53us ( +-  29.12% )
+                       PAUSE_INSTRUCTION         20     0.03%     0.00%      1.04us      1.51us      1.19us ( +-   3.19% )
+                               CR_ACCESS         11     0.02%     0.01%      1.08us      5.08us      2.43us ( +-  16.03% )
+                                  XSETBV          2     0.00%     0.00%      1.13us      3.96us      2.54us ( +-  55.56% )
+                               DR_ACCESS          1     0.00%     0.00%      1.70us      1.70us      1.70us ( +-   0.00% )
+                           EXCEPTION_NMI          1     0.00%     0.00%      0.98us      0.98us      0.98us ( +-   0.00% )
+                               GDTR_IDTR          1     0.00%     0.00%     13.64us     13.64us     13.64us ( +-   0.00% )
+                                    VMON          1     0.00%     0.00%      9.62us      9.62us      9.62us ( +-   0.00% )
+
+Total Samples:60640, Total events handled time:485921.58us.
+

@@ -1,0 +1,13 @@
+
+
+Analyze events for all VMs, all VCPUs:
+
+                                 VM-EXIT    Samples  Samples%     Time%    Min Time    Max Time         Avg time 
+
+                          IO_INSTRUCTION      15008    79.91%     0.18%      1.62us      6.12us      1.80us ( +-   0.06% )
+                                     HLT       3751    19.97%    99.82%   3925.11us   4012.94us   3982.34us ( +-   0.00% )
+                                MSR_READ         15     0.08%     0.00%      1.94us      3.29us      2.47us ( +-   4.39% )
+                           EPT_VIOLATION          7     0.04%     0.00%      2.39us      5.64us      2.98us ( +-  15.05% )
+
+Total Samples:18781, Total events handled time:14964840.20us.
+

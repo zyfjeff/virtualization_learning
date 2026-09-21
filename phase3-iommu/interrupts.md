@@ -14,7 +14,7 @@ ITS 实例自己的 doorbell 物理地址，没有统一基址可言。
 VFIO / IOMMUFD 都要在 attach 时特判一把 "SW_MSI"。这一节把这三个"想不通"一次解开。
 
 > 源码基线：`/root/code/linux-6.12.93`。IRTE / Posted Interrupt 的位级细节已在
-> [第四阶段](../phase4-interrupts/README.md) 以 `intel-vtd.pdf` §9.9–9.11 为据核过，
+> [第五阶段](../phase5-interrupts/README.md) 以 `intel-vtd.pdf` §9.9–9.11 为据核过，
 > 本文不重复，只讲"中断怎么穿过 IOMMU 这一层"。
 
 ## 📖 目录
@@ -71,7 +71,7 @@ x86 上开 IR 是防中断注入攻击的前提）、只开 DMA、都开、都�
 对直通设备意味着什么：设备 MSI 写进来后，硬件先用地址里的 handle 查**中断重映射表**
 （IRTE）得到投递目标——这一步归 IR 管；而 IRTE 本身放在内存里，硬件访问 IRTE 表
 走的是自己的取表逻辑，与设备 DMA 用的页表无关。IRTE 格式、Remapped/Posted 两种
-模式（`IM` 位）、PI Descriptor 见 [第四阶段](../phase4-interrupts/README.md)。
+模式（`IM` 位）、PI Descriptor 见 [第五阶段](../phase5-interrupts/README.md)。
 
 ---
 

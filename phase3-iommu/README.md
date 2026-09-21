@@ -19,7 +19,7 @@
 
 > **前置依赖**:
 > - 第二阶段（内存虚拟化 EPT）：本阶段"框架"一节直接用 EPT 做类比，没读过会失去最大的一个杠杆
-> - 不需要先读第六阶段；**反过来，本阶段是第六阶段的地基**
+> - 不需要先读第七阶段；**反过来，本阶段是第七阶段的地基**
 
 ---
 
@@ -78,7 +78,7 @@ Architecture Specification, **Rev 4.1**, Order Number D51397-016）、
   地方会明确写"代码如此，规范语义未核实"。
 - **PCIe/ACS/ATS 相关**：`pcie-base-spec-r6.0.pdf` 可用；VT-d 把部分语义（如 Device-TLB
   失效的 S 位）**委托**给 PCIe/ATS 规范，本阶段只给位运算事实并标出委托边界。
-  ACS/ATS 的判定语义已在第六阶段 §1.5 以源码为据核过，本阶段不重复，只做交叉链接。
+  ACS/ATS 的判定语义已在第七阶段 §1.5 以源码为据核过，本阶段不重复，只做交叉链接。
 - 术语统一采用 Intel 规范写法：**First-Stage Translation / Second-Stage Translation**
   （Rev 4.1 用 *stage* 不用 *level*）。
 
@@ -337,9 +337,9 @@ identity 的硬件表达各不相同。
 - **Linux 内核源码** `/root/code/linux-6.12.93/`：`drivers/iommu/`（core + 三后端）、
   `kernel/dma/`（DMA API）、`include/linux/iommu.h`。
 - **`intel-vtd.pdf`**（VT-d Rev 4.1）：§3.6/3.7 两级翻译、§4 地址翻译、§6 失效、§9 页表项。
-- **第六阶段** [`../phase6-vfio/README.md`](../phase6-vfio/README.md)：group 判定（§1.4）、
+- **第七阶段** [`../phase7-vfio/README.md`](../phase7-vfio/README.md)：group 判定（§1.4）、
   ACS/ATS（§1.5）、DMA 映射（§2）、MSI-X 直通（§3.3）。
-- **第四阶段** [`../phase4-interrupts/README.md`](../phase4-interrupts/README.md)：IRTE、
+- **第五阶段** [`../phase5-interrupts/README.md`](../phase5-interrupts/README.md)：IRTE、
   Posted Interrupt、MSI 地址格式。
 - **第二阶段** [`../phase2-mem-virt/README.md`](../phase2-mem-virt/README.md)：EPT 两级翻译，
   本阶段类比的基础。

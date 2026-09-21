@@ -606,7 +606,7 @@ void kvm_vcpu_halt(struct kvm_vcpu *vcpu)
 
 3. **为什么窗口超过某个值后收益饱和？**
    - 窗口盖住了典型 halt 时间后，再大也无法让唤醒更早
-   - 对照 phase9-performance/index.md §1.2 的实测数据
+   - 对照 phase10-performance/index.md §1.2 的实测数据
 
 ---
 
