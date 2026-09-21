@@ -4,7 +4,54 @@
 
 ---
 
-## 勘误 1：初始版本缺失
+## 勘误 1：BAR 枚举流程描述错误（严重）
+
+**位置**: `basics.md` §4.3
+
+**错误**: 
+1. 使用了不存在的函数 `pci_assign_resource_fixup()`
+2. 错误地将 BAR 大小探测放在 `pci_assign_resource()` 中
+3. 行号错误（setup-res.c:291 → 实际 329）
+
+**修正**: 
+- BAR 大小探测在 `__pci_read_base()` (`probe.c:176`)
+- 地址分配在 `pci_assign_resource()` (`setup-res.c:329`)
+- 这两个是独立的步骤，不应混为一谈
+
+**状态**: ✅ 已修复
+
+---
+
+## 勘误 2：PCI_CAP_ID_CSIV 名称错误
+
+**位置**: `basics.md` §5.2
+
+**错误**: `PCI_CAP_ID_CSIV` 不存在
+
+**修正**: 正确名称是 `PCI_CAP_ID_CHSWP`（CompactPCI HotSwap）
+
+**状态**: ✅ 已修复
+
+---
+
+## 勘误 3：源码引用行号错误（多处）
+
+**位置**: `basics.md` 和 `annotations.md`
+
+| 文件 | 错误行号 | 正确行号 |
+|------|---------|---------|
+| `pci_regs.h` BAR defines | 88 | 102-108 |
+| `setup-res.c` pci_assign_resource | 291 | 329 |
+| `pci_regs.h` ACS defines | 676 | 991-997 |
+| `pci.h` BDF macros | 32-36 | uapi/pci.h:31-33 + pci.h:73 |
+| `access.c` pci_read_config_byte | 49 | 560 |
+| `probe.c` pci_scan_slot | 2363 | 2747 |
+
+**状态**: 部分已修复，待继续修正
+
+---
+
+## 勘误 4：初始版本缺失
 
 **状态**: 待完善
 
@@ -20,21 +67,7 @@
 
 ---
 
-## 勘误 2：源码引用需要验证
-
-**状态**: 待验证
-
-**说明**: `annotations.md` 中的源码引用基于 Linux 6.12.93，但以下函数的行号可能随版本变化：
-- `pci_scan_child_bus_extend()`: `drivers/pci/probe.c:3183`
-- `pci_scan_slot()`: `drivers/pci/probe.c:2363`
-- `pci_acs_flags_enabled()`: `drivers/pci/pci.c:3598`
-- `pci_acs_enabled()`: `drivers/pci/pci.c:3624`
-
-**修正建议**: 使用函数名 grep 定位，而非依赖具体行号。
-
----
-
-## 勘误 3：PCIe 规范版本
+## 勘误 5：PCIe 规范版本
 
 **状态**: 需确认
 
@@ -44,7 +77,7 @@
 
 ---
 
-## 勘误 4：ACS quirk 表不完整
+## 勘误 6：ACS quirk 表不完整
 
 **状态**: 待补充
 
@@ -54,7 +87,7 @@
 
 ---
 
-## 勘误 5：lspci 输出示例过时
+## 勘误 7：lspci 输出示例过时
 
 **状态**: 待更新
 

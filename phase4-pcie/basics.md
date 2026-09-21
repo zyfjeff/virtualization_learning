@@ -358,37 +358,50 @@ BAR 支持三种类型：
 
 ### 4.3 BAR 枚举过程
 
-系统启动时，BIOS/内核会枚举所有 BAR 并分配地址：
+系统启动时，BIOS/内核会枚举所有 BAR 并分配地址。**BAR 大小探测**和**地址分配**是两个独立步骤。
+
+**步骤 1：BAR 大小探测**（设备枚举阶段）
 
 ```c
-/* 源码位置: drivers/pci/setup-res.c:291 */
+/* 来源: drivers/pci/probe.c:176 — __pci_read_base() */
+/* 在设备枚举时调用，探测 BAR 大小 */
+pci_read_config_dword(dev, pos, &l);        /* 1. 读取 BAR 原始值 */
+pci_write_config_dword(dev, pos, l | mask); /* 2. 写入全 1 */
+pci_read_config_dword(dev, pos, &sz);       /* 3. 读回值（低位为 0 表示大小） */
+pci_write_config_dword(dev, pos, l);        /* 4. 恢复原始值 */
+```
+
+**步骤 2：地址分配**（资源分配阶段）
+
+```c
+/* 来源: drivers/pci/setup-res.c:329 — pci_assign_resource() */
 int pci_assign_resource(struct pci_dev *dev, int resno)
 {
     struct resource *res = dev->resource + resno;
     
-    /* 1. 读取 BAR 原始值（保存大小信息） */
-    pci_read_config_dword(dev, PCI_BASE_ADDRESS_0 + resno * 4, &size);
+    /* 资源大小已在枚举阶段通过 __pci_read_base() 确定 */
+    /* 这里只负责分配地址并写入 BAR */
+    ret = _pci_assign_resource(dev, resno, size, min);
+    if (ret)
+        ret = pci_revert_fw_address(res, dev, resno, size);
     
-    /* 2. 写入全 1，读取返回值（获取大小） */
-    pci_write_config_dword(dev, PCI_BASE_ADDRESS_0 + resno * 4, 0xffffffff);
-    pci_read_config_dword(dev, PCI_BASE_ADDRESS_0 + resno * 4, &size);
-    
-    /* 3. 恢复 BAR 原始值 */
-    pci_write_config_dword(dev, PCI_BASE_ADDRESS_0 + resno * 4, size);
-    
-    /* 4. 分配地址并写入 BAR */
-    pci_assign_resource_fixup(dev, resno);
-    
-    return 0;
+    return ret;
 }
 ```
 
-**BAR 枚举步骤**：
-1. 读取 BAR 原始值
+**BAR 枚举完整流程**：
+
+| 阶段 | 函数 | 位置 | 作用 |
+|------|------|------|------|
+| 设备枚举 | `__pci_read_base()` | `probe.c:176` | 写全 1 读回，确定 BAR 大小 |
+| 资源分配 | `pci_assign_resource()` | `setup-res.c:329` | 分配地址，写入 BAR |
+| Bridge 窗口 | `__pci_bus_size_bridges()` | `setup-bus.c:1280` | 为 Bridge 下游分配地址范围 |
+
+**BAR 大小探测原理**：
+1. 读取 BAR 原始值（保存）
 2. 写入全 1（0xFFFFFFFF）
-3. 读回值，低位为 0 的位数表示 BAR 大小
-4. 根据大小分配地址
-5. 将分配的地址写回 BAR
+3. 读回值：低位为 0 的位数表示 BAR 大小
+4. 恢复 BAR 原始值
 
 ---
 
@@ -436,7 +449,7 @@ PCIe 能力是可选的扩展功能，通过 **Capability Pointer** 链接：
 #define PCI_CAP_ID_VPD        0x03  /* Vital Product Data */
 #define PCI_CAP_ID_SLOTID     0x04  /* Slot Identification */
 #define PCI_CAP_ID_MSI        0x05  /* Message Signaled Interrupts */
-#define PCI_CAP_ID_CSIV       0x06  /* CompactPCI (已过时) */
+#define PCI_CAP_ID_CHSWP      0x06  /* CompactPCI HotSwap (已过时) */
 #define PCI_CAP_ID_PCIX       0x07  /* PCI-X (已过时) */
 #define PCI_CAP_ID_HT         0x08  /* HyperTransport (已过时) */
 #define PCI_CAP_ID_VNDR       0x09  /* Vendor Specific */
