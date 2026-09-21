@@ -164,12 +164,12 @@ struct pci_bus *pci_create_root_bus(struct device *parent, int bus,
 BDF 编码反映了 PCIe 拓扑的层次结构：
 
 ```c
-/* 源码位置: include/linux/pci.h:32 */
+/* 源码位置: include/uapi/linux/pci.h:31-33 */
 #define PCI_DEVFN(slot, func)   ((((slot) & 0x1f) << 3) | ((func) & 0x07))
 #define PCI_SLOT(devfn)         (((devfn) >> 3) & 0x1f)
 #define PCI_FUNC(devfn)         ((devfn) & 0x07)
 
-/* 源码位置: include/linux/pci.h:36 */
+/* 源码位置: include/linux/pci.h:73 */
 #define PCI_BUS_NUM(devfn)      (((devfn) >> 8) & 0xff)  /* 从 devfn 提取 Bus */
 ```
 
@@ -257,17 +257,24 @@ PCIe 定义了三种配置空间类型：
 内核通过 `pci_read_config_*` / `pci_write_config_*` 访问配置空间：
 
 ```c
-/* 源码位置: drivers/pci/access.c:49 */
+/* 源码位置: drivers/pci/access.c:560 */
 int pci_read_config_byte(const struct pci_dev *dev, int where, u8 *val)
 {
-    /* 通过 BDF 定位设备，读取配置空间 */
+    if (pci_dev_is_disconnected(dev)) {
+        PCI_SET_ERROR_RESPONSE(val);
+        return PCIBIOS_DEVICE_NOT_FOUND;
+    }
     return pci_bus_read_config_byte(dev->bus, dev->devfn, where, val);
 }
 
-/* 源码位置: drivers/pci/access.c:69 */
-int pci_write_config_byte(const struct pci_dev *dev, int where, u8 val)
+/* 源码位置: drivers/pci/access.c:570 */
+int pci_read_config_word(const struct pci_dev *dev, int where, u16 *val)
 {
-    return pci_bus_write_config_byte(dev->bus, dev->devfn, where, val);
+    if (pci_dev_is_disconnected(dev)) {
+        PCI_SET_ERROR_RESPONSE(val);
+        return PCIBIOS_DEVICE_NOT_FOUND;
+    }
+    return pci_bus_read_config_word(dev->bus, dev->devfn, where, val);
 }
 ```
 
@@ -297,7 +304,7 @@ int pci_write_config_byte(const struct pci_dev *dev, int where, u8 val)
 #define PCI_PRIMARY_BUS         0x18    /* 8 bits */
 #define PCI_SECONDARY_BUS       0x19    /* 8 bits */
 #define PCI_SUBORDINATE_BUS     0x1a    /* 8 bits */
-#define PCI_SEC_LIMIT           0x1b    /* 8 bits */
+#define PCI_SEC_LATENCY_TIMER   0x1b    /* 8 bits - Secondary bus latency timer */
 ```
 
 ---
