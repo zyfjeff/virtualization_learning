@@ -9,12 +9,12 @@
 
 ## 📚 前置知识
 
-本阶段假设你已经完成 Phase 1-10，掌握了：
+本阶段假设你已经完成 Phase 1-3，掌握了：
 - ✅ IOMMU 基础概念（Phase 3）
-- ✅ 中断虚拟化与 VT-d（Phase 4）
-- ✅ VFIO 设备直通基础（Phase 6）
+- ✅ 内存虚拟化 EPT（Phase 2）
+- ✅ CPU 虚拟化基础（Phase 1）
 
-如果你还没有完成 Phase 6，建议先学习 `../phase7-vfio/README.md`。
+建议学习顺序：Phase 3 → Phase 4（本阶段）→ Phase 5（中断）→ Phase 7（VFIO）
 
 ---
 
