@@ -257,7 +257,23 @@ u8 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
 **决策逻辑**：
 1. **MMIO 区域**（设备内存）→ **UC (Uncacheable)**，防止缓存导致设备行为异常
 2. **普通 RAM** → **WB (Write-Back)**，最大化缓存性能
-3. **IPAT 位**：控制是否忽略 guest PAT（通常不需要）
+3. **IPAT 位**：控制是否忽略 guest PAT
+
+**内存类型决策表**：
+
+| `vmx_ignore_guest_pat()` | IPAT | bits 3-5 | 最终内存类型 | 适用场景 |
+|-------------------------|------|----------|-------------|---------|
+| **true** | 1 | WB | 强制 WB | 无非一致性 DMA |
+| **false** | 0 | WB | EPT(WB) ∩ Guest PAT | 有非一致性 DMA（如 GPU 直通） |
+
+**`vmx_ignore_guest_pat()` 的决策条件**（`arch/x86/kvm/vmx/vmx.c:7668`）：
+```c
+return !kvm_arch_has_noncoherent_dma(kvm) &&
+       kvm_check_has_quirk(kvm, KVM_X86_QUIRK_IGNORE_GUEST_PAT);
+```
+
+- **无非一致性 DMA** + **启用 quirk** → IPAT=1，强制 WB，忽略 Guest PAT
+- **有非一致性 DMA**（如某些 GPU）→ IPAT=0，允许 Guest 通过 PAT 控制内存类型
 
 #### 2.4.3 MMIO 检测机制
 
