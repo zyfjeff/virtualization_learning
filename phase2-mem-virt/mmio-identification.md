@@ -323,6 +323,29 @@ IPAT = 1: 忽略 Guest 的 PAT/MTRR 设置，使用 EPT 中设置的内存类型
 
 **✅ IPAT 默认开启**（对于大多数 VM）
 
+#### 决策逻辑总结
+
+`vmx_ignore_guest_pat()` 的决策逻辑（`arch/x86/kvm/vmx/vmx.c:7668`）：
+
+```c
+static inline bool vmx_ignore_guest_pat(struct kvm *kvm)
+{
+    return !kvm_arch_has_noncoherent_dma(kvm) &&
+           kvm_check_has_quirk(kvm, KVM_X86_QUIRK_IGNORE_GUEST_PAT);
+}
+```
+
+**内存类型决策表**：
+
+| `vmx_ignore_guest_pat()` | IPAT | bits 3-5 | 最终内存类型 | 适用场景 |
+|-------------------------|------|----------|-------------|---------|
+| **true** | 1 | WB | 强制 WB | 无非一致性 DMA |
+| **false** | 0 | WB | EPT(WB) ∩ Guest PAT | 有非一致性 DMA |
+
+**返回值含义**：
+- **true**：设置 `VMX_EPT_IPAT_BIT`，忽略 Guest PAT，强制 WB
+- **false**：不设置 IPAT，使用 Guest PAT 决定最终内存类型
+
 #### 普通 VM（无 VFIO 设备）
 
 ```bash
