@@ -710,28 +710,30 @@ cat /sys/module/kvm_intel/parameters/eptad
 
 ### 3. MMIO缓存
 
-**问题**：MMIO访问每次都触发VM-Exit
+**问题**：MMIO 地址（设备寄存器）不在 RAM 中，每次访问都触发 EPT Violation → VM-Exit。KVM 需要查找 memslot 判断是 RAM 还是 MMIO，频繁访问性能差。
 
-**解决**：缓存MMIO映射，减少VM-Exit
+**解决**：两级缓存机制
 
-```c
-/* kvm_mmu_set_mmio_spte_mask() 中启用 */
-if (mmio_caching) {
-    /* 缓存MMIO区域的SPTE */
-    kvm_mmu_set_mmio_spte_mask(mask, value);
-}
-```
+#### 3.1 SPTE 级缓存
+- **原理**：在 EPT/shadow page table 中创建特殊的 MMIO SPTE，标记该 GPA 是 MMIO 区域
+- **流程**：
+  1. 首次访问 → EPT Violation → KVM 查找 memslot → 发现不在任何 slot（`is_noslot_pfn`）
+  2. 创建 MMIO SPTE（`mark_mmio_spte`）
+  3. 后续访问 → SPTE 已存在 → 识别为 MMIO → 直接模拟
+- **失效**：memslot 变更或 page table 被 zap 时清除
 
-**配置**：
-```bash
-# 查看是否启用
-cat /sys/module/kvm/parameters/mmio_caching
-# 输出: Y (启用) 或 N (禁用)
-```
+#### 3.2 vCPU 级缓存（快速路径）
+- **原理**：在 `vcpu->arch` 中缓存最近访问的 MMIO 信息（GVA、GFN、access、generation）
+- **流程**：
+  1. 首次访问 → 完整流程 → 缓存信息（`vcpu_cache_mmio_info`）
+  2. 后续访问 → 检查缓存（`mmio_info_in_cache`）→ 命中则直接 `RET_PF_EMULATE`
+- **优势**：避免遍历 page table
+- **失效**：通过 generation 机制，memslot 变化时自动失效
 
-**效果**：
-- MMIO密集负载性能提升20%
-- 减少VM-Exit次数
+**源码引用**：
+- SPTE 缓存：`arch/x86/kvm/mmu/mmu.c:294` → `mark_mmio_spte()`
+- vCPU 缓存：`arch/x86/kvm/x86.h:288` → `vcpu_cache_mmio_info()`
+- 缓存命中：`arch/x86/kvm/mmu/mmu.c:4222` → `mmio_info_in_cache()`
 
 ### 4. 脏页日志优化
 
@@ -783,28 +785,55 @@ ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region);
 cat /sys/kernel/debug/kvm/<vm_id>/memslots
 ```
 
-### 陷阱2：EPT页表并发冲突
+### 陷阱2：Dirty Logging 的性能陷阱
 
-**场景**：多个vCPU同时访问同一GPA，导致EPT页表损坏
+**场景**：为了热迁移启用 `KVM_MEM_LOG_DIRTY_PAGES`，但迁移时间过长
 
-**症状**：Guest访问错误的数据，或内核panic
+**症状**：迁移无法收敛，或迁移期间 Guest 性能严重下降
 
-**原因**：EPT页表更新未使用原子操作
+**原因**：
+1. **频繁写内存区域**：Guest 的内存密集型应用（如数据库、视频处理）持续修改大量页面
+2. **Dirty log 读取不及时**：VMM 没有定期调用 `KVM_GET_DIRTY_LOG`，导致脏页堆积
+3. **Round 间没有收敛**：每轮复制的脏页数量 >= 上一轮，迁移永远无法完成
 
 **解决**：
 ```c
-// kvm_tdp_mmu_map() 中使用cmpxchg
-old_spte = *sptep;
-new_spte = make_spte(...);
-if (cmpxchg(sptep, old_spte, new_spte) == old_spte) {
-    // 成功更新
-} else {
-    // 被其他vCPU抢先修改，重试
-    return RET_PF_RETRY;
+// VMM 迁移线程的典型流程
+while (has_dirty_pages()) {
+    // 1. 获取脏页位图
+    struct kvm_dirty_log dirty_log = {
+        .slot = memslot_id,
+        .dirty_bitmap = bitmap_buffer,
+    };
+    ioctl(vm_fd, KVM_GET_DIRTY_LOG, &dirty_log);
+    
+    // 2. 只发送脏页（增量复制）
+    for_each_set_bit(bit, bitmap, num_pages) {
+        send_page_to_destination(gpa + bit * PAGE_SIZE);
+    }
+    
+    // 3. 短暂暂停或限流，让脏页率下降
+    if (dirty_page_count > threshold) {
+        throttle_guest_or_pause_vcpus();
+    }
+    
+    // 4. 清除脏页标记，开始下一轮
+    clear_bitmap(bitmap_buffer);
 }
+
+// 5. 最后暂停 VCPU，复制剩余脏页，完成迁移
+pause_vcpus();
+final_dirty_log_sync();
+resume_on_destination();
 ```
 
-**关键**：必须使用`cmpxchg`保证原子性
+**关键**：
+- **定期读取 dirty log**：每隔 50-100ms 读取一次，避免脏页堆积
+- **自适应限流**：根据脏页率动态调整 Guest 执行速度（QEMU 的 `migrate_autostart` 和 `x_checkpoint_delay`）
+- **压缩传输**：对脏页数据压缩，减少网络带宽占用
+- **postcopy 模式**：如果 precopy 无法收敛，切换到 postcopy（目标端按需拉取页面）
+
+**参考**：QEMU 的迁移实现 `migration/ram.c` 中的 `ram_save_iterate()` 和 `ram_save_complete()`
 
 ### 陷阱3：大页对齐错误
 
@@ -842,10 +871,15 @@ grep -i huge /proc/meminfo
 
 **解决**：
 ```c
-// 清理脏页日志
+// 清理脏页日志（同时自动恢复页表的可写权限）
+struct kvm_clear_dirty_log clear_log = {
+    .slot = memslot_id,
+    .first_page = 0,           // 从第0页开始清理
+    .num_pages = num_pages,    // 清理的页面数量
+    .dirty_bitmap = bitmap,    // 要清理的位图（1表示清理该页的脏标记）
+};
 ioctl(vm_fd, KVM_CLEAR_DIRTY_LOG, &clear_log);
-// 恢复页的可写位
-kvm_mmu_slot_set_write_access(kvm, slot);
+// 内核会自动：1)清理脏页位图 2)恢复对应页面的可写权限
 ```
 
 **检查**：
