@@ -25,6 +25,9 @@
 |------|------|
 | `README.md` | 本文件：概念 → 硬件时钟源全景 → KVM 各时钟虚拟化详解 → 实践练习 → 陷阱 |
 | [`annotations.md`](annotations.md) | 源码精读：PIT / APIC Timer / TSC / kvmclock / Timer Advance 关键代码逐段注释（引用均逐条核对） |
+| [`vmclock.md`](vmclock.md) | VMClock 技术深度解析：解决什么问题、如何工作、与 kvmclock 对比、热迁移处理、Linux 内核实现状态 |
+| [`kvm-clock-realtime.md`](kvm-clock-realtime.md) | KVM_CLOCK_REALTIME 深入分析：作用、使用场景、Firecracker PR #5809 问题、最佳实践 |
+| [`vmclock-phase1-analysis.md`](vmclock-phase1-analysis.md) | VMClock Phase 1 分析：与 VMGenID 的互补关系、ClockBound 的作用 |
 | [`corrections.md`](corrections.md) | 勘误：对本章旧版（及写作过程中）发现的错误的逐条更正与源码依据 |
 | [`practice/`](practice/README.md) | 动手实验：3 个基于 KVM API 的 C 程序（TSC scaling / kvmclock / LAPIC Timer） |
 
@@ -44,6 +47,8 @@
 8. 解释 VM 启动时三个时间基准（kvmclock 纪元 / guest TSC / masterclock）的首次同步
 9. 解释 PTP KVM 如何实现亚微秒级墙上时间同步
 10. 解释 Guest 迁移后时间跳变的原因和解决方法
+11. 说明 VMClock 解决什么问题、如何工作，以及它与 kvmclock 的设计差异（见 `vmclock.md`）
+12. 解释 `KVM_CLOCK_REALTIME` 标志的作用、使用场景和 Firecracker PR #5809 的陷阱（见 `kvm-clock-realtime.md`）
 
 ---
 
