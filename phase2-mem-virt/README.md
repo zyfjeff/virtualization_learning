@@ -44,6 +44,7 @@
 |------|------|
 | `README.md` | 本文件：EPT 硬件原理 + SPTE 格式 + 学习主线 |
 | `annotations.md` | 源码精读：SPTE 位定义、缺页入口、`kvm_tdp_mmu_map()`、`make_spte()`、原子更新 |
+| `ept-establishment-path.md` | ★ EPT 页表建立完整路径：从 mmap 到 EPT entry 创建的调用链追踪 |
 | `ept-violation-handling.md` | ★ EPT Violation 完整处理流程 |
 | `tdp-mmu-concurrency.md` | ★ TDP MMU 的并发模型与根页面管理 |
 | `mmio-identification.md` | ★ MMIO 识别机制与 IPAT / Guest 内存类型控制 |
