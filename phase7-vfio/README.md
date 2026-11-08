@@ -124,7 +124,35 @@ IOMMU 保证隔离性。
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 核心概念
+### 1.3 IOMMU 后端：Type1 vs IOMMUFD
+
+VFIO 支持两种 IOMMU 后端实现：
+
+| 特性 | Type1 IOMMU | IOMMUFD |
+|------|-------------|---------|
+| **内核接口** | `/dev/vfio/vfio` | `/dev/iommu` |
+| **管理模型** | 传统 Domain 模型 | IOAS/HWPT 对象模型 |
+| **嵌套翻译** | ❌ 不支持 | ✅ 原生支持 |
+| **适用场景** | 普通设备直通 | Nested VM、高级特性 |
+
+**关键区别**：
+
+```
+Type1 模型：
+  Container → Domain (地址空间 + 页表)
+  
+IOMMUFD 模型：
+  IOAS (地址空间管理) → HWPT (硬件页表 = Domain)
+    - 一个 IOAS 可关联多个 HWPT
+    - 支持 Parent HWPT (stage 2) + Nested HWPT (stage 1)
+    - 实现嵌套翻译：GPA → HPA → PA
+```
+
+**详细说明**：参考 [Phase 3 - IOMMUFD 对象模型](../phase3-iommu/iommufd-objects.md)
+
+> **注意**：本文档主要基于 Type1 IOMMU 讲解 VFIO 基础概念。IOMMUFD 的嵌套翻译等高级特性将在后续章节补充。
+
+### 1.4 核心概念
 
 | 概念 | 说明 |
 |------|------|

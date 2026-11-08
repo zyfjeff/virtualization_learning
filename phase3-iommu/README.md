@@ -54,6 +54,7 @@ phase6 说"ACS 决定 group 边界，group 决定能否单独直通"。这些都
 | [`invalidation.md`](invalidation.md) | Q5 | unmap 之后，硬件是不是立刻就不用旧翻译了 |
 | [`interrupts.md`](interrupts.md) | Q6 | 直通设备的中断怎么穿过 IOMMU |
 | [`userspace.md`](userspace.md) | Q7 | VFIO / IOMMUFD / dma-iommu 三套接口各管什么 |
+| [`iommufd-objects.md`](iommufd-objects.md) | — | IOMMUFD 对象模型（IOAS/HWPT）与传统 Domain 的关系 |
 | [`backends.md`](backends.md) | Q8 | Intel / ARM / AMD 怎么对上同一套软件抽象 |
 | `annotations.md` | — | 源码精读：probe→选域→attach→map→unmap→失效 完整调用链走读 |
 | `practice/` | — | 4 个实验：域类型可见性 / 总线地址≠物理地址 / 失效代价 / bypass fault |
