@@ -601,7 +601,129 @@ ARM SoC 的 PCIe host bridge），同一个 BAR 在 CPU 看来是 `0x1800_0000`�
 		}
 ```
 
-三种结果对应三条完全不同的硬件路径，而**判据就是 ACS**：
+### 完整的 P2P 映射类型判定流程
+
+三种结果对应三条完全不同的硬件路径，而**判据就是 ACS**。判定逻辑在 `calc_map_type_and_dist()` 中：
+
+```c
+/* 来源: drivers/pci/p2pdma.c:705-794（简化） */
+static enum pci_p2pdma_map_type
+calc_map_type_and_dist(struct pci_dev *provider, struct pci_dev *client,
+                       int *dist, bool verbose)
+{
+    enum pci_p2pdma_map_type map_type = PCI_P2PDMA_MAP_THRU_HOST_BRIDGE;
+    struct pci_dev *a = provider, *b = client, *bb;
+    int acs_cnt = 0;
+    
+    /* 第一步：遍历 provider → root bridge 路径，检查 ACS */
+    while (a) {
+        if (pci_bridge_has_acs_redir(a)) {
+            acs_cnt++;
+        }
+        
+        /* 查找 a 和 b 的公共祖先 */
+        bb = b;
+        while (bb) {
+            if (a == bb)
+                goto check_b_path_acs;  /* 找到公共祖先 */
+            bb = pci_upstream_bridge(bb);
+        }
+        a = pci_upstream_bridge(a);
+    }
+    
+    /* 没有找到公共祖先，必须通过 host bridge */
+    goto map_through_host_bridge;
+
+check_b_path_acs:
+    /* 第二步：检查从公共祖先到 client 的路径 */
+    bb = b;
+    while (bb) {
+        if (a == bb)
+            break;
+        if (pci_bridge_has_acs_redir(bb)) {
+            acs_cnt++;
+        }
+        bb = pci_upstream_bridge(bb);
+    }
+    
+    /* 第三步：根据 ACS 数量决定映射类型 */
+    if (!acs_cnt) {
+        /* ✅ 无 ACS redirect → BUS_ADDR */
+        map_type = PCI_P2PDMA_MAP_BUS_ADDR;
+        goto done;
+    }
+    
+    acs_redirects = true;
+
+map_through_host_bridge:
+    /* 第四步：检查是否支持通过 host bridge */
+    if (!cpu_supports_p2pdma() &&
+        !host_bridge_whitelist(provider, client, acs_redirects)) {
+        /* ❌ 不支持 → NOT_SUPPORTED */
+        map_type = PCI_P2PDMA_MAP_NOT_SUPPORTED;
+    }
+    /* ✅ 支持 → THRU_HOST_BRIDGE（默认值） */
+
+done:
+    return map_type;
+}
+```
+
+**ACS redirect 检查的实现**：
+
+```c
+/* 来源: drivers/pci/p2pdma.c:497-512 */
+static int pci_bridge_has_acs_redir(struct pci_dev *pdev)
+{
+    int pos;
+    u16 ctrl;
+
+    pos = pdev->acs_cap;
+    if (!pos)
+        return 0;  /* 没有 ACS capability → 无 redirect */
+
+    pci_read_config_word(pdev, pos + PCI_ACS_CTRL, &ctrl);
+
+    /* 检查三个关键位：RR (Request Redirect), CR (Completion Redirect), EC (ECRC) */
+    if (ctrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_EC))
+        return 1;  /* 有 redirect */
+
+    return 0;
+}
+```
+
+**BUS_ADDR 的地址转换**：
+
+```c
+/* 来源: include/linux/pci-p2pdma.h:210-213 */
+static inline dma_addr_t
+pci_p2pdma_bus_addr_map(struct p2pdma_provider *provider, phys_addr_t paddr)
+{
+    return paddr + provider->bus_offset;  /* 物理地址 + 偏移 = 总线地址 */
+}
+```
+
+**判定流程图**：
+
+```
+开始
+  ↓
+遍历 provider → root 路径，检查 ACS
+  ↓
+找到公共祖先？
+  ├─ 否 → 必须通过 host bridge → THRU_HOST_BRIDGE
+  └─ 是 → 继续遍历 client → 公共祖先路径
+           ↓
+         沿途有 ACS redirect？
+           ├─ 否（acs_cnt == 0）→ BUS_ADDR ✅
+           └─ 是 → 必须通过 host bridge
+                    ↓
+                  CPU/白名单支持？
+                    ├─ 否 → NOT_SUPPORTED ❌
+                    └─ 是 → THRU_HOST_BRIDGE ✅
+```
+
+三种结果对应三条完全不同的硬件路径：
 
 ```c
 /* 来源: drivers/pci/p2pdma.c:638-658（节选） */

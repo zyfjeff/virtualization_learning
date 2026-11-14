@@ -155,15 +155,184 @@ pdftotext virtio-v1.3-csd01.pdf /tmp/virtio-spec.txt
 pdftotext arm-smmuv3.pdf /tmp/smmuv3-spec.txt && grep -n "Stage-2\|STE\|Context Descriptor" /tmp/smmuv3-spec.txt
 pdftotext pcie-base-spec-r6.0.pdf /tmp/pcie-spec.txt && grep -n "ACS\|ATS\|MSI-X\|AER" /tmp/pcie-spec.txt
 
-# 实验 VM 环境（详见 scripts/README.md）
-cd scripts/vm
-./build-kernel.sh
-sudo ./build-rootfs-ubuntu.sh
-./boot-vm.sh ubuntu --memory 4G --cpus 4 --queues 4   # 默认 -enable-kvm -cpu host
-./boot-vm.sh ubuntu --tcg                             # 显式回退纯软件模拟
+# 实验 VM 环境
 
-# 确认某次运行真的走了 KVM（0 表示走的是 TCG）
+> **重要**：VM 环境是所有 phase 实验的基础，必须确保能可靠访问。
+
+### 快速开始
+
+```bash
+# 1. 构建镜像（首次需要）
+cd scripts/vm
+./build-kernel.sh                    # 编译内核（约 10-15 分钟）
+sudo ./build-rootfs-ubuntu.sh        # 构建 Ubuntu rootfs（约 5-10 分钟）
+
+# 2. 启动标准 VM
+./boot-vm.sh ubuntu --memory 4G --cpus 4 --queues 4
+
+# 3. 在 VM 串口控制台中登录
+# 用户名: root
+# 密码: root（或无密码，直接按回车）
+```
+
+### VM 启动配置
+
+| 场景 | 命令 | 说明 |
+|------|------|------|
+| **标准实验** | `./boot-vm.sh ubuntu --net user` | 基础配置，user 网络 |
+| **IOMMU 实验** | `./boot-vm.sh ubuntu --net user --qemu "-machine q35,kernel-irqchip=split -device intel-iommu,intremap=on"` | 启用 vIOMMU |
+| **完整 IOMMU** | `./boot-vm.sh ubuntu --net user --qemu "-machine q35,kernel-irqchip=split -device intel-iommu,intremap=on,caching-mode=on"` | 启用 caching-mode |
+| **性能测试** | `./boot-vm.sh ubuntu --net tap --queues 4 --memory 8G --cpus 8` | tap 网络，多队列 |
+| **纯软件模拟** | `./boot-vm.sh ubuntu --tcg` | 不用 KVM，用于对比 |
+
+### VM 访问方式
+
+#### 方式 1：串口控制台（**推荐**，最可靠）
+
+VM 启动后直接进入串口控制台，可以立即交互：
+
+```bash
+# 启动 VM（前台运行）
+./boot-vm.sh ubuntu --net user
+
+# VM 启动完成后，直接看到登录提示符：
+# Ubuntu 22.04 LTS kvm-study ttyS0
+# kvm-study login: root
+# root@kvm-study:~#
+
+# 退出 VM: Ctrl-A X
+```
+
+**优点**：
+- 立即访问，无需等待 SSH 服务
+- 可以看到完整的启动日志
+- 适合调试和实验
+
+**缺点**：
+- 前台运行，占用终端
+- 无法同时执行其他命令
+
+#### 方式 2：后台运行 + 串口日志
+
+```bash
+# 后台启动 VM
+./boot-vm.sh ubuntu --net user > /tmp/vm.log 2>&1 &
+VM_PID=$!
+
+# 查看启动进度
+tail -f /tmp/vm.log
+
+# 等待 VM 启动完成（看到 "login:" 提示符）
+grep -q "login:" /tmp/vm.log && echo "VM 已就绪"
+
+# 停止 VM
+kill $VM_PID
+```
+
+#### 方式 3：SSH 访问（**不推荐**，经常失败）
+
+```bash
+# user 网络模式下，SSH 端口转发到 2222
+ssh -p 2222 root@localhost
+
+# 如果连接超时，等待 30-60 秒后重试
+# SSH 服务在 VM 内可能启动较慢
+```
+
+**已知问题**：
+- SSH 服务启动慢，经常超时
+- 熵池不足导致 SSH 初始化延迟
+- 建议使用串口控制台代替
+
+### VM 管理脚本
+
+```bash
+# 查看 VM 状态
+ps aux | grep qemu | grep kvm-study
+
+# 查看端口监听
+ss -tlnp | grep 2222
+
+# 停止所有 VM
+pkill -9 -f "qemu.*kvm-study"
+
+# 查看 VM 日志
+tail -100 /tmp/vm.log
+```
+
+### 共享目录
+
+VM 自动挂载共享目录到 `/mnt/shared`：
+
+```bash
+# 在 host 上放置文件
+echo "test data" > scripts/shared/test.txt
+
+# 在 VM 内访问
+cat /mnt/shared/test.txt
+
+# 从 VM 复制文件到 host
+cp /path/in/vm /mnt/shared/
+```
+
+### IOMMU 实验环境验证
+
+```bash
+# 在 VM 内验证 vIOMMU
+dmesg | grep -i "DMAR\|IOMMU"
+# 应该看到: DMAR: Intel(R) Virtualization Technology for Directed I/O
+
+# 检查 IOMMU 组
+ls /sys/kernel/iommu_groups/
+# 应该看到多个组目录
+
+# 检查域类型
+for g in /sys/kernel/iommu_groups/*/type; do
+  echo "$g: $(cat $g)"
+done
+# 应该看到: DMA 或 identity
+
+# 检查设备
+lspci | grep -i "DMA\|IOMMU"
+```
+
+### 常见问题
+
+#### Q1: VM 启动后黑屏，无输出
+**解决**：确保使用 `-nographic` 参数（boot-vm.sh 默认已包含）
+
+#### Q2: SSH 连接超时
+**解决**：使用串口控制台代替，或等待 60 秒后重试
+
+#### Q3: vIOMMU 未识别
+**解决**：
+- 确保使用 `-machine q35` 参数
+- 检查内核命令行是否包含 `intel_iommu=on`
+- 在 VM 内执行 `dmesg | grep DMAR` 查看错误
+
+#### Q4: 网络不通
+**解决**：
+- user 网络：检查端口转发配置
+- tap 网络：检查 tap 设备和桥接配置
+- 在 VM 内执行 `ip addr` 和 `ping 10.0.2.2`（user 网络网关）
+
+#### Q5: 共享目录未挂载
+**解决**：
+```bash
+# 在 VM 内手动挂载
+mount -t 9p -o trans=virtio hostshare /mnt/shared
+```
+
+### 确认 KVM 加速
+
+```bash
+# 在 host 上检查 VM 是否使用 KVM（0 表示 TCG）
 ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm
+
+# 在 VM 内检查
+grep -E "vmx|svm" /proc/cpuinfo | head -1
+# 应该看到 vmx 标志
+```
 
 # 观测脚本（宿主侧，ftrace + perf）
 ls scripts/trace/   # trace-vmexit.sh, kvm-overview.sh 等
