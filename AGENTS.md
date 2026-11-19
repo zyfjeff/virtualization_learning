@@ -49,6 +49,7 @@ examples/  notes/  scripts/  shared/
 | Intel VMX 规范 | `intel-vmx.pdf` | VMCS、VM-Exit/Entry、EPT/VPID、Posted Interrupt |
 | Intel VT-d 规范 | `intel-vtd.pdf` | IOMMU、中断重映射、IRTE/PI Descriptor |
 | Virtio 规范 | `virtio-v1.3-csd01.pdf` | virtqueue、设备类型、feature bits |
+| AMD IOMMU 规范 | `amd-virtualization.pdf` | AMD-Vi IOMMU、AVIC (Guest Virtual APIC)、IRTE 格式、GA Log |
 | ARM SMMU v3 规范 | `arm-smmuv3.pdf` | ARM SMMUv3 架构、Stage-1/2 翻译、STE/CD 格式、CMDQ 命令 |
 | PCIe Base 规范 | `pcie-base-spec-r6.0.pdf` | PCIe 6.0、TLP/DLLP、ACS/ATS/AER、MSI/MSI-X、配置空间 |
 
@@ -151,6 +152,7 @@ grep -rn "KVM_SET_GSI_ROUTING" /root/code/qemu-10.1.0-rc2/accel/kvm/
 # 规范 PDF（poppler-utils）
 pdftotext intel-vmx.pdf /tmp/vmx-spec.txt && grep -n "Posted-Interrupt Processing" /tmp/vmx-spec.txt
 pdftotext intel-vtd.pdf /tmp/vtd-spec.txt
+pdftotext amd-virtualization.pdf /tmp/amd-vtd-spec.txt && grep -n "AVIC\|Guest Virtual APIC\|IRTE.*GuestMode" /tmp/amd-vtd-spec.txt
 pdftotext virtio-v1.3-csd01.pdf /tmp/virtio-spec.txt
 pdftotext arm-smmuv3.pdf /tmp/smmuv3-spec.txt && grep -n "Stage-2\|STE\|Context Descriptor" /tmp/smmuv3-spec.txt
 pdftotext pcie-base-spec-r6.0.pdf /tmp/pcie-spec.txt && grep -n "ACS\|ATS\|MSI-X\|AER" /tmp/pcie-spec.txt

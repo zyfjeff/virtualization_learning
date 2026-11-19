@@ -41,11 +41,13 @@
 |------|------|
 | `README.md` | 本文件：技术全景 + 完整中断路径 + 跨层数据结构速览 |
 | `annotations.md` | 源码精读：PI 描述符、IRTE、PIR→IRR 同步、桥梁函数、PIC/IOAPIC 模拟 |
-| `posted-interrupts.md` | ★ Posted 模式系统深入：PI Descriptor / IRTE 格式 / 零 VM-Exit 机制 / KVM 实现 |
+| `posted-interrupts.md` | ★ Intel Posted 模式系统深入：PI Descriptor / IRTE 格式 / 零 VM-Exit 机制 / KVM 实现 |
+| `amd-avic.md` | ★ AMD AVIC 系统深入：Guest Virtual APIC / IRTE GuestMode / GA Log / 与 Intel 对比 |
 | `msi-affinity-migration.md` | ★ MSI 地址格式与亲和性迁移（Remapped vs Posted 的迁移路径差异） |
 | `practice/` | ★ 6 个实验脚本：环境检查 / IRTE 观察 / PI 追踪 / 性能对比 / ON-SN / vCPU 迁移 |
 
 > 数据结构与桥梁函数在本文件中只作速览，字段级细节以 `annotations.md` 为准。
+> AMD 平台细节以 `amd-avic.md` 为准。
 
 ---
 
@@ -53,25 +55,32 @@
 
 ```
 第1步: README.md (本文件) — 技术全景
-  → 理解中断虚拟化两层架构
-  → 掌握完整数据路径：设备MSI → IOMMU → PI描述符 → vCPU
-  → 目标：能画出传统模式和PI模式的中断路径
+  → 理解中断虚拟化两层架构 (Intel + AMD)
+  → 掌握完整数据路径：设备MSI → IOMMU → PI描述符/vAPIC → vCPU
+  → 目标：能画出传统模式和PI/AVIC模式的中断路径
 
-第2步: posted-interrupts.md — PI 机制深入
+第2步: posted-interrupts.md — Intel PI 机制深入
   → PI Descriptor 硬件结构
   → 零 VM-Exit 机制的原理
-  → 目标：理解 PI 的硬件工作原理
+  → 目标：理解 Intel PI 的硬件工作原理
 
-第3步: msi-affinity-migration.md — MSI 与亲和性迁移
+第3步: amd-avic.md — AMD AVIC 机制深入
+  → Guest Virtual APIC Table 结构
+  → IRTE GuestMode=1 格式
+  → GA Log 机制
+  → AMD vs Intel 对比
+  → 目标：理解 AMD AVIC 与 Intel PI 的异同
+
+第4步: msi-affinity-migration.md — MSI 与亲和性迁移
   → Remapped vs Posted 的迁移路径差异
   → 目标：理解 vCPU 迁移时 IRTE 的更新
 
-第4步: annotations.md — 源码精读
+第5步: annotations.md — 源码精读 (Intel)
   → PI 描述符、IRTE、PIR→IRR 同步
   → vmx_pi_update_irte() 桥梁函数
   → 目标：读懂每行代码的"为什么"
 
-第5步: practice/ — 动手实验（6 个）
+第6步: practice/ — 动手实验（6 个）
   → 环境检查 / IRTE 观察 / PI 追踪 / 性能对比
 ```
 
@@ -957,3 +966,130 @@ if (vector < 32 || vector > 255)
 # 查看中断向量分配
 cat /sys/kernel/debug/kvm/<vm_id>/irq_routing
 ```
+
+---
+
+## 🔄 AMD AVIC vs Intel VT-d PI 对比
+
+> 本节是速览对比。AMD AVIC 的详细机制见 [amd-avic.md](amd-avic.md)。
+
+### 架构概览对比
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                AMD vs Intel 中断虚拟化架构对比                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Intel VT-d (Posted Interrupts):                                         │
+│    设备 MSI → IOMMU → IRTE (IM=1) → PI Descriptor → vCPU PIR           │
+│                    ↑ 64B 结构, 独立于 vLAPIC                             │
+│                    ↑ IOMMU 设置 PIR[vec]=1, ON=1                         │
+│                    ↑ 发送通知中断给 pCPU                                  │
+│                    ↑ VM-Exit 时硬件自动 PIR→IRR                           │
+│                                                                          │
+│  AMD IOMMU (Guest Virtual APIC):                                         │
+│    设备 MSI → IOMMU → IRTE (GuestMode=1) → vAPIC Backing Page          │
+│                    ↑ 4KB 页面, 与 vLAPIC 共享                            │
+│                    ↑ IOMMU 设置 vIRR[vec]=1                              │
+│                    ↑ 如果 IsRun=1: 发送 doorbell                          │
+│                    ↑ 如果 IsRun=0: 写入 GA Log                            │
+│                    ↑ VM-Entry 时硬件评估 vIRR                             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 核心数据结构对比
+
+| 特性 | Intel VT-d PI | AMD Guest Virtual APIC |
+|------|---------------|------------------------|
+| **虚拟化目标结构** | PI Descriptor (64 bytes) | vAPIC Backing Page (4KB) |
+| **对齐要求** | 64-byte aligned | 4KB aligned |
+| **中断请求位** | PIR[255:0] (独立区域) | vIRR[255:0] (在 vAPIC 偏移 0x200) |
+| **通知机制** | ON (Outstanding Notification) | doorbell 中断 (仅当 IsRun=1) |
+| **抑制机制** | SN (Suppress Notification) | IsRun=0 (Guest 未运行) |
+| **目标 CPU 字段** | NDST (32-bit APIC ID) | Destination (8-bit) |
+| **向量字段** | VV (Virtual Vector, 8-bit) | Vector (8-bit) |
+| **地址字段** | PDA (58-bit, 64B 对齐) | GVAPTR (40-bit, 4KB 对齐) |
+| **IRTE 模式选择位** | `IM` (bit 15) | `GuestMode` (bit 7) |
+
+### IRTE 格式对比
+
+```
+Intel VT-d IRTE (Posted 模式, IM=1):
+┌─────────────────────────────────────────────────────────────────┐
+│ P │ FPD │ Rsvd │ AVAIL │ Rsvd │ URG │ IM=1 │ VV │ Rsvd │ PDAL │
+│ 1b│ 1b  │  6b  │  4b   │  2b  │ 1b  │  1b  │ 8b │ 14b  │ 26b  │
+├─────────────────────────────────────────────────────────────────┤
+│ SID │ SQ │ SVT │ Rsvd │ PDAH (PI描述符物理地址高位)              │
+│ 16b │ 2b │ 2b  │ 12b  │            32b                           │
+└─────────────────────────────────────────────────────────────────┘
+  · PDA: 指向 PI Descriptor (64B)
+  · VV: Virtual Vector (通知向量)
+  · DestID: 目标 pCPU APIC ID
+
+AMD IOMMU IRTE (Guest Virtual APIC, GuestMode=1):
+┌─────────────────────────────────────────────────────────────────┐
+│ Rsvd │  Guest Virtual APIC Table Root Pointer [51:32]            │
+│ 12b  │                    20-bit                                  │
+├─────────────────────────────────────────────────────────────────┤
+│ Rsvd │ GVAPTR[31:12] │ Vector │          GATag                   │
+│ 4b   │     20-bit     │  8-bit  │          32-bit                │
+├─────────────────────────────────────────────────────────────────┤
+│ Rsvd │ Destination │GuestMode│IsRun│Rsvd│GALogIntr│SupIOPF│RemapEn│
+│ 16b  │    8-bit    │   =1    │ 1b  │3b │   1b    │  1b   │  1b   │
+└─────────────────────────────────────────────────────────────────┘
+  · GVAPTR: 指向 vAPIC Backing Page (4KB)
+  · Vector: 用于计算 vIRR 位偏移
+  · Destination: doorbell 目标 pCPU
+  · IsRun: Guest 运行状态提示
+  · GALogIntr: GA Log 记录使能
+```
+
+### 中断投递流程对比
+
+| 步骤 | Intel VT-d | AMD IOMMU |
+|------|------------|-----------|
+| **① IOMMU 接收中断** | 查找 IRTE (IM=1) | 查找 IRTE (GuestMode=1) |
+| **② 设置请求位** | PIR[VV]=1, ON=1 | vIRR[Vector]=1 |
+| **③ 检查运行状态** | 无 (总是发送通知) | IsRun=1? |
+| **④ 发送通知** | 发送通知中断 (NV) | 如果 IsRun=1: doorbell; 如果 IsRun=0: GA Log |
+| **⑤ 目标 CPU 处理** | 收到通知中断 | 收到 doorbell (仅当 IsRun=1) |
+| **⑥ 同步到 IRR** | VM-Exit 时硬件 PIR→IRR | VM-Entry 时硬件评估 vIRR |
+| **⑦ Guest 处理** | 直接处理 (零 VM-Exit) | 直接处理 (零 VM-Exit) |
+
+### 关键差异总结
+
+| 方面 | Intel VT-d | AMD IOMMU | 影响 |
+|------|------------|-----------|------|
+| **目标结构大小** | 64 bytes | 4 KB | AMD 内存开销更大 |
+| **缓存友好性** | 好 (小结构) | 一般 (大页面) | Intel 可能更快 |
+| **运行状态管理** | SN 位抑制 | IsRun 位 + GA Log | AMD 更智能 (避免无效 doorbell) |
+| **日志机制** | 无 | GA Log | AMD 提供调度辅助信息 |
+| **vLAPIC 集成** | 分离 (PIR vs IRR) | 共享 (vIRR 在 vAPIC) | AMD 可能减少拷贝 |
+| **零 VM-Exit 触发** | VM-Exit 时自动处理 | VM-Entry 时自动评估 | 最终效果相同 |
+
+### 详细文档链接
+
+- **Intel VT-d Posted Interrupts**: [posted-interrupts.md](posted-interrupts.md)
+- **AMD Guest Virtual APIC**: [amd-avic.md](amd-avic.md)
+- **MSI 亲和性迁移**: [msi-affinity-migration.md](msi-affinity-migration.md)
+- **源码精读 (Intel)**: [annotations.md](annotations.md)
+
+---
+
+## ✅ 扩展验证清单
+
+完成本阶段后，除了 Intel VT-d 的问题，还应该能回答：
+
+**AMD AVIC 相关**：
+- [ ] AMD IRTE 的 `GuestMode` 位作用是什么？
+- [ ] Guest Virtual APIC Table Root Pointer 指向什么？
+- [ ] `IsRun` 位如何影响中断投递？
+- [ ] GA Log 的作用是什么？何时使用？
+- [ ] AMD AVIC 与 Intel VT-d PI 的主要区别是什么？
+- [ ] 两者如何实现零 VM-Exit 中断注入？
+
+**平台选择**：
+- [ ] 什么时候选择 Intel VT-d？什么时候选择 AMD IOMMU？
+- [ ] 两者在性能上有什么差异？
+- [ ] KVM 如何同时支持两种平台？
