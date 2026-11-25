@@ -1,6 +1,16 @@
-# Phase 2 实践练习
+# Phase 2 实践练习 — 理论取证链
 
-> 内存虚拟化（EPT）深度练习，连接 `annotations.md` 源码精读
+> 五段式（COURSE_FRAMEWORK §3.5）：理论 → 预测 → 操作 → 对照 → 反馈。
+> 连接 `annotations.md` 源码精读。C 练习 `make` 构建，需 VM（-enable-kvm -cpu host）。
+
+## 📋 取证总览
+
+| 编号 | 验证的理论 | 预测 | 对照判据 |
+|------|-----------|------|---------|
+| ept_violation_demo | 缺页建表（ept-violation-handling） | 首次访问触发 EPT violation，后续命中不触发 | ftrace kvm_page_fault 计数对照 |
+| concurrent_test | 并发原子更新（tdp-mmu-concurrency） | 多 vCPU 并发缺页无 SPTE 损坏 | 并发压测无 corruption |
+| memtype_analysis | MMIO/IPAT（mmio-identification） | MMIO 区走 misconfig 模拟 | trace 对照 RAM/MMIO |
+| check-ept-ad / read-ept-ad-msr | EPT A/D 硬件支持 | capability MSR 解出 A/D 位 | MSR 解码对照（宿主） |
 
 ---
 
