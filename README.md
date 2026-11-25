@@ -37,11 +37,6 @@ kvm-study/
 ├── README.md                    ← 本文件
 ├── COURSE_FRAMEWORK.md          ← ★ 统一课程框架：学习循环 + 章节骨架 + 迁移计划
 ├── templates/phase-template/    ← 各 phase 复用的 README/corrections/practice 模板
-├── notes/                       ← 学习笔记汇总
-│   ├── README.md                ← 笔记索引
-│   ├── source-navigation.md     ← 源码导航图
-│   ├── debugging-guide.md       ← ★ KVM调试实战指南 (新增!)
-│   └── issue.md                 ← 早期学习笔记（EPT/VMX 主题清单，归档）
 ├── phase0-kvm-framework/        ← 第零阶段：KVM框架层深度解析
 │   ├── README.md                ← 框架层核心概念 + 本章文件导航
 │   ├── annotations.md           ← kvm_dev_ioctl→vcpu_enter_guest 全链路注释
@@ -198,7 +193,7 @@ sudo ./build-rootfs-ubuntu.sh
 3. **性能优化** (30分钟): 学习KVM特有的性能优化技术
 4. **追踪** (30分钟): 使用 ftrace/BPF 观察实际运行中的代码路径
 5. **实践** (1小时): 运行 `examples/` 中的示例代码验证理解
-6. **调试** (30分钟): 参考 `notes/debugging-guide.md` 排查问题
+6. **调试** (30分钟): 参考 `phase11-debugging/README.md` 排查问题
 
 ### 可运行示例快速入门
 
@@ -245,9 +240,8 @@ sudo bpftrace examples/bpf-programs/trace-vmexit.bpf
 - ✓ ★ 性能专题 (phase9): 测量纪律与观测者扰动预算 + 三块独占机制源码走读
   （PLE 与定向让出 / EPT 粒度与 PML / 主时钟与 TSC offset）+ E1–E5 可跑实验
   + 参数默认值唯一来源 + 跨章结论索引
-- ✓ ★ 调试与测试专题 (phase10): 场景驱动的运行时诊断（启动失败/vCPU退出/性能瓶颈）
+- ✓ ★ 调试与测试专题 (phase11): 场景驱动的运行时诊断（启动失败/vCPU退出/性能瓶颈）
   + 完整 trace events 目录 + 12 个 bpftrace 脚本 + 3 个场景实验 + 11 条勘误
-- ✓ 配套KVM调试实战指南 (`notes/debugging-guide.md`)
 - ✓ 所有 trace events 和函数行号均基于 6.12.93 实际源码验证
 
 ## 快速开始

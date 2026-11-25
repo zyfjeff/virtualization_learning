@@ -425,7 +425,7 @@ struct kvm_run {                    ← 通过 mmap(vcpu_fd) 映射
   - `arch/x86/kvm/vmx/vmx.c` — VMX 实现
 - **本项目**:
   - `phase1-cpu-virt/README.md` — VT-x 基础学习指南
-  - `notes/source-navigation.md` — 源码导航图
+  - `phase0-kvm-framework/annotations.md` — KVM 框架源码精读（ioctl 全链路）
 - **外部**:
   - [KVM API 文档](https://www.kernel.org/doc/html/latest/virt/kvm/)
   - Intel SDM Vol.3 Chapter 23-29 (VMX)

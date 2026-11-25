@@ -194,11 +194,8 @@ sudo ./build-rootfs-ubuntu.sh
 
 ### 学习笔记
 
-- `notes/cpu-virtualization.md` - CPU 虚拟化总结
-- `notes/interrupt-virtualization.md` - 中断虚拟化
-- `notes/memory-virtualization.md` - 内存虚拟化
-- `notes/vm-lifecycle.md` - VM 生命周期
-- `notes/debugging-guide.md` - 调试指南
+> 早期 `notes/` 目录已于 2026-11-25 清理（内容并入各 phase，git 历史保留）。
+> 源码坐标见各 phase `annotations.md`；调试速查见 `phase11-debugging/`。
 
 ---
 
