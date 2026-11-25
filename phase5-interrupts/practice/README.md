@@ -1,11 +1,29 @@
-# Posted Interrupts 实验指南
+# Phase 5 实践练习 — 理论取证链
 
-> 基于设备 0000:4b:00.0 (Virtio block device, MSI-X)
-> 需要 root 权限运行
+> 五段式（COURSE_FRAMEWORK §3.5）：理论 → 预测 → 操作 → 对照 → 反馈。
+> 基于设备 0000:4b:00.0 (Virtio block, MSI-X)，需 root。
+>
+> ⚠️ **安全纪律（AGENTS.md #15/#16）**：4b:00.0 曾发生 unbind 挂死事故。
+> unbind/复位前确认无在途 I/O、无 opener；绝不通过 /dev/mem 摸驱动着的设备 BAR；
+> 可疑设备 sysfs 访问用 timeout 包裹；实验结束恢复到 vfio-pci 安全绑定。
+> 该设备 BAR 布局随 MSI-X Enable 动态变化，寄存器换算先做启用前/后对照 dump。
+
+## 📋 实验总览（取证链）
+
+| 编号 | 验证的理论 | 预测（理论成立必然观察到） | 对照判据 |
+|------|-----------|--------------------------|---------|
+| ex1 | PI 环境支持（APICv+IR） | enable_apicv=Y，IOMMU intremap=on | 模块参数/dmesg 对照 |
+| ex2 | IRTE Posted 格式（AGENTS.md #1） | 直通设备 IRTE pst(IM)=1，PDA 指向 vCPU pi_desc | IRTE dump 字段对照（SID=BDF 验证 kprobe 可信，#9） |
+| ex3 | 零 VM-Exit（SDM 30.6） | Posted 通知向量不产生 kvm_exit | trace 计数对照（向量匹配 vs 不匹配） |
+| ex4 | Posted vs Remapped 开销 | Posted exit 数/延迟低于 Remapped | A/B 对照（数字 → phase10 分级） |
+| ex5 | SN 位抑制（vCPU 抢占） | vCPU 阻塞时 SN=1，通知被抑制 | pi_desc SN 位对照 vCPU 状态 |
+| ex6 | 迁移 IRTE 更新 | vCPU 迁移后 Dest_ID/NDST 更新 | 迁移前后 IRTE/pi_desc 对照 |
+
+**链式衔接**：ex1 环境 → ex2 IRTE 格式 → ex3 零 VM-Exit → ex4 开销 → ex5 SN 抑制 → ex6 迁移维护。
 
 ---
 
-## 实验列表
+## 实验列表（难度/时间参考）
 
 | 编号 | 实验名称 | 需要 VM | 难度 | 预计时间 | 核心知识点 |
 |------|---------|---------|------|---------|-----------|

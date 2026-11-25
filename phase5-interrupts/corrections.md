@@ -146,6 +146,28 @@ irte.VV = POSTED_INTR_VECTOR;   /* 虚拟向量 (Virtual Vector) */
 
 ---
 
+## 勘误 8：README 陷阱节"检查 DM 位"应为 IM（2026-11-25 已修）
+
+旧 README 陷阱 2 的检查注释写"检查 DM 位是否为 1"，但同节代码用 `irte.IM = 1`。
+区分 Remapped/Posted 的是 **IM（IRTE Mode, bit15）**，不是 DM（AGENTS.md 全局陷阱 #1）。
+内核里该位叫 `pst`/`p_pst`（`include/linux/dmar.h:212/240`）。
+
+**已同步修正**：README 重写后陷阱节统一用 IM/VV/PDA 规范术语，并列出 #1–9 全局陷阱入口。
+
+## 勘误 9：性能优化节无出处数字（2026-11-25 登记，待审计）
+
+旧 README「⚡ 性能优化技术」含"减少中断相关 VM-Exit 80%""中断延迟降低 50%"
+"高吞吐性能提升 3-5 倍""吞吐提升 20-30%"等无本仓实测出处数字。
+按 AGENTS.md 性能单一来源规则属机制推算（至多 C 级）。
+（"正常 Posted 路径 0 VM-Exit、延迟<1μs" 有 SDM 30.6/VT-d 5.2.5 支撑，属机制结论，保留。）
+
+**已做**：README 性能节改纯指针（→ phase10），数字标待实测；ex4-pi-vs-remapped.sh 可实测但需分级。
+**待做**：按 measurement.md 实测 Posted vs Remapped 并汇入 phase10 index 分级。
+
+**状态**: ⚠️ 待审计
+
+---
+
 ## 总结
 
 本次审查发现了 6 个严重事实错误，主要问题集中在：

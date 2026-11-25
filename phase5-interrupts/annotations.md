@@ -4,6 +4,9 @@
 > 行号可能随版本变化，用函数名 grep 定位更可靠。
 > **命名约定**：VT-d 规范术语（IM / VV / NV）用于硬件描述；内核源码字段名（`pst` / `p_vector`）
 > 用于代码引用。两者映射关系见 §2。
+>
+> **体例：问题链**（COURSE_FRAMEWORK §3.2）。节序沿中断路径：
+> PI 描述符 → IRTE → 两条 Posted 分水岭 → PIR→IRR → 桥梁函数 → 调度 → 投递 → 零 VM-Exit 核心原则。
 
 ---
 
@@ -533,6 +536,16 @@ void vmx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
 ---
 
 ## 8. 核心原则：PI 零 VM-Exit 与旁路处理
+
+**问题链**（入口来自第一性原理："中断注入为什么能零 VM-Exit？"）：
+
+1. 入口：`handle_external_interrupt_irqoff()` 是 PI 的正常路径吗？→ **不是**
+2. 引申：正常 Posted 路径在哪？→ **硬件**自动清 ON→PIR→VIRR→评估（SDM 30.6），
+   KVM 代码根本不执行
+3. 引申（反事实）：那这段 KVM 代码处理什么？→ 向量不匹配 / PI 未启用 / 嵌套 / vCPU 迁移
+   等**旁路**情况
+4. 链尾：旁路里 vCPU 迁移怎么维护 PI 状态？→ §6 + vcpu-migration-affinity.md；
+   真机验证零 VM-Exit → 实验 ex3
 
 ### Q: `handle_external_interrupt_irqoff()` 是 PI 的正常路径吗？
 
