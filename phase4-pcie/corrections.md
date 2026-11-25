@@ -115,6 +115,52 @@ basics.md 中仍有部分行号引用错误，需要逐一定位正确行号。
 
 ---
 
+### ⚠️ 11. ats.md 性能数字无出处（2026-11-25 登记）
+
+`ats.md`「📊 ATS 的性能分析」含 "IOMMU 查询减少 80-95%"、"100-500 ns"、
+"10-50 ns"、"5-10x"、"1-10 μs" 等数字，无规范引用、无本仓实测记录，
+按 AGENTS.md 性能单一来源规则属机制推算（至多 C 级），不得当实测结论引用。
+
+**已做**: 原文节首加"机制推算"警示注记；README「性能与测量」注明现状。
+**待做**: 按 `../COURSE_FRAMEWORK.md` §1.3 审计流程逐条核对出处，
+有出处的补引用，无出处的在 `../phase10-performance/index.md` §3 登记或标"待实测"。
+
+**状态**: ⚠️ 待审计
+
+---
+
+## 2026-11-25 统一课程框架试点（P1）修正记录
+
+### ✅ 8. README 本章文件表列出不存在的文件
+
+**错误**: 文件表与推荐阅读顺序引用 `topology.md` / `capabilities.md` /
+`vfio-integration.md` 三个**不存在**的文件；实际存在的两个深入文档未列出。
+
+**修正**: 文件表按磁盘实际文件重写；学习路线改为映射实际材料
+（basics.md 覆盖拓扑+能力概览，VFIO 集成指向 phase7 README §1.4–1.5）。
+
+### ✅ 9. 实践练习计数错误
+
+**错误**: README 写"3 个动手实验"，practice/ 实际有 ex1–ex4 四个脚本。
+**修正**: 改为 4 个，列表与 practice/README.md 总览表对齐。
+
+### ✅ 10. 旧待修项 K（README 前置编号）复核
+
+2026-09-21 登记的"README 前置知识 phase 编号待更新"：复核现行 README
+前置引用（Phase 1-3、Phase 3→4→5→7）已是正确编号，无需再改。标记已核实。
+
+### 📝 改名与结构重组（非错误，留档）
+
+- `ACS_UF_EXPLANATION.md` → `acs-upstream-forwarding.md`、
+  `ATS_EXPLANATION.md` → `ats.md`（COURSE_FRAMEWORK §5 命名规范；
+  改名前 grep 全库确认零外部引用）。
+- `practice/PHASE4_SUMMARY.md` → `practice/reports/`（脚本与报告分离）。
+- README 按 COURSE_FRAMEWORK §4 统一骨架重组：新增 VMM视角对比 /
+  源码精读入口 / 性能与测量（指针）/ 陷阱与勘误 / 下一步；
+  原有学习目标、技术全景、检验清单、参考资料原文保留。
+
+---
+
 ## 总结
 
 **已修复**：

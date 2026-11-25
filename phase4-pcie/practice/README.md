@@ -322,6 +322,6 @@ sudo ./ex4-iommu-group.sh
 
 - `../annotations.md` — 源码精读
 - `../basics.md` — PCIe 硬件基础
-- `../vfio-integration.md` — PCIe 与 VFIO 的结合
+- `../../phase7-vfio/README.md` §1.4–1.5 — PCIe 与 VFIO 的结合（group 划分、ACS/ATS 直通依赖）
 - Intel PCIe Base Spec — `pcie-base-spec-r6.0.pdf`
 - Linux 6.12.93 源码 — `drivers/pci/`, `drivers/iommu/`
