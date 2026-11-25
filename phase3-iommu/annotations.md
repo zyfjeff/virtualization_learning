@@ -2,6 +2,9 @@
 
 > 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
 > 行号可能随版本变化，用函数名 grep 定位更可靠。
+>
+> **体例：问题链**（COURSE_FRAMEWORK §3.2）。本节序沿主流程调用链
+> （probe→选域→attach→map→unmap→失效），每节问题对应 README 的 8 问。
 
 ---
 
@@ -153,6 +156,15 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
 ---
 
 ## 3. 默认域选择：投票 + 四级回落
+
+**问题链**（对应 README Q3："passthrough 为什么是正确性开关？"）：
+
+1. 入口：默认域怎么选定？→ 投票 + 四级回落
+2. 引申：为什么是"投票"而不是单一配置？（多个驱动/设备需求冲突时取最严格）
+3. 引申（反事实）：如果 passthrough 只是"性能开关"，关掉 IOMMU 会怎样？
+   （identity 域下 DMA 地址=物理地址，设备可 DMA 到任意物理地址 → 隔离失效，
+   所以它是正确性开关；见 domains.md）
+4. 链尾：选定域怎么装到设备上？→ §4 attach；真机看 type → 实验 ex1
 
 ### Q: 默认域的类型怎么确定？
 
@@ -357,6 +369,16 @@ Intel 的实现是 `intel_iommu_iotlb_sync_map()`（`drivers/iommu/intel/iommu.c
 ---
 
 ## 6. unmap 与失效同步
+
+**问题链**（对应 README Q5："unmap 后硬件立刻不用旧翻译吗？"）：
+
+1. 入口：unmap 删页表后还要做什么？→ 同步失效
+2. 引申：为什么必须**同步等**失效完成，不能异步？
+   （Device-TLB 在芯片外链路另一端，"改页表"与"设备看到变了"无硬件次序保证；
+   异步 → 设备可能用旧翻译 DMA 到已释放内存 → 安全漏洞）
+3. 引申（反事实）：strict 与 lazy 差在哪？lazy 省了什么、代价是什么？
+   （lazy 用 flush queue 批量失效省开销，但窗口期内旧翻译仍可用）
+4. 链尾：运行期换域怎么触发失效？→ §7；真机测代价 → 实验 ex3
 
 ### Q: `iommu_unmap()` 怎么保证失效完成？
 

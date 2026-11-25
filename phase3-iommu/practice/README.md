@@ -1,11 +1,23 @@
-# 第3阶段实践：4 个实验
+# Phase 3 实践练习 — 理论取证链
 
-> 每个实验对应主文档里的一个问题，按"目的 → 环境 → 步骤 → 观察点 → 结论回链"
-> 组织。观测工具统一用 [`../../scripts/trace/iommu-analysis.sh`](../../scripts/trace/iommu-analysis.sh)
-> 加 ftrace，不新增脚本。
+> 每个实验取证主文档的一个问题（COURSE_FRAMEWORK §3.5 五段式：理论→预测→操作→对照→反馈）。
+> 下文各实验按"目的 → 环境 → 步骤 → 观察点 → 结论回链"展开，观察点即对照判据。
+> 观测工具统一用 [`../../scripts/trace/iommu-analysis.sh`](../../scripts/trace/iommu-analysis.sh)
+> 加 ftrace，不新增脚本。历史实验记录在 [`reports/`](reports/)。
 >
 > 文档中的 `path:line` 可用 [`check-citations.sh`](check-citations.sh) 复核：
 > `./check-citations.sh`（需内核源码树，默认 `/root/code/linux-6.12.93`）。
+
+## 📋 实验总览（取证链）
+
+| 编号 | 验证的理论 | 预测（理论成立必然观察到） | 对照判据 |
+|------|-----------|--------------------------|---------|
+| ex1 | 默认域类型可见性（[Q3](../domains.md)） | sysfs `type` 反映默认域；改 passthrough 后 type 变 | 切换前后 type 对照 |
+| ex2 | IOVA ≠ 物理地址（[Q4](../iova.md)） | dma_map 返回的总线地址 ≠ phys；identity 域下相等 | 总线地址 vs phys 对照 |
+| ex3 | 失效同步代价（[Q5](../invalidation.md)） | strict unmap 比 lazy 慢（同步等失效） | strict/lazy 延迟对照 |
+| ex4 | bypass 触发 fault（[Q8](../backends.md)） | 未映射 IOVA 的 DMA 记 fault | fault 计数 vs 注入对照 |
+
+**链式衔接**：ex1 域类型 → ex2 地址空间 → ex3 失效代价 → ex4 翻译失败路径。
 
 ## 环境与前置
 
