@@ -548,6 +548,23 @@ make
 
 ---
 
+## 附：EPT A/D 诊断工具
+
+两个宿主侧小工具（2026-11-25 自仓库根目录移入，`make` 一并构建）：
+
+| 工具 | 用途 | 运行位置 |
+|------|------|---------|
+| `check-ept-ad` | 通过 CPUID + MSR 检查 CPU 是否支持 EPT A/D 位 | 宿主（需 VMX） |
+| `read-ept-ad-msr` | 通过 `/dev/cpu/0/msr` 读 `IA32_VMX_EPT_VPID_CAP` (0x48C)，解码 EPT A/D 支持位 | 宿主（需 msr 模块） |
+
+```bash
+make check-ept-ad read-ept-ad-msr
+./check-ept-ad
+sudo modprobe msr && sudo ./read-ept-ad-msr
+```
+
+---
+
 ## 参考资料
 
 - Phase 2 README: `../README.md`

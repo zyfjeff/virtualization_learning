@@ -37,7 +37,8 @@ kvm-study/
 ├── README.md                    ← 本文件
 ├── notes/                       ← 学习笔记汇总
 │   ├── source-navigation.md     ← 源码导航图
-│   └── debugging-guide.md       ← ★ KVM调试实战指南 (新增!)
+│   ├── debugging-guide.md       ← ★ KVM调试实战指南 (新增!)
+│   └── issue.md                 ← 早期学习笔记（EPT/VMX 主题清单，归档）
 ├── phase0-kvm-framework/        ← 第零阶段：KVM框架层深度解析
 │   ├── README.md                ← 框架层核心概念 + 本章文件导航
 │   ├── annotations.md           ← kvm_dev_ioctl→vcpu_enter_guest 全链路注释
@@ -47,14 +48,14 @@ kvm-study/
 │   ├── README.md                ← 学习指南 + VMM对比 + 性能优化 + 常见陷阱
 │   ├── annotations.md           ← VT-x源码精读注释
 │   ├── cpu-virtualization.md    ← ★ CPUID/MSR/指令虚拟化
-│   └── practice/                ← 4 个 C 练习程序（make 构建）
+│   └── practice/                ← 5 个 C 练习程序（make 构建）
 ├── phase2-mem-virt/             ← 第二阶段：内存虚拟化(EPT/TDP MMU)
 │   ├── README.md                ← EPT原理 + SPTE格式 + 本章文件导航
 │   ├── annotations.md           ← SPTE/缺页/TDP MMU 源码注释
 │   ├── ept-violation-handling.md← ★ EPT Violation 完整处理流程
 │   ├── tdp-mmu-concurrency.md   ← ★ TDP MMU 并发模型
 │   ├── mmio-identification.md   ← ★ MMIO 识别与 IPAT（含核查报告）
-│   ├── practice/                ← 2 个 C 练习程序（make 构建）
+│   ├── practice/                ← 4 个 C 练习 + 2 个 EPT A/D 诊断工具（make 构建）
 │   └── archive/                 ← 已归档的过程性文档
 ├── phase3-iommu/                ← 第三阶段：IOMMU 层（phase7 VFIO 的地基）
 │   ├── README.md                ← 框架 + 概念 + 主流程 + 8 问清单
@@ -71,6 +72,8 @@ kvm-study/
 │   ├── README.md                ← 技术全景 + 中断路径 + 数据结构速览
 │   ├── annotations.md           ← pi_desc + IRTE + PIR→IRR + PI调度
 │   ├── posted-interrupts.md     ← ★ Posted 模式系统深入
+│   ├── amd-avic.md              ← ★ AMD AVIC 系统深入（与 Intel PI 对比）
+│   ├── vcpu-migration-affinity.md← ★ vCPU 迁移与中断亲和性变更
 │   ├── msi-affinity-migration.md← ★ MSI 地址格式与亲和性迁移
 │   └── practice/                ← 6 个实验脚本 + PI 演示内核模块
 ├── phase6-virtio/               ← 第六阶段：virtio / vhost / vhost-user
@@ -99,7 +102,9 @@ kvm-study/
 │   ├── project1-minivmm-boot.md ← ★ 可启动最小 VMM（bzImage 引导）
 │   ├── project2-minivmm-virtio.md← 自制 virtio-mmio 设备
 │   ├── project3-minivmm-vfio.md ← VFIO 直通进自己的 VMM
-│   └── project4-minivmm-bench.md← 与 QEMU/Firecracker 性能对标
+│   ├── project4-minivmm-bench.md← 与 QEMU/Firecracker 性能对标
+│   ├── corrections.md           ← 勘误（含直通实验事故复盘）
+│   └── practice/                ← minivmm / msixdump / mini-kvm 内核模块 + bench 脚本
 ├── phase10-performance/          ← 第十阶段：性能测量方法论 + 独占机制 + 结论索引
 │   ├── README.md                ← 本章定位 + 文件清单 + 三条硬性规则
 │   ├── measurement.md           ← 测量纪律：重复/噪声/分辨率/观测者扰动/开跑前自检
@@ -123,11 +128,7 @@ kvm-study/
 │   │   ├── kvm-demo-regs.c      ← ★ 寄存器操作演示 (make && ./kvm-demo-regs)
 │   │   ├── Makefile
 │   │   └── README.md
-│   ├── mini-kvm/                ← ★★ 实战项目: 简化版 KVM 内核模块实现
-│   │   ├── mini-kvm.c           ← 内核模块主代码
-│   │   ├── test-mini-kvm.c      ← 用户空间测试程序
-│   │   ├── Makefile
-│   │   └── stages/              ← 分阶段学习指南 (stage1-5)
+│   ├── cpuid-faulting-demo/     ← CPUID Faulting 演示（make 构建）
 │   ├── minimal-vmx/             ← 最小VMX内核模块
 │   │   ├── vmx-info/            ← ★ VMX能力检测 (安全,不会崩溃)
 │   │   │   └── vmx-info.c
