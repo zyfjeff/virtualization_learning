@@ -221,7 +221,8 @@ annotations.md 配套要求（模板见 `templates/phase-template/annotations.md
 phaseN-slug/
 ├── README.md          # 导航 + 全景 + 学习路线（§4 骨架）
 ├── annotations.md     # 源码精读：file:line + 为什么（知识类必备）
-├── corrections.md     # 勘误（所有 phase 必备，可先建占位）
+├── corrections.md     # 勘误（所有 phase 必备，可先建占位；记录范围按 AGENTS.md
+│                      #   瘦身策略：概念性错误/独家复盘/待办三类，机械修复只走 git）
 ├── <topic>.md         # 深度主题文档：小写 kebab-case，名词短语
 ├── archive/           # 已被取代的过程性文档（按需创建）
 └── practice/
