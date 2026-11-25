@@ -747,9 +747,9 @@ pci_p2pdma_map_segment(struct pci_p2pdma_map_state *state, struct device *dev,
 `struct pci_p2pdma_pagemap`（`drivers/pci/p2pdma.c:30-34`）。
 
 > **旧稿勘误**：这里原来引用了一个**不存在的函数** `pci_p2pdma_bus_addr_map()`，
-> 还把它标成 `include/linux/pci-p2pdma.h:210-213`。两处都是假的：
-> ① 全内核搜不到该符号；② `include/linux/pci-p2pdma.h` 在 6.12.93 里**只有 107 行**，
-> 210-213 越界。真实的换算就是上面 `pci_p2pdma_map_segment()` 里的那两行。
+> 还把它标成 `pci-p2pdma.h` 的第 210-213 行。两处都是假的：
+> ① 全内核搜不到该符号；② 该头文件（`include/linux/pci-p2pdma.h`）在 6.12.93 里
+> **只有 107 行**，210-213 越界。真实的换算就是上面 `pci_p2pdma_map_segment()` 里的那两行。
 > 头文件里唯一与总线地址有关的公开 API 是 `pci_p2pmem_virt_to_bus()`：声明在
 > `include/linux/pci-p2pdma.h:28`，定义在 `drivers/pci/p2pdma.c:871-889`
 > （`:65` 那个是 `CONFIG_PCI_P2PDMA` 关闭时的 `return 0` 桩，别拿它当实现）。

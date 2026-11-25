@@ -78,10 +78,16 @@
   （`arch/x86/kvm/mmu/spte.h:32-37`）。bits 8/9 才是硬件 A/D
   （`VMX_EPT_ACCESS_BIT (1ull << 8)`、`VMX_EPT_DIRTY_BIT (1ull << 9)`，
   `arch/x86/include/asm/vmx.h:538-539`）。
-  `annotations.md:317/:1015` 一直写的是 52:53，是对的。
-- **顺带修正的记法**: 本章原有多处写成 "52:53"、"54:55"（低位在前）。规范惯例是
-  `高:低`，已统一为 **53:52**、**55:54**（`SHADOW_ACC_TRACK_SAVED_BITS_SHIFT = 54` +
-  R/X 两位 → bits 55:54，`spte.h:69-73`）。
+  `annotations.md` 的软件位表与 §6 `make_spte()` 注释一直写的是 52:53（值域对，只是
+  低位在前的记法），只有 `ept-violation-handling.md` 8.3 写成了 9-8。
+- **顺带修正的两处记法**:
+  1. 本章原有多处写成 "52:53"（低位在前）。规范惯例是 `高:低`，已统一为 **53:52**。
+  2. 原文把访问跟踪位写成 "54:55"，**这是个实质错误而不只是写法问题**：
+     `SHADOW_ACC_TRACK_SAVED_BITS_MASK = SPTE_EPT_READABLE_MASK(0x1) |
+     SPTE_EPT_EXECUTABLE_MASK(0x4)`、`..._BITS_SHIFT = 54`（`spte.h:54-55, 69-73`），
+     于是保存位是 **bit 54（原 R）与 bit 56（原 X）**——**跨两位、不连续**，
+     掩码 = `0x140000000000000`。（`restore_acc_track_spte()` 的
+     `spte >> 54 & 0x5` 也印证这一点。）已按此改正。
 - **已同步修正**: `ept-violation-handling.md` 8.3、`annotations.md`（软件位表、
   EPT 布局图、make_spte 注释共 6 处）
 
@@ -200,8 +206,27 @@
 
 ---
 
-## 勘误 9（待办）：本章实践脚本仍引用旧的错误结论
+## 勘误 9：`practice/README.md` 的 SPTE 解码样例与自身数值矛盾
 
-`practice/` 里的取证练习若按"bit 9-8 是 A/D 模式位"、"`cat …/noncoherent_dma_count`"
-去设计判据，会得到假阴性。改文档时未同步动 `practice/`——**待办**：
-下一轮实践复核时按本文件勘误 4/7 校正判据。
+- **发现日期**: 2026-11-26
+- **位置**: `practice/README.md` Exercise 1（"输出示例"与"思考题"）
+- **错误**: 样例给的是 `SPTE 解码: 0x8000000123456067`，然后逐位标注
+  "MemType=110(6)=WB、IPAT=0、bit 7 = Ignore PAT、bit 57/58 = 1"。
+  **把这些位真从这个数上拆出来，5 处全对不上**：
+  `bits 5:3 = 4`（WT，不是 WB）、`bit 6 = 1`（IPAT 恰恰是 1）、
+  `bit 57/58 = 0`（不是 1）。另外把 bit 7 叫 "Ignore PAT" 是重复命名——
+  SDM Table 29-7 里 **bit 6 才是 Ignore PAT，bit 7 在 4K 叶条目是 "Ignored"**
+  （大页条目里 bit 7 才是 PS）。
+- **正确**: 换成自洽样例 `0x8600000123456373`（每一位可反算，`python3` 一行校验已写进原文），
+  并把 EPT 叶条目位布局与 `spte.h:81-91`、`spte.c:439-440`（`shadow_present_mask`
+  恒含 `VMX_EPT_SUPPRESS_VE_BIT` = bit 63）对齐；
+  A/D 模式位统一改标 **bits 53:52**（本文件勘误 4）；
+  AD 三档场景改按勘误 8 的真实判据（`AD_DISABLED` 与 PML 无关）。
+- **已同步修正**: `practice/README.md`（宏来源改指 `mmu.h:15-17` + `spte.h:39-43/90-91`、
+  位布局表、思考题 1/2、输出示例 + 校验命令）
+- **仍未处理（待办）**: `practice/ept_violation_demo.c` 与
+  `practice/memtype_analysis.c` 里的宏名/注释仍用 legacy 叫法
+  （`SPTE_USER (1ULL << 2)`、把 bit 2 注释成 "User"，以及 `// Present`），
+  而这两个程序模拟的是 EPT 叶条目 —— bit 2 在 EPT 里是 **Execute**。
+  不影响它们演示的调用流程，但**读输出时会按错的语义理解**；
+  下次动实践代码时一并改名为 `SPTE_EXECUTABLE` 并修正注释。

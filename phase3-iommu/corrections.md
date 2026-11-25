@@ -170,7 +170,7 @@ Specification**"。
 
 **实际**：VT-d Rev 4.1 里**没有** `FS21GP`/`FS11GP`/`FS2LP`/`FS1LP` 这几个字段
 （`pdftotext` 后全文零命中）。`FS5LP` 存在，但它是 **Capability Register bit 60 的
-"First Stage 5-level Paging Support"**（`cap_fl5lp_support`，`iommu.h:164`），
+"First Stage 5-level Paging Support"**（`cap_fl5lp_support`，`drivers/iommu/intel/iommu.h:164`），
 跟二级大页无关。二级大页的规范字段是 **SSLPS: Second Stage Large Page Support，
 bits 37:34**。
 
@@ -180,7 +180,7 @@ supported: 0 = 21-bit offset (2MB), 1 = 30-bit offset (1GB), 2/3 = Reserved … 
 valid values for this field are 0000b, 0001b, 0011b."
 
 **源码引用**: `drivers/iommu/intel/iommu.h:174` → `cap_super_page_val(c) = ((c) >> 34) & 0xf`
-（正是 SSLPS 那 4 位）；`iommu.h:167` → `cap_fl1gp_support(c) = ((c) >> 56) & 1`（一级 1GB）。
+（正是 SSLPS 那 4 位）；`drivers/iommu/intel/iommu.h:167` → `cap_fl1gp_support(c) = ((c) >> 56) & 1`（一级 1GB）。
 
 **修正**：`translation.md` T.3.3 已改成一级 FS1GP(bit56) / 二级 SSLPS(bits37:34) 的
 两行对照表，并保留"为什么 `fls()` 的结果恰好等于 `iommu_superpage`"的推导。
@@ -189,13 +189,14 @@ valid values for this field are 0000b, 0001b, 0011b."
 
 ## 勘误 10：P2P 一节三处引用全错，其中一个是虚构函数
 
-**旧稿写法**（`iova.md` IO.6 P2P）：
+**旧稿写法**（`iova.md` IO.6 P2P，三处"来源"标注都错；这里故意**不用** `路径:行号`
+的可机读形式，以免 `practice/check-citations.sh` 把已知的错误引用当成待核引用）：
 
-```c
-/* 来源: drivers/pci/p2pdma.c:705-794（简化） */   ← calc_map_type_and_dist()
-/* 来源: drivers/pci/p2pdma.c:497-512 */          ← pci_bridge_has_acs_redir()
-/* 来源: include/linux/pci-p2pdma.h:210-213 */    ← pci_p2pdma_bus_addr_map()
-/* RR (Request Redirect), CR (Completion Redirect), EC (ECRC) */
+```text
+旧标注 1：来源 drivers/pci/p2pdma.c 第 705-794 行（简化）   ← calc_map_type_and_dist()
+旧标注 2：来源 drivers/pci/p2pdma.c 第 497-512 行          ← pci_bridge_has_acs_redir()
+旧标注 3：来源 include/linux/pci-p2pdma.h 第 210-213 行    ← pci_p2pdma_bus_addr_map()
+旧注释：  RR (Request Redirect), CR (Completion Redirect), EC (ECRC)
 ```
 
 **实际**：
@@ -204,7 +205,7 @@ valid values for this field are 0000b, 0001b, 0011b."
 |---|---|---|
 | `calc_map_type_and_dist()` | 不在 705-794（708 只是一个调用点） | `drivers/pci/p2pdma.c:575-668` |
 | `pci_bridge_has_acs_redir()` | 不在 497-512（那段是 host bridge whitelist 检查） | `drivers/pci/p2pdma.c:383-403`，**函数体旧稿抄得逐行正确**，只是行号错 |
-| `pci_p2pdma_bus_addr_map()` | **内核里没有这个函数**；`include/linux/pci-p2pdma.h` 总共只有 107 行，`:210-213` 越界 | 换算是 `pci_p2pdma_map_segment()` 里的 `sg->dma_address = sg_phys(sg) + state->bus_off;`（`drivers/pci/p2pdma.c:1026`；函数 `:1016-1033`），偏移在 `:324-325` `bus_offset = pci_bus_address(pdev, bar) - pci_resource_start(pdev, bar)` 算好 |
+| `pci_p2pdma_bus_addr_map()` | **内核里没有这个函数**；该头文件 `include/linux/pci-p2pdma.h` 总共只有 107 行，旧标注的 210-213 行越界 | 换算是 `pci_p2pdma_map_segment()` 里的 `sg->dma_address = sg_phys(sg) + state->bus_off;`（`drivers/pci/p2pdma.c:1026`；函数 `:1016-1033`），偏移在 `:324-325` `bus_offset = pci_bus_address(pdev, bar) - pci_resource_start(pdev, bar)` 算好 |
 | `EC (ECRC)` | EC 不是 ECRC | `PCI_ACS_EC = 0x0020 /* P2P Egress Control */`（`include/uapi/linux/pci_regs.h:996`）。ECRC 属于 TLP prefix / AER，压根不在 ACS Control 里 |
 
 **修正**：`iova.md` IO.6 已换成上面四处正确引用，并把 ACS 三个被检查位做成表格
@@ -217,16 +218,16 @@ valid values for this field are 0000b, 0001b, 0011b."
 **旧稿写法**（`group.md` G.2 调用树）：
 
 ```
-├─ iommu_group_alloc_device()  iommu.c:549
+├─ iommu_group_alloc_device()  drivers/iommu/iommu.c:549
 │    ├─ bus->iommu_ops->device_group()   ← 分组判定在这里
-│    └─ iommu_group_alloc()    iommu.c:963
+│    └─ iommu_group_alloc()    drivers/iommu/iommu.c:963
 ```
 
 **实际**：`iommu_group_alloc_device(struct iommu_group *group, struct device *dev)`
 （定义 `drivers/iommu/iommu.c:1158`）的**形参里已经带着 group**，它只做
 `group_device` 记账与 sysfs 链接，不调 `device_group()`。真正的调用是
 `iommu_init_device()` 里的 `group = ops->device_group(dev);`
-（`drivers/iommu/iommu.c:427`；该函数定义 `:402`，由 `__iommu_probe_device()` 在 `:544` 调用，
+（`drivers/iommu/iommu.c:427`；该函数定义 `:402`，由 `__iommu_probe_device()` 在 `drivers/iommu/iommu.c:544` 调用，
 结果存进 `dev->iommu_group` 于 `:434`，`:548` 取回后才传给 `:549`）。
 
 **后果**：分组判定与后端的 `ops->probe_device()`（`:416`）在**同一帧**、且**早于链表加入**
@@ -267,8 +268,8 @@ nested 不挂 IOAS）、`:258-263`（`iommufd_ioas.hwpt_list`，一对多只存�
 
 | 位置 | 旧引用 | 正确 |
 |---|---|---|
-| `domains.md` D.6 表 | `iommu_group_show_resv_regions`（`iommu.c:922`） | 函数在 `drivers/iommu/iommu.c:868`；`:922` 是 `IOMMU_GROUP_ATTR(reserved_regions, 0444, …)` 挂属性那一行（顺带确认：**0444 只读**） |
-| `domains.md` D.6 表 | "`type` … **0644 可写**，走 `iommu_group_store_type()`" | 核实无误：`iommu.c:925` 定义 `IOMMU_GROUP_ATTR(type, 0644, iommu_group_show_type, iommu_group_store_type)`，宿主实测 `-rw-r--r--` |
+| `domains.md` D.6 表 | `iommu_group_show_resv_regions`（`drivers/iommu/iommu.c:922`） | 函数在 `drivers/iommu/iommu.c:868`；`:922` 是 `IOMMU_GROUP_ATTR(reserved_regions, 0444, …)` 挂属性那一行（顺带确认：**0444 只读**） |
+| `domains.md` D.6 表 | "`type` … **0644 可写**，走 `iommu_group_store_type()`" | 核实无误：`drivers/iommu/iommu.c:925` 定义 `IOMMU_GROUP_ATTR(type, 0644, iommu_group_show_type, iommu_group_store_type)`，宿主实测 `-rw-r--r--` |
 
 **修正**：`domains.md` 已改第一条并补注第二条。
 
@@ -283,7 +284,7 @@ nested 不挂 IOAS）、`:258-263`（`iommufd_ioas.hwpt_list`，一对多只存�
   不分配内存；因此 identity 域走不到 `iommu_is_dma_domain()` 分支（`:1980-1988`），
   没有 per-group IOVA 分配器。`domains.md` D.5 写法正确。
 - **`iommu.passthrough` 是默认域类型选择器**，不是"IOMMU 开关"：
-  `early_param`（`iommu.c:697`）→ `iommu_set_default_passthrough/translated(true)`
+  `early_param`（`drivers/iommu/iommu.c:697`）→ `iommu_set_default_passthrough/translated(true)`
   （`:2809-2821`，置 `IOMMU_CMD_LINE_DMA_API` 让驱动无法覆盖）。
   且 `iommu_setup_dma_ops()` 里 `dev->dma_iommu = iommu_is_dma_domain(domain)`
   （`drivers/iommu/dma-iommu.c:1754`）——identity 域下为 false。

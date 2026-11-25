@@ -333,7 +333,7 @@ SSE (bit 7)     supervisor shadow-stack 访问权限强制
 | 10 | `DEFAULT_SPTE_MMU_WRITABLE` = `BIT_ULL(10)` | KVM MMU 认为可写（非 EPT） |
 | 11 | `SPTE_MMU_PRESENT_MASK` = `BIT_ULL(11)` | KVM 认为"存在"（区分 MMIO SPTE） |
 | 53:52 | `SPTE_TDP_AD_MASK` = `(3ULL << 52)` | EPT A/D 位跟踪类型 |
-| 55:54 | `SHADOW_ACC_TRACK_SAVED_MASK` = `(R\|X) << 54` | 访问跟踪时保存的原始 R/X 位 |
+| 56 + 54 | `SHADOW_ACC_TRACK_SAVED_MASK` = `(R\|X) << 54`，R=bit0→**54**、X=bit2→**56**（**非连续两位**） | 访问跟踪时保存的原始 R/X 位 |
 | 57 | `EPT_SPTE_HOST_WRITABLE` = `BIT_ULL(57)` | 宿主认为可写（EPT 模式） |
 | 58 | `EPT_SPTE_MMU_WRITABLE` = `BIT_ULL(58)` | KVM MMU 认为可写（EPT 模式） |
 
@@ -691,7 +691,7 @@ if (spte & VMX_EPT_IPAT_BIT) {
 软件位（KVM 添加）：
   - bit 11: SPTE_MMU_PRESENT_MASK（KVM 认为"存在"）
   - bit 53:52: SPTE_TDP_AD_MASK（A/D 位跟踪类型）
-  - bit 55:54: SHADOW_ACC_TRACK_SAVED_MASK（访问跟踪保存的 R/X 位）
+  - bits 56 + 54: SHADOW_ACC_TRACK_SAVED_MASK（访问跟踪保存的 X 与 R，非连续）
   - bit 57: EPT_SPTE_HOST_WRITABLE（宿主认为可写）
   - bit 58: EPT_SPTE_MMU_WRITABLE（KVM MMU 认为可写）
 ```
@@ -702,7 +702,7 @@ if (spte & VMX_EPT_IPAT_BIT) {
 |--------|------|-----------|
 | `SPTE_MMU_PRESENT_MASK` (11) | KVM 内部标记 | 区分有效 SPTE 和 MMIO SPTE |
 | `SPTE_TDP_AD_MASK` (53:52) | A/D 位跟踪 | 当硬件不支持 A/D 时，软件跟踪 |
-| `SHADOW_ACC_TRACK_SAVED_MASK` (55:54) | 访问跟踪 | 保存原始 R/X 位，用于内存回收 |
+| `SHADOW_ACC_TRACK_SAVED_MASK` (bits 56+54) | 访问跟踪 | 保存原始 X/R 位，用于内存回收 |
 | `EPT_SPTE_HOST_WRITABLE` (57) | 宿主写保护 | 跟踪宿主是否允许写 |
 | `EPT_SPTE_MMU_WRITABLE` (58) | MMU 写保护 | 跟踪 KVM MMU 是否允许写 |
 

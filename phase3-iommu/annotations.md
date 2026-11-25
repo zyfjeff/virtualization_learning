@@ -121,7 +121,7 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
         return 0;
 
     /* 1. 初始化设备 IOMMU 档案 */
-    ret = iommu_init_device(dev, ops);       /* iommu.c:402 */
+    ret = iommu_init_device(dev, ops);       /* drivers/iommu/iommu.c:402 */
 
     /* 2. 分配到组（ops->device_group 决定分组） */
     group = dev->iommu_group;
@@ -148,7 +148,7 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
 
 ### Q: 为什么 `list_add_tail` 必须在 `iommu_setup_default_domain` 之前？
 
-选域函数 `iommu_get_default_domain_type()`（`iommu.c:1726`）遍历 `group->devices`
+选域函数 `iommu_get_default_domain_type()`（`drivers/iommu/iommu.c:1726`）遍历 `group->devices`
 链表的每个成员投票。如果设备没入链表，投票就不包含它的意见 → 可能选错域类型。
 
 注释也明确写了：`"The gdev must be in the list before calling iommu_setup_default_domain()"`
@@ -317,17 +317,17 @@ static int __iommu_group_set_domain_internal(struct iommu_group *group,
 DMA API 分发（README §3.2）
   │
   ▼
-iommu_dma_map_page()          [dma-iommu.c:1163]
+iommu_dma_map_page()          [drivers/iommu/dma-iommu.c:1163]
   │
   ├── 1. IOVA 分配（iovad）
   ├── 2. 可能需要 SWIOTLB bounce buffer
   │
   ▼
-iommu_map()                   [iommu.c:2510]
+iommu_map()                   [drivers/iommu/iommu.c:2510]
   │
-  ├── __iommu_map()           [iommu.c:2447]
+  ├── __iommu_map()           [drivers/iommu/iommu.c:2447]
   │     └── ops->map_pages()  ← Intel: intel_iommu_map_pages()
-  │                               (iommu.c:3726)
+  │                               (drivers/iommu/intel/iommu.c:3726)
   │
   └── ops->iotlb_sync_map()   ← caching-mode 硬件需要
 ```
@@ -356,7 +356,7 @@ out_err:
 ```
 
 **事务性由 core 保证**，后端不用管。`__iommu_map()` 按 `iommu_pgsize()` 逐段循环
-（`iommu.c:2486` 调用 `ops->map_pages()`），中途失败则 `iommu_unmap()` 清掉已建部分。
+（`drivers/iommu/iommu.c:2486` 调用 `ops->map_pages()`），中途失败则 `iommu_unmap()` 清掉已建部分。
 
 ### Q: `iotlb_sync_map` 是什么？
 
@@ -416,7 +416,7 @@ struct iommu_iotlb_gather {
 };
 ```
 
-`__iommu_unmap()`（`iommu.c:2540`）逐段调 `ops->unmap_pages()`，每段把范围
+`__iommu_unmap()`（`drivers/iommu/iommu.c:2540`）逐段调 `ops->unmap_pages()`，每段把范围
 累积进 `gather`。最后 `iommu_iotlb_sync()` 一次性失效 → 减少 IOTLB flush 次数。
 
 **返回时失效一定完成了吗？** 是的。`iommu_iotlb_sync()` 等到所有缓存（IOTLB +
@@ -451,7 +451,7 @@ static ssize_t iommu_group_store_type(struct iommu_group *group,
     /* ★ 唯一在线切换：DMA → DMA-FQ（不用解绑驱动） */
     if (req_type == IOMMU_DOMAIN_DMA_FQ &&
         group->default_domain->type == IOMMU_DOMAIN_DMA) {
-        ret = iommu_dma_init_fq(group->default_domain);  /* dma-iommu.c:336 */
+        ret = iommu_dma_init_fq(group->default_domain);  /* drivers/iommu/dma-iommu.c:336 */
         group->default_domain->type = IOMMU_DOMAIN_DMA_FQ;
         goto out_unlock;
     }
@@ -618,21 +618,21 @@ KVM 如何选择？
 设备出现在总线
   │
   ▼  A.1
-iommu_probe_device()             [iommu.c:600]
-  └→ __iommu_probe_device()      [iommu.c:513]
-     ├→ iommu_init_device()      [iommu.c:402]
+iommu_probe_device()             [drivers/iommu/iommu.c:600]
+  └→ __iommu_probe_device()      [drivers/iommu/iommu.c:513]
+     ├→ iommu_init_device()      [drivers/iommu/iommu.c:402]
      │   └→ ops->probe_device()  ← Intel: intel_iommu_probe_device()
      ├→ ops->device_group()      ← Intel: intel_iommu_device_group()
      ├→ list_add_tail()          ← ★ 先入组
      │
      ▼  A.2（组首次有成员时）
-  iommu_setup_default_domain()   [iommu.c:2950]
+  iommu_setup_default_domain()   [drivers/iommu/iommu.c:2950]
      ├→ 类型投票 (1726)：驱动意见 → 冲突时 IDENTITY 胜 → untrusted 强制 DMA
      ├→ 分配回落 (1605)：ops 静态 → 要求类型 → iommu_def_domain_type → DMA + pr_warn
      ├→ RESV_DIRECT 预映射       ← ★ 固件保留区先建
      │
      ▼  A.3
-  __iommu_group_set_domain_internal() [iommu.c:2305]
+  __iommu_group_set_domain_internal() [drivers/iommu/iommu.c:2305]
      └→ ops->attach_dev()        ← Intel: intel_iommu_attach_device() (:3676)
                                    写 VT-d Context Entry
      │
@@ -641,17 +641,17 @@ iommu_probe_device()             [iommu.c:600]
   │
   │   驱动运行期：
   ▼  A.4
-  dma_map_page() → iommu_dma_map_page() [dma-iommu.c:1163]
-     └→ iommu_map()              [iommu.c:2510]
-        ├→ __iommu_map()         [iommu.c:2447]
+  dma_map_page() → iommu_dma_map_page() [drivers/iommu/dma-iommu.c:1163]
+     └→ iommu_map()              [drivers/iommu/iommu.c:2510]
+        ├→ __iommu_map()         [drivers/iommu/iommu.c:2447]
         │   └→ ops->map_pages()  ← Intel: intel_iommu_map_pages() (:3726)
         │       写 VT-d DMA PTE (try_cmpxchg64)
         ├→ trace_map()           ← include/trace/events/iommu.h:79
         └→ ops->iotlb_sync_map() ← caching-mode 硬件需要
   │
   ▼  A.5
-  dma_unmap_page() → iommu_unmap() [iommu.c:2594]
-     ├→ __iommu_unmap()          [iommu.c:2540]
+  dma_unmap_page() → iommu_unmap() [drivers/iommu/iommu.c:2594]
+     ├→ __iommu_unmap()          [drivers/iommu/iommu.c:2540]
      │   └→ ops->unmap_pages() + gather 累积
      ├→ iommu_iotlb_sync()       ← ★ 同步等硬件确认失效
      └→ trace_unmap()            ← include/trace/events/iommu.h:103
@@ -659,7 +659,7 @@ iommu_probe_device()             [iommu.c:600]
   │   fault 方向：
   ▼
   设备访问未映射地址
-     └→ report_iommu_fault()     [iommu.c:2700]
+     └→ report_iommu_fault()     [drivers/iommu/iommu.c:2700]
         └→ trace_io_page_fault() ← include/trace/events/iommu.h:153
   可恢复缺页 (PRI/PRQ)：
      └→ iommu_report_device_fault() [io-pgfault.c:214]

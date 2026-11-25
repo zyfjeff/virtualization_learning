@@ -115,7 +115,7 @@ sudo gdb -p $(pgrep qemu-system)
 # bit 10:    Execute for user-mode（仅当 mode-based execute control = 1）
 # bit 51:12  物理地址
 # bit 53:52  A/D 类型（软件位，00/01/10）
-# bit 55:54  access-tracking 保存的 R/X（软件位）
+# bit 54 / 56  access-tracking 保存的原 R / 原 X（软件位，非连续）
 # bit 57:    Host Writable（软件位）
 # bit 58:    MMU Writable （软件位）
 # bit 63:    Suppress #VE（KVM 把它并入 shadow_present_mask，spte.c:439-440）
@@ -172,7 +172,7 @@ SPTE 解码: 0x8600000123456373
   bit 9   (D):            1
   bits 51:12 (PAddr): 0x123456000  ← 物理地址，PFN = 0x123456
   bits 53:52 (AD type):  00 = SPTE_TDP_AD_ENABLED   ← 软件位，不是 bit 9/8
-  bits 55:54          :  00 （未做 access tracking）
+  bit 54 / 56 (acc track): 0 / 0 （未做 access tracking）
   bit 57 (HostWritable):  1  ← KVM 软件位（EPT 模式用高位）
   bit 58 (MMUWritable) :  1  ← KVM 软件位
   bit 63 (SUPPRESS_VE):   1  ← KVM 恒定并入 shadow_present_mask
@@ -186,7 +186,8 @@ SPTE 解码: 0x8600000123456373
 ```bash
 python3 -c 'v=0x8600000123456373; \
 print("R",v&1,"W",(v>>1)&1,"X",(v>>2)&1,"MT",(v>>3)&7,"IPAT",(v>>6)&1,"A",(v>>8)&1, \
-"D",(v>>9)&1,"pfn",hex((v>>12)&((1<<40)-1)),"ADtype",(v>>52)&3,"hostW",(v>>57)&1,"mmuW",(v>>58)&1,"VE",v>>63)'
+"D",(v>>9)&1,"pfn",hex((v>>12)&((1<<40)-1)),"ADtype",(v>>52)&3,"trackX",(v>>56)&1, \
+"trackR",(v>>54)&1,"hostW",(v>>57)&1,"mmuW",(v>>58)&1,"VE",v>>63)'
 ```
 
 ---

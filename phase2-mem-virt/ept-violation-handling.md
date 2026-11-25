@@ -627,9 +627,12 @@ out_unlock:
 ```
 
 **两个要点**：① 旧路径拿锁**之后**还要再查一次 `is_page_fault_stale()`——因为取 pfn
-是在锁外做的，锁期间 memslot 可能已经变了（`mmu_seq` 比对）；② `mmu_lock` 是
-`rwlock_t`（`include/linux/kvm_host.h:764`，TDP MMU 关闭时退化为 `spinlock_t`，`:766`），
-旧路径全程写模式，而 TDP MMU 的缺页走读模式 + `cmpxchg`（见
+是在锁外做的，锁期间 memslot 可能已经变了（`mmu_seq` 比对）；② `mmu_lock` 在 x86 上是
+`rwlock_t`（`include/linux/kvm_host.h:763-767`：`#ifdef KVM_HAVE_MMU_RWLOCK` →
+`rwlock_t`，`#else` → `spinlock_t`；而 x86 无条件定义了
+`KVM_HAVE_MMU_RWLOCK`，`arch/x86/include/asm/kvm_host.h:439`，所以**不存在"退化成
+spinlock"这回事**，那是给没定义该宏的架构准备的）。旧路径全程走写模式，
+而 TDP MMU 的缺页走读模式 + `cmpxchg`（见
 [`tdp-mmu-concurrency.md`](tdp-mmu-concurrency.md)）。
 
 **为什么需要 mmu_lock？**
@@ -726,7 +729,7 @@ static int kvm_tdp_map_page(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code,
 
 调用链上 `prefetch=true` 是从 `kvm_mmu_do_page_fault(vcpu, gpa, error_code, true, ...)`
 的第四个实参传下去的（`mmu.c:4752`），最终落到 `struct kvm_page_fault.prefetch`
-（`mmu_internal.h:194`、构造点 `:306`）。**`fault->prefault` 这个字段不存在**，
+（字段 `mmu_internal.h:194`、构造点 `:305`）。**`fault->prefault` 这个字段不存在**，
 `tdp_mmu_map_handle_target_level()` 里也没有 "prefault 就或上 PT_ACCESSED_MASK" 这段代码
 （旧稿把这两处写错了，A 位的决定权在 `make_spte()`，不在 target-level 处理里）。
 

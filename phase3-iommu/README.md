@@ -118,7 +118,7 @@ DMA 发起**之前**建好——这就是 `dma_map*()` 存在的全部理由，�
 
 钥匙：`iommu_ops` 的 `blocked_domain`/`identity_domain` 是指向**静态 domain** 的指针
 （`intel/iommu.c:4644`），`__iommu_domain_alloc()` 遇 IDENTITY/BLOCKED 直接返回单例不分配
-（`iommu.c:1947`）——Q3 的关键。
+（`drivers/iommu/iommu.c:1947`）——Q3 的关键。
 
 ### 主流程：一次设备 DMA 的完整旅程
 

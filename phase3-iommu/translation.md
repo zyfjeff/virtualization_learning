@@ -284,13 +284,13 @@ static int iommu_superpage_capability(struct intel_iommu *iommu, bool first_stag
 
 | 侧 | CAP_REG 字段（规范名） | 位 | 内核解码宏 | 语义 |
 |---|---|---|---|---|
-| 一级 | **FS1GP**: First Stage 1-GByte Page Support | bit 56 | `cap_fl1gp_support(c)` = `((c) >> 56) & 1`（`iommu.h:167`） | 只有有/无两档；有 1GB 就返回 2（可跳两级），否则 1（只能 2MB） |
-| 二级 | **SSLPS**: Second Stage Large Page Support | bits 37:34 | `cap_super_page_val(c)` = `((c) >> 34) & 0xf`（`iommu.h:174`） | 4 位图，bit0 = 2MB、bit1 = 1GB、bits 3:2 **保留**；取 `fls()` |
+| 一级 | **FS1GP**: First Stage 1-GByte Page Support | bit 56 | `cap_fl1gp_support(c)` = `((c) >> 56) & 1`（`drivers/iommu/intel/iommu.h:167`） | 只有有/无两档；有 1GB 就返回 2（可跳两级），否则 1（只能 2MB） |
+| 二级 | **SSLPS**: Second Stage Large Page Support | bits 37:34 | `cap_super_page_val(c)` = `((c) >> 34) & 0xf`（`drivers/iommu/intel/iommu.h:174`） | 4 位图，bit0 = 2MB、bit1 = 1GB、bits 3:2 **保留**；取 `fls()` |
 
 > **旧稿勘误**：这里原来写的是"二级看由 `FS21GP/FS11GP/FS5LP/FS2LP/FS1LP` 组成的
 > `SUPER_PAGE_VAL`"。这些字段名**在 VT-d Rev 4.1 里不存在**（`FS21GP`/`FS11GP`/`FS2LP`/`FS1LP`
 > 全文零命中）；`FS5LP` 确实存在，但它是 **CAP_REG bit 60 的 "First Stage 5-level Paging
-> Support"**（`cap_fl5lp_support`，`iommu.h:164`），跟二级大页毫无关系。二级大页的规范名
+> Support"**（`cap_fl5lp_support`，`drivers/iommu/intel/iommu.h:164`），跟二级大页毫无关系。二级大页的规范名
 > 就是 **SSLPS**。
 > **规范引用**: `intel-vtd.pdf` Rev 4.1, Capability Register 字段表（SSLPS，bits 37:34）。
 > 规范还限制了 SSLPS 的合法值：只能 `0000b`/`0001b`/`0011b`（"支持某个大页尺寸就必须支持

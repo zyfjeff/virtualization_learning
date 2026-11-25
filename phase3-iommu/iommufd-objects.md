@@ -93,10 +93,33 @@ IOAS (软件账本)
 
 ### 为什么要分两级
 
-Guest 里跑着自己的 stage-2（Guest 认为的"GPA→HPA"，其实是 L2 的 EPT/二级页表），
-宿主侧把这张表**原样交给硬件**做 stage-1，宿主自己的 stage-2 再把 GPA 落到真 HPA。
-传统 `iommu_domain` 没有"父域"概念，表达不了这个父子关系，所以才需要 IOMMUFD 把
-"页表对象"和"地址空间账本"拆开。
+直通场景里，**guest 自己有一张 IOMMU 页表**（guest 内核给设备建的映射：
+`IOVA → GPA`；guest 并不知道也不关心 HPA）。传统做法是 QEMU 截获 guest 的每次
+IOMMU 建表，把它**翻译一遍**再 `iommu_map()` 进宿主的域 —— 每次 guest 改映射都要
+VM-Exit + 双份页表。nested 的做法是把 guest 那张表**原样交给硬件当 stage-1**
+（输入 IOVA，输出 GPA），宿主只维护 stage-2（GPA → HPA），硬件串起来走两级：
+
+```
+设备发 IOVA ──stage-1（guest 的表，硬件直接读）──▶ GPA ──stage-2（宿主的表）──▶ HPA
+```
+
+内核侧的落点（Intel）就是 `intel_pasid_setup_nested()`：
+
+```c
+/* 来源: drivers/iommu/intel/pasid.c:606, 667, 681, 688（节选） */
+ * @domain:     User stage-1 domain nested on a stage-2 domain
+...
+	pasid_set_flptr(pte, (uintptr_t)s1_gpgd);              /* stage-1 = 用户态(guest)那张表 */
+...
+	pasid_set_slptr(pte, virt_to_phys(pgd));               /* stage-2 = parent 域（宿主）的表 */
+...
+	pasid_set_translation_type(pte, PASID_ENTRY_PGTT_NESTED);
+```
+
+也就是说 **nested HWPT ⇄ `FLPTPTR`（first/stage-1），parent HWPT ⇄ `SLPTPTR`（second/stage-2）**。
+传统 `iommu_domain` 没有"父域"概念，一个域只能表达一张表，所以表达不了这种父子关系；
+IOMMUFD 把"地址空间账本（IOAS）"和"硬件页表对象（HWPT）"拆开，才装得下
+"一个 parent 之上再挂用户自备的 stage-1"这个模型。
 
 ---
 

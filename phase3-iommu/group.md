@@ -73,10 +73,10 @@ peer-to-peer），那么把它们放进不同域就是自欺——域 A 的页�
 ```
 
 > **勘误**：旧稿把 `bus->iommu_ops->device_group()` 画在 `iommu_group_alloc_device()`
-> 之下，这是错的。`iommu_group_alloc_device()`（定义 `iommu.c:1158`）的形参就已经带着
+> 之下，这是错的。`iommu_group_alloc_device()`（定义 `drivers/iommu/iommu.c:1158`）的形参就已经带着
 > `struct iommu_group *group` —— **group 在它被调用之前就存在了**，它只负责建
 > `group_device`、加 sysfs 链接。真正执行分组判定的是它的**兄弟帧** `iommu_init_device()`
-> 里的 `group = ops->device_group(dev)`（`iommu.c:427`），判定结果在 `:434` 存进
+> 里的 `group = ops->device_group(dev)`（`drivers/iommu/iommu.c:427`），判定结果在 `:434` 存进
 > `dev->iommu_group`，`:548` 再取出来传给 `iommu_group_alloc_device()`。
 > 这个区分不是学术问题：**"设备进哪个 group"发生在与后端 `probe_device` 同一帧、
 > 早于任何链表记账**，所以 [Q3](domains.md) 的选域投票才可能读到最终确定的组成员。

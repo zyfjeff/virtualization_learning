@@ -705,8 +705,8 @@ static void kvm_mmu_clear_dirty_pt_masked(struct kvm *kvm,
 （`arch/x86/kvm/mmu/tdp_mmu.c:1607`，旧稿写成 `tdp_mmu_clear_dirty_pt_masked()`）。
 它内部对每个 root 调 `clear_dirty_pt_masked()`（`:1561`），后者用
 `tdp_root_for_each_leaf_pte(iter, root, gfn + __ffs(mask), gfn + BITS_PER_LONG)`
-（`:1570-1571`）沿位图**最低置位**起步做一次遍历，边遍历边 `mask &= ~(1UL << (iter.gfn - gfn))`
-（`:1585`）消掉已处理的位；要清的位由
+（`:1572-1573`）沿位图**最低置位**起步做一次遍历，边遍历边 `mask &= ~(1UL << (iter.gfn - gfn))`
+（`:1584`）消掉已处理的位；要清的位由
 `dbit = (wrprot || tdp_mmu_need_write_protect(root)) ? PT_WRITABLE_MASK : shadow_dirty_mask`
 （`:1564-1565`）决定 —— 没有硬件 A/D（或需要写保护）时清的是**写权限位**而不是 D 位。
 
