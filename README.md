@@ -57,8 +57,7 @@ kvm-study/
 │   ├── ept-violation-handling.md← ★ EPT Violation 完整处理流程
 │   ├── tdp-mmu-concurrency.md   ← ★ TDP MMU 并发模型
 │   ├── mmio-identification.md   ← ★ MMIO 识别与 IPAT（含核查报告）
-│   ├── practice/                ← 4 个 C 练习 + 2 个 EPT A/D 诊断工具（make 构建）
-│   └── archive/                 ← 已归档的过程性文档
+│   └── practice/                ← 4 个 C 练习 + 2 个 EPT A/D 诊断工具（make 构建）
 ├── phase3-iommu/                ← 第三阶段：IOMMU 层（phase7 VFIO 的地基）
 │   ├── README.md                ← 框架 + 概念 + 主流程 + 8 问清单
 │   ├── translation/…/backends.md← 8 篇问题深入文档

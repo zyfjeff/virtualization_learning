@@ -76,7 +76,7 @@ parallel and/or the 'replay' calls from ACPI/OF code" 是解释**为什么用全
 `iommu_probe_device_lock` 而不是 `device_lock`** 的，不要跟幂等判断混为一谈。
 
 这个幂等判断的实际后果是：**设备在 sysfs 里出现的 group 链接，不代表它的驱动已经
-attach 完成**。这跟 [phase6 corrections](../phase7-vfio/corrections.md) 里"VFIO 接管在
+attach 完成**。这跟 [phase7 corrections](../phase7-vfio/corrections.md) 里"VFIO 接管在
 sysfs 上看不见"是同一类观测盲区，成因不同但结论一致：sysfs 反映的是 core 的记账，
 不反映硬件状态。
 

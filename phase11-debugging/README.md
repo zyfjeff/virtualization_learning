@@ -1,4 +1,4 @@
-# Phase 10：KVM 运行时调试与诊断
+# Phase 11：KVM 运行时调试与诊断
 
 > 基于 Linux 6.12.93 源码 | 面向 KVM 运行时诊断的场景指南
 
@@ -6,13 +6,13 @@
 
 ## 📚 前置知识
 
-本阶段假设你已经完成 Phase 1-9，掌握了：
+本阶段假设你已经完成 Phase 0-10，掌握了：
 - ✅ ftrace 基础（Phase 1/2 练习）
-- ✅ perf kvm stat（Phase 9）
+- ✅ perf kvm stat（Phase 10）
 - ✅ KVM tracepoints（Phase 0）
-- ✅ VM-Exit 机制（Phase 1-4）
+- ✅ VM-Exit 机制（Phase 1-5）
 
-如果你还没有完成 Phase 9，建议先学习 `../phase10-performance/README.md`。
+如果你还没有完成 Phase 10，建议先学习 `../phase10-performance/README.md`。
 
 ---
 
@@ -90,10 +90,10 @@ sudo perf kvm stat record -a -- sleep 10
 sudo perf kvm stat report
 
 # 针对性处理（详细分析见 performance-analysis.md §2）
-# EXTERNAL_INTERRUPT 多 → APICv / Posted Interrupts (phase4)
-# EPT_VIOLATION 多 → 大页配置 (phase9 E2)
+# EXTERNAL_INTERRUPT 多 → APICv / Posted Interrupts (phase5)
+# EPT_VIOLATION 多 → 大页配置 (phase10 E2)
 # CPUID 多 → VMM 预填充 CPUID 缓存
-# IO_INSTRUCTION 多 → vhost 优化 (phase5)
+# IO_INSTRUCTION 多 → vhost 优化 (phase6)
 ```
 
 ### 场景 2: 中断延迟异常
@@ -250,8 +250,8 @@ dmesg | grep -A30 'VMCS'   # 如果 dump_invalid_vmcs 启用
 ```
 本阶段工具在各 phase 中的应用:
 
-phase0-8 源码学习    → 用 ftrace 验证理解
-phase9 性能测量      → 测量纪律与观测成本看 phase10-performance/measurement.md
+phase0-9 源码学习    → 用 ftrace 验证理解
+phase10 性能测量     → 测量纪律与观测成本看 phase10-performance/measurement.md
                        本章提供场景诊断的工具和方法
 
 跨 phase 指针（不复制内容）：

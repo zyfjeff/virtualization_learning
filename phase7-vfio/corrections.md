@@ -632,6 +632,19 @@ static bool vmx_can_use_vtd_pi(struct kvm *kvm)
 
 ---
 
+## 勘误 9：标题与正文交叉引用沿用旧 phase 编号
+
+- **发现日期**: 2026-11-25（统一课程框架 P0 事实修复，见 `../COURSE_FRAMEWORK.md` §1.2）
+- **位置与修正**:
+  | 位置 | 错误 | 正确 |
+  |---|---|---|
+  | `annotations.md:1` | 标题 "Phase 6：源码精读注释 - VFIO 设备直通" | Phase 7 |
+  | `README.md:1564` | "这是 phase4（中断虚拟化）与 phase6 真正接壤的地方" | "phase5（中断虚拟化）与 phase7（VFIO，本阶段）" |
+- **成因**: phase4-pcie 插入后中断 4→5、VFIO 6→7，本文未同步。
+- **已同步修正**: `annotations.md`、`README.md`
+
+---
+
 ## 参考
 
 - 实验程序：`phase7-vfio/practice/`（说明见该目录 `README.md`）

@@ -4,7 +4,7 @@
 > initramfs 引导到 shell。
 
 **前置**：phase0（KVM API）、phase1（vCPU/VMCS）、phase2（内存虚拟化）、
-phase4（in-kernel irqchip）、phase7（时钟）。起步代码见
+phase5（in-kernel irqchip）、phase8（时钟）。起步代码见
 `../examples/kvm-api-demo/kvm-demo.c` 与 `../phase8-timer-virt/practice/common.h`。
 
 ---

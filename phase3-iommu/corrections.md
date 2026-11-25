@@ -136,6 +136,21 @@ Specification**"。
 
 ---
 
+## 勘误 8：交叉引用沿用旧 phase 编号
+
+- **发现日期**: 2026-11-25（统一课程框架 P0 事实修复，见 `../COURSE_FRAMEWORK.md` §1.2）
+- **位置与修正**:
+  | 位置 | 错误 | 正确 |
+  |---|---|---|
+  | `README.md:28-29` | "phase4 说…IRTE"、"phase6 说…ACS" | phase5（中断）、phase7（VFIO）；"前几阶段"改"其它阶段"（5/7 编号在本阶段 3 之后，"前几"自相矛盾） |
+  | `group.md:79` | 链接文字 "[phase6 corrections]" | phase7（链接目标 `../phase7-vfio/corrections.md` 本就正确，仅文字旧编号） |
+  | `domains.md:276` | "见 phase6 §1.4 的实测方法" | phase7 §1.4 |
+  | `domains.md:278` | 链接文字 "[phase6 corrections]" | phase7 |
+- **成因**: phase4-pcie 插入后中断 4→5、VFIO 6→7，本文未同步。
+- **已同步修正**: `README.md`、`group.md`、`domains.md`
+
+---
+
 ## 附：本阶段未重犯、但值得留档的既有陷阱
 
 以下不是新发现的错误，而是与 AGENTS.md「已知陷阱」直接相关、本阶段文档写作时

@@ -198,6 +198,29 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep kvm_update_master_clock
 
 ---
 
+## C12: 标题与跨 phase 引用沿用旧编号
+
+**发现日期**: 2026-11-25（统一课程框架 P0 事实修复，见 `../COURSE_FRAMEWORK.md` §1.2）
+
+**错误与修正**:
+
+| 位置 | 错误 | 正确 |
+|---|---|---|
+| `README.md:1` | 标题 "Phase 10" | Phase 11 |
+| `README.md:9-15` | 前置 "Phase 1-9"、"perf kvm stat（Phase 9）"、"VM-Exit 机制（Phase 1-4）"、"还没有完成 Phase 9" | Phase 0-10 / Phase 10 / Phase 1-5 / Phase 10 |
+| `README.md:93-96` | "(phase4)"、"(phase9 E2)"、"(phase5)" | (phase5)、(phase10 E2)、(phase6) |
+| `README.md:253-254` | "phase0-8 源码学习"、"phase9 性能测量" | phase0-9 / phase10 |
+| `annotations.md:1` | 标题 "Phase 10" | Phase 11 |
+| `index.md:130-140` | 表头 "phase10 中的位置"（实为本章 phase11 的文件）；行内 phase4 中断/phase5 virtio/phase7 时钟/phase8 最小 VMM/phase9 性能 | 表头 "本章（phase11）中的位置"；phase5/phase6/phase8/phase9/phase10 |
+| `practice/e2-perf-bottleneck/README.md:157-160` | 同 README 93-96 三处 | 同上 |
+
+**成因**: phase4-pcie 插入后全局编号顺延（中断 4→5、virtio 5→6、VFIO 6→7、
+时钟 7→8、capstone 8→9、性能 9→10、调试 10→11），本章未同步。
+
+**已同步修正**: 上表全部文件。
+
+---
+
 ## 总结
 
 | # | 错误 | 正确 | 源码 |

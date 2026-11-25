@@ -154,10 +154,10 @@ interval:s:10 {
 性能差
     │
     ├─ VM-Exit 过多（perf kvm stat）
-    │   ├─ EXTERNAL_INTERRUPT > 40% → APICv / Posted Interrupts (phase4)
-    │   ├─ EPT_VIOLATION > 20% → 大页配置 (phase9 E2)
+    │   ├─ EXTERNAL_INTERRUPT > 40% → APICv / Posted Interrupts (phase5)
+    │   ├─ EPT_VIOLATION > 20% → 大页配置 (phase10 E2)
     │   ├─ CPUID > 10% → 预填充 CPUID 缓存
-    │   └─ IO_INSTRUCTION 多 → vhost 优化 (phase5)
+    │   └─ IO_INSTRUCTION 多 → vhost 优化 (phase6)
     │
     ├─ Exit 延迟高（bpftrace vmx_handle_exit）
     │   ├─ 大部分 < 2μs → 正常

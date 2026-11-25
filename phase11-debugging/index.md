@@ -127,14 +127,14 @@
 
 ## 🔗 跨 Phase 引用
 
-| Phase | 关联内容 | phase10 中的位置 |
+| Phase | 关联内容 | 本章（phase11）中的位置 |
 |-------|---------|-----------------|
 | phase0 KVM 框架 | KVM 模块初始化 | `launch-failures.md` §1 |
 | phase1 VT-x | VMCS 字段、VM-Entry/Exit | `launch-failures.md` §4 |
 | phase2 内存虚拟化 | EPT、缺页处理 | `performance-analysis.md` §4 |
 | phase3 IOMMU | 设备直通相关崩溃 | `case-studies.md` 案例 3 |
-| phase4 中断虚拟化 | APICv、Posted Interrupts | `performance-analysis.md` §5 |
-| phase5 virtio | vhost 优化 | `performance-analysis.md` §2 |
-| phase7 时钟虚拟化 | TSC、kvmclock | `performance-analysis.md` §7 |
-| phase8 最小 VMM | KVM API 调用 | `launch-failures.md` §2 |
-| phase9 性能测量 | 测量纪律、观测者成本 | `performance-analysis.md` §1 |
+| phase5 中断虚拟化 | APICv、Posted Interrupts | `performance-analysis.md` §5 |
+| phase6 virtio | vhost 优化 | `performance-analysis.md` §2 |
+| phase8 时钟虚拟化 | TSC、kvmclock | `performance-analysis.md` §7 |
+| phase9 最小 VMM | KVM API 调用 | `launch-failures.md` §2 |
+| phase10 性能测量 | 测量纪律、观测者成本 | `performance-analysis.md` §1 |

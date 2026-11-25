@@ -728,7 +728,7 @@ perf report --stdio
 **关键洞察**：
 - **高频 VM-Exit**（外部中断、EPT Violation）是性能瓶颈的主要来源
 - **快速路径**（内核态处理）比**慢速路径**（返回用户态）快 5-10 倍
-- **Posted Interrupts**（phase4 详解）可以将外部中断的 VM-Exit 次数降为 0
+- **Posted Interrupts**（phase5 详解）可以将外部中断的 VM-Exit 次数降为 0
 - **EPT 大页**（phase2 详解）可以将页错误次数降低 512 倍（2MB 页 vs 4KB 页）
 
 ---

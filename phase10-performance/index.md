@@ -148,12 +148,12 @@ Section 30.6 与 VT-d Spec 5.2.5 明确"process posted interrupts"=1 且向量�
 
 ## 5. 本仓空白（关心但完全没数据）
 
-phase9 重写后识别出的真实缺口，逐条对应一个待跑实验：
+phase10 重写后识别出的真实缺口，逐条对应一个待跑实验：
 
 | 缺口 | 为什么是空白 | 实验 |
 |---|---|---|
-| **PLE / directed yield 的实际收益** | 全仓零数据。phase8 已定性说明"单 vCPU、无超卖自旋测不出"，并把超卖实验推给 phase9 | `practice/bench-ple.md`（E1） |
-| **大页 vs 4K 的可测差异** | phase2 只有机制与推算值；phase8 说"本规模无独立可测收益"但那是单 vCPU 512 MB 场景 | `practice/bench-huge-dirty.md`（E2） |
+| **PLE / directed yield 的实际收益** | 全仓零数据。phase9 已定性说明"单 vCPU、无超卖自旋测不出"，并把超卖实验推给 phase10 | `practice/bench-ple.md`（E1） |
+| **大页 vs 4K 的可测差异** | phase2 只有机制与推算值；phase9 说"本规模无独立可测收益"但那是单 vCPU 512 MB 场景 | `practice/bench-huge-dirty.md`（E2） |
 | **脏页日志 / 热迁移开销** | 只有机制文档，从无 A/B 数据 | 同上（E2） |
 | **vCPU 迁移的代价** | `../phase5-interrupts/practice/ex6-vcpu-migration.sh` 只观测未落结论 | `practice/bench-migrate.md`（E3） |
 | **主时钟启停的实际触发条件** | 旧文档写的是 CPUID invariant 位，与源码判据不符（[annotations.md](annotations.md) §3） | `practice/bench-clock-master.md`（E4） |

@@ -273,9 +273,9 @@ cookie。这就是"域的形状"和"group 的边界"真正耦合的地方。
 | 系统默认域 | `dmesg \| grep "Default domain type"` | 来自 `iommu_subsys_init()`，`(set via kernel command line)` 后缀表示被 cmdline 抢过 |
 | lazy/strict | `dmesg \| grep "TLB invalidation policy"` | 只在非 passthrough 时打印 |
 | 每 group 的域类型 | `cat /sys/kernel/iommu_groups/N/type` | 读的是 `group->default_domain->type`；**0644 可写**，走 `iommu_group_store_type()` |
-| group 成员 | `ls /sys/kernel/iommu_groups/N/devices/` | 见 phase6 §1.4 的实测方法 |
+| group 成员 | `ls /sys/kernel/iommu_groups/N/devices/` | 见 phase7 §1.4 的实测方法 |
 | 保留区 | `cat /sys/kernel/iommu_groups/N/reserved_regions` | `iommu_group_show_resv_regions`（`drivers/iommu/iommu.c:922`）；与 [Q4](iova.md) 的窗口偏移对得上 |
-| 是否真的走了 IOMMU | 设备 `dma_map` 后读 `iommu_groups/*/devices` + `type`，或直接看失效计数 | sysfs 不反映 VFIO 接管，见 [phase6 corrections](../phase7-vfio/corrections.md) |
+| 是否真的走了 IOMMU | 设备 `dma_map` 后读 `iommu_groups/*/devices` + `type`，或直接看失效计数 | sysfs 不反映 VFIO 接管，见 [phase7 corrections](../phase7-vfio/corrections.md) |
 
 **两套字符串不要混用**：dmesg 走 `iommu_domain_type_str()` 印 `Passthrough` / `Translated`，
 sysfs 的 `type` 走 `iommu_group_show_type()`（`drivers/iommu/iommu.c:890-917`）印 `identity` / `DMA` /

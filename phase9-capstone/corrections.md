@@ -1556,3 +1556,25 @@ mini-kvm 的 `make` 均 rc=0、无新增警告，模块十个文件行数与 J13
 要精确数列只能数**行尾**的完整标记：
 `grep -cE -- '<!-- check-refs:ignore --> *$' corrections.md`（本文 15，phase7 10）。
 本轮 phase7 新增的 10 处标记全部是行尾追加，那三个文件的行号漂移只来自内容改写本身。
+
+---
+
+## K. 旧 phase 编号与 mini-kvm 旧路径（2026-11-25 P0 事实修复）
+
+成因：phase4-pcie 插入后全局编号顺延（中断 4→5、virtio 5→6、VFIO 6→7、
+时钟 7→8、capstone 8→9、性能 9→10、调试 10→11）；mini-kvm 已自
+`examples/mini-kvm/` 移入 `practice/mini-kvm/`（见 J 节）。本章多处未同步。
+发现于统一课程框架 P0（`../COURSE_FRAMEWORK.md` §1.2），原文已同步修正：
+
+| 位置 | 错误 | 正确 |
+|---|---|---|
+| `README.md:14/16` | `examples/mini-kvm`、"本阶段（phase8）" | `practice/mini-kvm`、本阶段（phase9） |
+| `README.md:20` | 前置 "phase0-7 全部" | phase0-8 全部 |
+| `README.md:32` 项目1 整合 | phase0/1/2/4/7 | phase0/1/2/5/8 |
+| `README.md:33` 项目2 整合 | phase5 | phase6 |
+| `README.md:34` 项目3 整合 | phase3/4/6 | phase3/5/7 |
+| `README.md:49` | `../examples/mini-kvm/` | `practice/mini-kvm/` |
+| `project1-minivmm-boot.md:7` | phase4（in-kernel irqchip）、phase7（时钟） | phase5、phase8 |
+| `project3-minivmm-vfio.md:7` | "phase6 的地基" | phase7 |
+
+注：`README.md:35` 项目4 的 "phase9/10/11" 已是现行编号，未改。

@@ -11,13 +11,13 @@ virtio、VFIO、时钟。本阶段反过来**从零建造**：只用 `/dev/kvm` 
 ioctl，写一个能启动 Linux 的用户态 VMM，然后逐级加上 virtio 设备、
 VFIO 直通，最后与 QEMU/Firecracker 对标性能。
 
-**与 `examples/mini-kvm` 的区分**（两者互补，不要混淆）：
+**与 `practice/mini-kvm` 的区分**（两者互补，不要混淆）：
 
-| | `examples/mini-kvm` | 本阶段（phase8） |
+| | `practice/mini-kvm` | 本阶段（phase9） |
 |---|---|---|
 | 造的是什么 | 一个"KVM"（**内核模块**，自己实现 VM-Entry/Exit） | 一个"VMM"（**用户态程序**，基于 `/dev/kvm`） |
 | 视角 | KVM 内核态怎么实现 | VMM 怎么驱动 KVM |
-| 前置 | phase0-2（VT-x/VMCS 机制） | phase0-7 全部 |
+| 前置 | phase0-2（VT-x/VMCS 机制） | phase0-8 全部 |
 
 读源码时本阶段反复用到两条对照线：**QEMU 是怎么调这些 ioctl 的**
 （`/root/code/qemu-10.1.0-rc2/`），以及 **KVM 内核侧收到后做了什么**
@@ -29,9 +29,9 @@ VFIO 直通，最后与 QEMU/Firecracker 对标性能。
 
 | # | 项目 | 交付物 | 整合的 phase |
 |---|------|--------|-------------|
-| 1 | [可启动的最小 VMM](project1-minivmm-boot.md) | bzImage + initramfs 引导到 shell | phase0/1/2/4/7 |
-| 2 | [自制 virtio-mmio 设备](project2-minivmm-virtio.md) | 在自己的 VMM 里实现 virtio-blk + console | phase5 |
-| 3 | [VFIO 设备直通](project3-minivmm-vfio.md) | 把真实设备直通进自己的 VMM | phase3/4/6 |
+| 1 | [可启动的最小 VMM](project1-minivmm-boot.md) | bzImage + initramfs 引导到 shell | phase0/1/2/5/8 |
+| 2 | [自制 virtio-mmio 设备](project2-minivmm-virtio.md) | 在自己的 VMM 里实现 virtio-blk + console | phase6 |
+| 3 | [VFIO 设备直通](project3-minivmm-vfio.md) | 把真实设备直通进自己的 VMM | phase3/5/7 |
 | 4 | [性能对标](project4-minivmm-bench.md) | 与 QEMU/Firecracker 对比启动延迟与 VM-Exit 分布 | phase9/10/11 |
 
 **建议顺序完成**：每个项目都建立在前一个的 VMM 代码之上。
@@ -46,7 +46,7 @@ VFIO 直通，最后与 QEMU/Firecracker 对标性能。
 |------|------|
 | `../examples/kvm-api-demo/kvm-demo.c` | 完整 KVM API 生命周期：open → CREATE_VM → TSS/identity map → memslot → CREATE_VCPU → mmap kvm_run → 运行循环（处理 `KVM_EXIT_HLT`/`KVM_EXIT_IO`），每步注释标注内核侧函数 |
 | `../phase8-timer-virt/practice/common.h` | 可复用的最小 VMM 骨架：`vcpu_setup_cpuid()`、寄存器封装、端口 I/O 处理；三个已跑通的实验（TSC offset / kvmclock / TSC-deadline 中断）都在它之上 |
-| `../examples/mini-kvm/` | 对照阅读：同一个概念（vCPU 循环、中断注入）在内核模块侧的实现 |
+| `practice/mini-kvm/` | 对照阅读：同一个概念（vCPU 循环、中断注入）在内核模块侧的实现 |
 
 ---
 

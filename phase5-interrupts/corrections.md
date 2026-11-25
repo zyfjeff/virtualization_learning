@@ -136,6 +136,16 @@ irte.VV = POSTED_INTR_VECTOR;   /* 虚拟向量 (Virtual Vector) */
 
 ---
 
+## 勘误 7：annotations.md 标题沿用旧 phase 编号
+
+- **发现日期**: 2026-11-25（统一课程框架 P0 事实修复，见 `../COURSE_FRAMEWORK.md` §1.2）
+- **位置**: `annotations.md:1`
+- **错误**: 标题 "Phase 4：源码精读注释 - 中断虚拟化 + VT-d 中断重映射"
+- **正确**: Phase 5。phase4-pcie 插入后中断虚拟化由 phase4 顺延为 phase5。
+- **已同步修正**: `annotations.md`
+
+---
+
 ## 总结
 
 本次审查发现了 6 个严重事实错误，主要问题集中在：

@@ -1,4 +1,4 @@
-# Phase 5：源码精读注释 - vhost 内核态加速
+# Phase 6：源码精读注释 - vhost 内核态加速
 
 > 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
 > 行号可能随版本变化，用函数名 grep 定位更可靠。
@@ -139,7 +139,7 @@ if (consumer->token == producer->token) {
 }
 ```
 
-**注意**：这走的是完全独立于 `KVM_DEV_VFIO_FILE_ADD` 的路径。详见 phase6 corrections.md 勘误 4。
+**注意**：这走的是完全独立于 `KVM_DEV_VFIO_FILE_ADD` 的路径。详见 phase7 corrections.md 勘误 4。
 
 ---
 

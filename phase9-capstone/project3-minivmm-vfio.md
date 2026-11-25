@@ -4,7 +4,7 @@
 > guest 内用原生驱动驱动它。
 
 **前置**：项目 2；**强烈建议先完成阅读**：
-`../phase3-iommu/`（group/domain/ACS 判定，phase6 的地基）、
+`../phase3-iommu/`（group/domain/ACS 判定，phase7 的地基）、
 `../phase7-vfio/README.md`（VFIO 全栈：§1.4 group 划分、§1.5 ACS/ATS、
 DMA 映射、MSI-X 直通流程）。硬件要求：启用 `intel_iommu=on`，
 设备位于**可独立直通的 IOMMU group**。

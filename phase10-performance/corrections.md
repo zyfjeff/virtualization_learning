@@ -862,3 +862,19 @@ ex6 三处；`trace-page-fault.sh` 抽出 `count_re()` 辅助函数统一兜底�
 | phase2 的 200 ns / 2-5 µs / 50 ns 等推算值在 `archive/` 多处复制 | `../phase2-mem-virt/` | 未逐处改写，统一在 [index.md](index.md) §3 登记为 C 级 |
 | `scripts/shared/` 下 `memtype_test`、`real_hugepage_test` 无对应源码 | `../scripts/shared/` | 未处理。`real_hugepage_test` 本是本章大页实验的现成抓手，缺源码则不可复算 → 列为待补 |
 | phase3 的 `dmar_perf_latency` 方法有、数据无 | `../phase3-iommu/practice/README.md` I.15 | 归 phase3 自己补，[index.md](index.md) §3 已登记 |
+
+---
+
+## G. 旧 phase 编号残留（2026-11-25 P0 事实修复，已改）
+
+成因：phase4-pcie 插入后性能章由 phase9 顺延为 phase10、capstone 由 phase8
+顺延为 phase9，本章部分位置未同步。发现于统一课程框架 P0
+（`../COURSE_FRAMEWORK.md` §1.2），原文已同步修正：
+
+| 位置 | 错误 | 正确 |
+|---|---|---|
+| `README.md:1` | 标题 "Phase 9：性能测量与跨机制开销" | Phase 10 |
+| `annotations.md:1` | 标题 "Phase 9：源码精读注释 - 性能机制" | Phase 10 |
+| `index.md:151` | "phase9 重写后识别出的真实缺口" | phase10（本章自指） |
+| `index.md:155` | "phase8 已定性说明…并把超卖实验推给 phase9" | phase9（capstone）已定性说明…推给 phase10（本章） |
+| `index.md:156` | "phase8 说'本规模无独立可测收益'" | phase9（capstone） |
