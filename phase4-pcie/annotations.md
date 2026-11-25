@@ -2,10 +2,27 @@
 
 > 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
 > 行号已经过验证，基于 Linux 6.12.93。
+>
+> **体例：问题链**（COURSE_FRAMEWORK.md §3.2）。每节开头给出问题链——
+> 先带着问题读代码，再对答案；引申问题从上一个答案里长出来，链尾指向下一节/实验。
 
 ---
 
 ## 1. PCIe 设备发现与枚举
+
+**问题链**（入口问题来自全景层："没有任何驱动，内核怎么知道有什么设备？"）：
+
+1. 入口：PCI 子系统如何发现总线上的设备？→ 下方扫描循环
+2. 引申：为什么扫描步长是 `devfn += 8` 而不是 +1？
+   （BDF 编码：32 device × 8 function，devfn = device<<3 | function；basics §2）
+3. 引申：为什么扫描 bridge **之前**先调 `pci_iov_bus_range()` 给 SR-IOV 预留 bus 号？
+   （VF 要占 bus 号，而 bus 号是稀缺资源——每 segment 只有 256 个；
+   `drivers/pci/iov.c:1050` 取 `max_VF_buses`）
+4. 引申（反事实）：为什么 bridge 要扫**两遍**？去掉第一遍会怎样？
+   （第一遍保留固件已配置好的 bridge、不动它们；第二遍才重配需要重配的，
+   并把剩余 bus 号分给 hotplug bridge 留余量——见下方源码注释。
+   去掉第一遍 = 推翻固件分配，热插拔余量也无从预留）
+5. 链尾：bridge 的三个 bus 号字段各干什么？→ §2
 
 ### Q: PCI 子系统如何发现总线上的设备？
 
@@ -132,6 +149,21 @@ Bus 01: Switch Upstream Port
 ---
 
 ## 3. ACS（Access Control Services）检查
+
+**问题链**（入口问题来自第一性原理："P2P 流量在 Switch 内短路、绕过 IOMMU，隔离怎么保证？"）：
+
+1. 入口：ACS 如何影响 IOMMU group 划分？→ 下方 `pci_acs_flags_enabled()`
+2. 引申：为什么 `pci_acs_enabled()` 先查 quirk、后看 PCIe 类型？
+   （规范依据：PCIe Spec §6.12 **强烈建议** RCiEP 无 ACS 时流量先过
+   Translation Agent → Intel RCiEP 构造上就隔离，quirk 是规范建议的实现，不是 hack；
+   AGENTS.md 全局陷阱 #11）
+3. 引申：为什么 `acs_flags &= (cap | PCI_ACS_EC)`——没声明的能力反而算已启用？
+   （没声明 = 硬连线已启用；只有"Cap 里有、Ctl 里没开"才算不通过；AGENTS.md #11）
+4. 引申（反事实）：规范说 ACS **默认关闭**、只能由 ACS-aware 软件启用（§6.12）。
+   内核不主动开会怎样？→ 隔离不成立，group 只能按最粗粒度划。
+   所以 `pci_enable_acs()` 在 probe 时主动写 ACS Control（AGENTS.md #13）；
+   再追问：为什么它的 quirk 判据是**反的**？（AGENTS.md #12）
+5. 链尾：隔离判定如何落成 IOMMU group 粒度？→ 实验 ex4 + `../phase3-iommu/group.md`
 
 ### Q: ACS 如何影响 IOMMU group 划分？
 
@@ -284,6 +316,19 @@ Bus 01: Root Port (ACS 启用)
 ---
 
 ## 4. PCIe 配置访问实现
+
+**问题链**（入口问题来自演进性约束："换了物理层，为什么软件接口不动？"）：
+
+1. 入口：内核如何访问 PCIe 配置空间？→ 下方 `pci_read_config_byte()`
+2. 引申：为什么 CF8/CFC 与 ECAM 两条路径并存？
+   （legacy 路径只覆盖前 256B，extended 4096B 需要 ECAM；保留 legacy 是向后兼容约束；
+   `arch/x86/pci/direct.c` 头注释）
+3. 引申（反事实）：为什么 `pci_conf1_read()` 要持 `pci_config_lock`？去掉锁会怎样？
+   （CF8/CFC 是**共享的两寄存器间接访问**：先写地址再读数据，
+   并发下 CPU A 的地址会被 CPU B 的数据配错对；`direct.c:31` raw_spin_lock_irqsave）
+4. 引申：为什么 `pci_read_config_byte()` 先查 `pci_dev_is_disconnected()`？
+   （surprise removal 热拔后设备已不在，返回全 1 而不是挂死；`access.c:560`）
+5. 链尾：配置读这么贵（legacy 路径还要持锁）→ 为什么 `pci_dev` 要缓存 `acs_cap`？→ §5
 
 ### Q: 内核如何访问 PCIe 配置空间？
 

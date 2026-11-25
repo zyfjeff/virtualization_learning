@@ -10,6 +10,9 @@
 
 ## 📋 学习目标
 
+**核心问题**：为什么有些设备不能单独直通？——隔离粒度不是软件策略，
+而是 PCIe 拓扑的物理事实。本章从第一性原理推出这个结论，再读内核怎么把它变成 IOMMU group。
+
 完成本阶段后，你应该能够：
 
 1. **PCIe 基础**
@@ -65,11 +68,11 @@
 
 | 文件 | 内容 | 何时读 |
 |------|------|--------|
-| `README.md` | 本文件：技术全景 + 学习路线 | 入口 |
+| `README.md` | 本文件：第一性原理 + 全景 + 问题链入口 | 入口 |
 | [`basics.md`](basics.md) | PCIe 硬件基础：拓扑、BDF、配置空间、BAR、能力概览（含 SR-IOV/AER 简介） | 步 2 |
 | [`acs-upstream-forwarding.md`](acs-upstream-forwarding.md) | ACS Upstream Forwarding (UF) 深入：UF 与 RR 分工、完整 ACS 配置 | 步 2 深入 |
 | [`ats.md`](ats.md) | ATS 深入：设备侧翻译、失效机制、与 IOMMU 协作、启用时序 | 步 2 深入 |
-| [`annotations.md`](annotations.md) | 源码精读：设备发现 / Bridge / ACS 检查 / 配置访问 / 数据结构 | 步 4 |
+| [`annotations.md`](annotations.md) | 问题链精读：设备发现 / Bridge / ACS 检查 / 配置访问 / 数据结构 | 步 4 |
 | [`corrections.md`](corrections.md) | 勘误记录 | 步 7 |
 | [`practice/`](practice/README.md) | 4 个编号实验（拓扑 / 配置空间 / ACS / IOMMU group） | 步 5 |
 
@@ -84,36 +87,67 @@
 第1步: 定位与目标 — 读本文件「学习目标」
   → 带着问题进入：为什么有些设备不能单独直通？
 
-第2步: 硬件全景 — 读本文件「技术全景」+ basics.md
+第2步: 第一性原理与硬件全景 — 读本文件「第一性原理与技术全景」+ basics.md
+  → 想：I/O 互连的根本矛盾是什么？为什么串行化却保留配置空间？
   → 拓扑（RC/Switch/Endpoint）、BDF、配置空间、BAR
   → 深入：acs-upstream-forwarding.md（UF 与 RR 分工）、ats.md（设备侧翻译）
-  → 想：硬件提供了什么隔离/翻译能力？软件怎么用？
 
 第3步: VMM 对比 — 读本文件「VMM视角对比」
-  → 想：QEMU 的虚拟拓扑 vs 内核的物理拓扑，边界在哪？
+  → 想：为什么隔离判定必须在内核？QEMU 的虚拟拓扑 vs 内核的物理拓扑，边界在哪？
 
-第4步: 源码精读 — annotations.md §1–5
-  → 设备发现 → Bridge/Bus Number → ACS 检查 → 配置访问 → 数据结构
-  → 目标：读懂每行代码的"为什么"
+第4步: 问题链精读 — annotations.md §1–5，先看下方「问题链精读入口」
+  → 每节带着入口问题 + 引申问题读代码（为什么步长 8？为什么两遍扫描？为什么 quirk 优先？）
+  → 答不出 = 没读懂，回到链上重读
 
 第5步: 动手验证 — practice/README.md，实验 ex1–ex4
-  → 拓扑分析 / 配置空间读写 / ACS 验证 / IOMMU group 分析
+  → 每个实验取证问题链中的一个答案（见实践练习表）
 
 第6步: 性能与测量 — 读本文件「性能与测量」
-  → 指针 → phase10；本章机制的实测数据现状
+  → 想：这些设计的代价是什么？指针 → phase10；本章实测数据现状
 
 第7步: 陷阱与勘误 — 读本文件「陷阱与勘误」+ corrections.md
-  → 对照 AGENTS.md 全局陷阱 #10–14（全部与本章相关）
+  → 对照 AGENTS.md 全局陷阱 #10–14（全部与本章相关）：直觉错在哪一层？
 
-第8步: 自测与衔接 — 本文件「阶段检验清单」
+第8步: 自测与衔接 — 本文件「阶段检验清单」（含深度自测）
   → 全部通过 → phase5（中断）→ phase7（VFIO 直通）
 ```
 
 ---
 
-## 🏗️ 技术全景
+## 🏗️ 第一性原理与技术全景
 
-### 为什么 PCIe 对虚拟化如此重要？
+### 根本问题
+
+I/O 互连要同时满足三个互相拉扯的需求：**带宽随设备演进持续增长**、
+**软件模型保持稳定**（OS/驱动生态不能推倒重来）、虚拟化时代追加的
+**流量可隔离、可分配**（直通）。PCIe 的每个关键设计都是这三者的折中。
+
+### 不可变约束
+
+| 约束 | 内容 | 依据 |
+|------|------|------|
+| 物理 | 并行总线频率受 skew/串扰限制，共享总线仲裁不 scale | PCIe Spec Chapter 1（p.98）："parallel bus implementation is replaced by a highly scalable, fully serial interface" |
+| 兼容 | PCI 的 load-store 模型与配置空间软件接口必须保留 | Spec Chapter 1："usage model, load-store architecture, and software interfaces, are maintained from PCI Local Bus" |
+| 资源 | BDF 的 bus 字段 8 位 → 每 segment 只有 256 个 bus 号，枚举时是稀缺资源 | `drivers/pci/probe.c:2963` 的 available_buses 分配逻辑（annotations §1） |
+| 隔离 | P2P 流量在 Switch 内短路、不经过 RC → IOMMU 看不见 | PCIe Spec §6.12（ACS 的控制点定义） |
+
+### 设计空间与取舍
+
+- **物理层**：串行差分点对点 + Switch  fabric +  packetized（TLP），
+  按 lane 扩展带宽——用协议复杂度换频率可扩展性（Spec Chapter 1）。
+- **发现**：保留配置空间 = 标准化、与驱动无关的枚举接口，
+  内核才能用一套统一算法扫描所有设备（annotations §1 的扫描循环）。
+- **隔离**：ACS 不做"所有流量强制过 RC"，而是在拓扑里设**控制点**
+  （正常路由/阻止/重定向，Spec §6.12）——保留 P2P 的性能选项，
+  把"关掉短路"的能力交给软件。且 ACS **默认关闭**、只能由 ACS-aware 软件启用
+  → 这就是 `pci_enable_acs()` 在 probe 时主动写寄存器的原因（AGENTS.md #13）。
+- **翻译**：每次 DMA 过 IOMMU vs 设备侧缓存翻译（ATS，Spec Chapter 10）——
+  省翻译延迟，换来失效协议的往返开销与设备复杂度（`ats.md`；
+  Device-TLB 失效为什么是同步的，见 phase3）。
+
+### 机制全景
+
+#### 为什么 PCIe 对虚拟化如此重要？
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -133,7 +167,7 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### PCIe 在虚拟化栈中的位置
+#### PCIe 在虚拟化栈中的位置
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -159,7 +193,7 @@ PCIe 的作用：
 - 提供高级能力（ACS/ATS/SR-IOV）
 ```
 
-### 关键概念速览
+#### 关键概念速览
 
 | 概念 | 作用 | 虚拟化影响 |
 |------|------|-----------|
@@ -186,15 +220,18 @@ PCIe 的作用：
 
 ---
 
-## 📖 源码精读入口
+## 📖 问题链精读入口
 
-| 环节 | annotations.md | 关键入口（源码） |
-|------|---------------|-----------------|
-| 设备发现与枚举 | §1 | `pci_scan_child_bus_extend()` — `drivers/pci/probe.c:2963` |
-| Bridge 与 Bus Number | §2 | `PCI_PRIMARY_BUS` / `PCI_SECONDARY_BUS` / `PCI_SUBORDINATE_BUS` — `include/uapi/linux/pci_regs.h:132-134` |
-| ACS 检查 | §3 | `pci_acs_flags_enabled()` — `drivers/pci/pci.c:3583`（quirk 层 `pci_dev_specific_acs_enabled()` 见 AGENTS.md #11） |
-| 配置访问 | §4 | `pci_read_config_byte()` — `drivers/pci/access.c:560`；`pci_conf1_read()` — `arch/x86/pci/direct.c:21` |
-| 关键数据结构 | §5 | `struct pci_dev` — `include/linux/pci.h:336` |
+> 完整问题链 + 答案在 annotations.md 各节开头；这里给入口与关键引申。
+> 读法：先盖住答案，自己顺着问题读代码；答不出再对答案。
+
+| annotations 节 | 入口问题 | 关键引申问题 | 源码入口 |
+|---------------|---------|-------------|---------|
+| §1 设备发现 | 没有任何驱动，内核怎么知道有什么设备？ | 为什么扫描步长是 8？为什么先给 SR-IOV 预留 bus 号？为什么 bridge 扫两遍（反事实：去掉第一遍会怎样）？ | `pci_scan_child_bus_extend()` — `drivers/pci/probe.c:2963` |
+| §2 Bridge/Bus Number | bridge 为什么需要三个 bus 号？ | 256 个 bus 号用完会怎样？hotplug bridge 为什么要留余量？ | `PCI_PRIMARY_BUS` 等 — `include/uapi/linux/pci_regs.h:132-134` |
+| §3 ACS 检查 | "有 ACS 能力"为什么 ≠ "已隔离"？ | 为什么 quirk 优先于 PCIe 类型？为什么没声明的能力算已启用？为什么 probe 时主动写（反事实：不写会怎样）？ | `pci_acs_flags_enabled()` — `drivers/pci/pci.c:3583` |
+| §4 配置访问 | CF8/CFC 与 ECAM 为什么并存？ | 为什么 CF8/CFC 要持锁（反事实：去掉锁会怎样）？为什么先查 disconnected？ | `pci_read_config_byte()` — `drivers/pci/access.c:560`；`pci_conf1_read()` — `arch/x86/pci/direct.c:21` |
+| §5 数据结构 | 拓扑/配置空间/能力在 `pci_dev` 里如何对应？ | 配置读这么贵，为什么缓存 `acs_cap`？（接 §4 链尾） | `struct pci_dev` — `include/linux/pci.h:336` |
 
 ---
 
@@ -202,12 +239,12 @@ PCIe 的作用：
 
 4 个编号实验（均在宿主执行，需 root + `pciutils`，详见 [`practice/README.md`](practice/README.md)）：
 
-| 编号 | 主题 | 核心问题 | 入口 |
-|------|------|---------|------|
-| ex1 | PCIe 拓扑分析 | RC/Switch/Endpoint 如何分布？ | `practice/ex1-pcie-topology.sh` |
-| ex2 | 配置空间读写 | Type 0/1 区别？BAR 如何解析？ | `practice/ex2-config-space.sh` |
-| ex3 | ACS 能力分析 | 哪些设备支持 ACS？如何影响 group？ | `practice/ex3-acs-analysis.sh` |
-| ex4 | IOMMU Group 分析 | 设备如何分组？直通约束是什么？ | `practice/ex4-iommu-group.sh` |
+| 编号 | 主题 | 验证问题链中的哪个问题 | 入口 |
+|------|------|----------------------|------|
+| ex1 | PCIe 拓扑分析 | §1/§2 链：物理拓扑长什么样？bus 号如何分配？ | `practice/ex1-pcie-topology.sh` |
+| ex2 | 配置空间读写 | §4 链：Type 0/1 区别？BAR 如何解析？ | `practice/ex2-config-space.sh` |
+| ex3 | ACS 能力分析 | §3 链：能力 vs 实际启用？quirk 命中了谁？ | `practice/ex3-acs-analysis.sh` |
+| ex4 | IOMMU Group 分析 | §3 链尾：隔离判定如何落成 group 粒度？ | `practice/ex4-iommu-group.sh` |
 
 实验报告在 `practice/reports/`。
 
@@ -256,6 +293,17 @@ PCIe 的作用：
 - [ ] 诊断 ACS 相关的直通失败问题
 - [ ] 使用 `lspci` 和 `setpci` 工具探索 PCIe 拓扑
 - [ ] 用 ftrace 追踪 PCIe 配置访问
+
+**深度自测**（答不出 = 没学会，回到问题链重读）：
+
+- [ ] **反事实**：如果没有 ACS，Switch 下两个设备 P2P 通信时 IOMMU 为什么看不见？
+      这会造成什么隔离漏洞？（Spec §6.12）
+- [ ] **反事实**：去掉 `pci_conf1_read()` 的 `pci_config_lock`，两个 CPU 并发读配置空间
+      会具体坏在哪一步？（CF8/CFC 两寄存器间接访问）
+- [ ] **不可简化**：bridge 两遍扫描的第一遍看似"什么都没做"，为什么不能省？
+      （固件已配置的 bridge；`probe.c` 注释）
+- [ ] **推导**：合上代码，从"每 segment 256 个 bus 号 + 热插拔随时可能加设备"
+      推出枚举算法必须给 hotplug bridge 预留余量。
 
 ---
 
