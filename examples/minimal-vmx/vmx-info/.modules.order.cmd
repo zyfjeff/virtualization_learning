@@ -1,1 +1,0 @@
-savedcmd_/root/code/kvm-study/examples/minimal-vmx/vmx-info/modules.order := {   echo /root/code/kvm-study/examples/minimal-vmx/vmx-info/vmx-info.o; :; } > /root/code/kvm-study/examples/minimal-vmx/vmx-info/modules.order

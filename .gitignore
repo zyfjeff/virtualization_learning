@@ -15,11 +15,14 @@ Module.symvers
 phase1-cpu-virt/practice/ex1-vmx-verify
 phase1-cpu-virt/practice/ex2-cpuid-fault
 phase1-cpu-virt/practice/ex3-msr-test
+phase1-cpu-virt/practice/ex4-cpuid-analysis
 phase1-cpu-virt/practice/ex5-vmexit-overhead
 phase2-mem-virt/practice/ept_violation_demo
 phase2-mem-virt/practice/memtype_analysis
 phase2-mem-virt/practice/memtest
 phase2-mem-virt/practice/concurrent_test
+phase2-mem-virt/practice/check-ept-ad
+phase2-mem-virt/practice/read-ept-ad-msr
 phase7-vfio/practice/vfio-claim-trace
 phase7-vfio/practice/vfio-dma-map
 phase7-vfio/practice/vfio-msix-probe
@@ -38,8 +41,22 @@ phase9-capstone/practice/mini-kvm/guest/guest.bin
 phase9-capstone/practice/blk.img
 *.img
 
+# examples 演示程序（无扩展名 ELF，由各目录 Makefile 重建）
+examples/cpuid-faulting-demo/test-cpuid-fault
+examples/cpuid-faulting-demo/test-cpuid-fault-kvm
+examples/kvm-api-demo/kvm-demo
+examples/kvm-api-demo/kvm-demo-regs
+
 # phase10 bench-*.sh 的实测结果目录（运行产物，换宿主就换一批）
 phase10-performance/practice/bench/
+
+# perf 运行时采集数据（perf.data / perf.data.guest / perf.data.old 等）
+perf.data*
+
+# 旧 9p 暂存区归档（2026-06 遗留，已被 scripts/shared/ 取代；只跟踪源码与说明）
+scripts/archive/legacy-shared/*
+!scripts/archive/legacy-shared/*.c
+!scripts/archive/legacy-shared/README.md
 
 # 9p 共享暂存区（只放拷进 guest 的产物）
 scripts/shared/*
