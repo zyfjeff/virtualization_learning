@@ -90,6 +90,9 @@ examples/  notes/  scripts/  shared/
 
 ## 文档规范
 
+**课程内容结构**（统一学习循环、README 章节骨架、文件布局与命名、迁移计划）的唯一来源：
+`COURSE_FRAMEWORK.md`，可复制模板在 `templates/phase-template/`。本节只规定引用格式与勘误流程。
+
 引用格式：
 
 ```markdown

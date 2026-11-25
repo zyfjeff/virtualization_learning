@@ -35,6 +35,8 @@
 ```
 kvm-study/
 ├── README.md                    ← 本文件
+├── COURSE_FRAMEWORK.md          ← ★ 统一课程框架：学习循环 + 章节骨架 + 迁移计划
+├── templates/phase-template/    ← 各 phase 复用的 README/corrections/practice 模板
 ├── notes/                       ← 学习笔记汇总
 │   ├── source-navigation.md     ← 源码导航图
 │   ├── debugging-guide.md       ← ★ KVM调试实战指南 (新增!)
