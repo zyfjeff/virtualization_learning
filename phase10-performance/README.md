@@ -1,21 +1,24 @@
-# Phase 10：性能测量与跨机制开销
+# Phase 10｜性能测量与跨机制开销
 
+> 核心问题：一个性能结论怎么才能信？本章是全仓测量可信性 + 参数默认值 + 结论索引的唯一来源。
 > 基于 Linux 6.12.93 源码 | 实测宿主：96 线程裸金属，内核 6.8.0-51-generic，
 > QEMU 10.1.0-rc2。★ 宿主与参考内核**不是同一棵树**，参数默认值可能不同 ——
 > 每次引用默认值前先做 [`measurement.md`](measurement.md) §5 第 2 条的"参数实存性自检"。
+>
+> 横切变体（COURSE_FRAMEWORK §6.3）：保留 measurement/parameters/index 单一来源地位。
 
 ---
 
-## 📚 前置知识
+## 📚 前置与衔接
 
-本阶段假设你已经完成 Phase 1-8，掌握了：
+本阶段假设你已经完成 Phase 0-9，掌握了：
 - ✅ halt-polling 机制（Phase 0/8）
-- ✅ PLE 退出机制（Phase 1 §8）
-- ✅ EPT A/D 位与 PML（Phase 2 §4）
-- ✅ Posted Interrupts 与定时器（Phase 4 §3-4）
-- ✅ VFIO 直通与中断（Phase 6）
+- ✅ PLE 退出机制（Phase 1）
+- ✅ EPT A/D 位与 PML（Phase 2）
+- ✅ Posted Interrupts（Phase 5）与定时器（Phase 8）
+- ✅ VFIO 直通与中断（Phase 7）
 
-如果你还没有完成 Phase 8，建议先学习 `../phase9-capstone/README.md`。
+如果你还没有完成 Phase 9（毕业建造），建议先学习 `../phase9-capstone/README.md`。
 
 ---
 
@@ -85,3 +88,16 @@ sudo ./bench-observer-cost.sh --arms O0,O2,O3,O0e --sample-s 20
 - [ ] 解释 halt-polling 的参数调优策略
 - [ ] 理解 TSC scaling 对性能的影响
 - [ ] 使用 perf kvm stat 分析 VM-Exit 分布
+
+深度自测（答不出 = 没学会）：
+
+- [ ] **反事实**：如果观测手段自身扰动和被测开销同量级，测出的数字还能用吗？怎么判？
+- [ ] **不可简化**：为什么"tracing_on=0"不能当零开销基线？static key 省了哪段、没省哪段？
+- [ ] **推导**：从"副本会随重测过期"推出"别处只写指针、数字单一来源"的规则。
+
+---
+
+## 🚀 下一步
+
+- **Phase 11（调试诊断）**：性能瓶颈定位的场景化方法（工具用法 + 排查树）
+- **本章进阶**：补齐 E1–E5 实测，填扰动预算表（measurement.md §4）

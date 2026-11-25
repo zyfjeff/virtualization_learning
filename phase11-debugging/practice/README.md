@@ -1,16 +1,15 @@
-# Phase 10 KVM 调试与测试 — 场景实验
+# Phase 11 实践练习 — 场景取证链
 
-> 基于 Linux 6.12.93 源码 | 运行时诊断实战
+> 五段式（COURSE_FRAMEWORK §3.5）：理论 → 预测 → 操作 → 对照 → 反馈。
+> 基于 Linux 6.12.93 源码 | 运行时诊断实战。每个实验取证一个诊断场景的根因定位方法。
 
----
+## 📋 取证总览
 
-## 📋 实验列表
-
-| 实验 | 场景 | 工具 | 难度 | 预计时间 |
-|------|------|------|------|---------|
-| `e1-ftrace-diagnosis` | VM 启动失败诊断 | ftrace + debugfs | ★★☆ | 30min |
-| `e2-perf-bottleneck` | 运行时性能瓶颈定位 | perf kvm stat + bpftrace | ★★★ | 35min |
-| `e3-vcpu-exit-analysis` | vCPU 异常退出分析 | ftrace + bpftrace + debugfs | ★★★ | 40min |
+| 实验 | 验证的理论 | 预测 | 工具 |
+|------|-----------|------|------|
+| `ex1-ftrace-diagnosis` | 启动失败根因定位（launch-failures） | ftrace ioctl 链 + dump_invalid_vmcs 定位失败点 | ftrace + debugfs |
+| `ex2-perf-bottleneck` | 性能瓶颈归因（performance-analysis） | perf kvm stat（-a）exit 分布指向瓶颈 | perf + bpftrace |
+| `ex3-vcpu-exit-analysis` | 异常退出诊断（vcpu-exit-diagnosis） | kvm_exit + kvm_inj_exception 定位 triple fault | ftrace + bpftrace |
 
 ---
 
@@ -22,7 +21,7 @@
 
 ```bash
 # 进入实验目录
-cd e1-ftrace-diagnosis/
+cd ex1-ftrace-diagnosis/
 
 # 1. 检查环境（不执行诊断）
 sudo ./run.sh --preflight

@@ -1,10 +1,13 @@
-# Phase 11：KVM 运行时调试与诊断
+# Phase 11｜KVM 运行时调试与诊断
 
+> 核心问题：VMM 起不来/vCPU 异常退出/性能不及预期时，怎么从症状定位到内核侧根因？
 > 基于 Linux 6.12.93 源码 | 面向 KVM 运行时诊断的场景指南
+>
+> 横切变体（COURSE_FRAMEWORK §6.3）：保留场景驱动导航（快速导航/决策树/工具选择）。
 
 ---
 
-## 📚 前置知识
+## 📚 前置与衔接
 
 本阶段假设你已经完成 Phase 0-10，掌握了：
 - ✅ ftrace 基础（Phase 1/2 练习）
@@ -283,13 +286,19 @@ phase10 性能测量     → 测量纪律与观测成本看 phase10-performance/
 - [ ] 知道 `dump_invalid_vmcs` 默认关闭，需要手动启用
 - [ ] 能区分 `KVM_EXIT_FAIL_ENTRY` / `INTERNAL_ERROR` / `SHUTDOWN` 的诊断路径
 
+深度自测（答不出 = 没学会）：
+
+- [ ] **反事实**：如果 `perf kvm stat` 不加 `-a`，会丢什么数据？为什么诊断结论会错？
+- [ ] **不可简化**：为什么诊断要先扫 corrections.md 再写脚本？省掉这步会踩哪些静默坑？
+- [ ] **推导**：从"trace 文本是符号名、BPF 是数字"推出"按 reason=[0-9] grep trace 永远抓不到"。
+
 ---
 
 ## 📖 推荐阅读顺序
 
 1. **入门**：读本页 → 了解整体结构
 2. **避坑**：扫 `corrections.md` → 避免常见错误
-3. **动手**：做 `practice/e1-ftrace-diagnosis` → 练习 ftrace 诊断
+3. **动手**：做 `practice/ex1-ftrace-diagnosis` → 练习 ftrace 诊断
 4. **深入**：按需求选读 `launch-failures.md` / `vcpu-exit-diagnosis.md` / `performance-analysis.md`
 5. **综合**：读 `case-studies.md` → 端到端案例
 6. **参考**：`annotations.md` → trace events 完整目录 + bpftrace 脚本集

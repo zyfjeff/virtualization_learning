@@ -106,16 +106,16 @@
 ### 快速入门（30 分钟）
 1. 读 `README.md` 了解整体结构
 2. 扫 `corrections.md` 避免常见错误
-3. 做 `practice/e1-ftrace-diagnosis` 练习 ftrace 诊断
+3. 做 `practice/ex1-ftrace-diagnosis` 练习 ftrace 诊断
 
 ### 深入调试（2 小时）
 4. 读 `launch-failures.md` 掌握启动失败诊断
 5. 读 `vcpu-exit-diagnosis.md` 掌握退出分析
-6. 做 `practice/e3-vcpu-exit-analysis` 练习退出诊断
+6. 做 `practice/ex3-vcpu-exit-analysis` 练习退出诊断
 
 ### 性能分析（2 小时）
 7. 读 `performance-analysis.md` 掌握性能瓶颈定位
-8. 做 `practice/e2-perf-bottleneck` 练习 perf + bpftrace
+8. 做 `practice/ex2-perf-bottleneck` 练习 perf + bpftrace
 9. 读 `annotations.md` §6 的 bpftrace 脚本集
 
 ### 全面掌握（4 小时+）

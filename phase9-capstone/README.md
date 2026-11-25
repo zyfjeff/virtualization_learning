@@ -1,15 +1,44 @@
-# 第九阶段：毕业建造 — 最小 VMM
+# Phase 9｜毕业建造 — 最小 VMM
 
-> 基于 Linux 6.12.93 内核源码 | 综合建造阶段
+> 只用 /dev/kvm ioctl，从零造一个能启动 Linux 的 VMM——把前 8 章的机制亲手用一遍。
+> 前置：phase0-8 全部 | 版本基线：Linux 6.12.93 / QEMU 10.1.0-rc2
+>
+> capstone 变体（COURSE_FRAMEWORK §6.2）：每个项目内部复用 8 步学习循环
+> （目标→设计→实现→验收）。
 
 ---
 
-## 🎯 本阶段定位
+## 🎯 本阶段定位（学习目标）
 
-前七个阶段逐层拆解了 KVM 的内核实现：框架、VT-x、EPT、IOMMU、中断、
+**核心问题**：理解了 KVM 内核实现，能不能反过来只用 `/dev/kvm` ioctl 造一个 VMM？
+造的过程会暴露哪些"以为懂了其实没懂"的机制？
+
+前八个阶段逐层拆解了 KVM 的内核实现：框架、VT-x、EPT、IOMMU、PCIe、中断、
 virtio、VFIO、时钟。本阶段反过来**从零建造**：只用 `/dev/kvm` 暴露的
 ioctl，写一个能启动 Linux 的用户态 VMM，然后逐级加上 virtio 设备、
 VFIO 直通，最后与 QEMU/Firecracker 对标性能。
+
+---
+
+## 📚 前置与衔接
+
+- **前序 phase**：phase0-8 全部。本项目阶梯整合各章（见下表）。
+- **VMM 经验衔接**：你熟悉 QEMU/crosvm 的 ioctl 用法。本章让你**自己实现**一遍，
+  对照 QEMU 源码（`/root/code/qemu-10.1.0-rc2/`）与 KVM 内核侧（`/root/code/linux-6.12.93/`）。
+
+---
+
+## 📂 本章文件
+
+| 文件 | 内容 | 整合 phase |
+|------|------|-----------|
+| `README.md` | 本文件：定位 + 项目阶梯 + 验收 | — |
+| [project1-minivmm-boot.md](project1-minivmm-boot.md) | 可启动最小 VMM | phase0/1/2/5/8 |
+| [project2-minivmm-virtio.md](project2-minivmm-virtio.md) | 自制 virtio-mmio 设备 | phase6 |
+| [project3-minivmm-vfio.md](project3-minivmm-vfio.md) | VFIO 设备直通 | phase3/5/7 |
+| [project4-minivmm-bench.md](project4-minivmm-bench.md) | 性能对标 | phase9/10/11 |
+| [corrections.md](corrections.md) | 勘误（含直通事故复盘 F/G 节） | — |
+| `practice/` | minivmm / msixdump / mini-kvm 内核模块 + bench 脚本 | — |
 
 **与 `practice/mini-kvm` 的区分**（两者互补，不要混淆）：
 
@@ -75,6 +104,19 @@ VFIO 直通，最后与 QEMU/Firecracker 对标性能。
 - [ ] 把真实 PCI 设备直通进自己的 VMM，解释 IOMMU group / ACS 的前置判定
 - [ ] 用 `perf kvm stat` 与 ftrace 对比自己的 VMM 与 QEMU 的 VM-Exit 分布，
       解释差异来源
+
+深度自测（答不出 = 没学会）：
+
+- [ ] **反事实**：如果你的 VMM 不设 TSC offset，guest 迁移/重启后时间会怎样？
+- [ ] **不可简化**：为什么 virtio-blk 不能省掉 ioeventfd/irqfd，直接用 ioctl 通知？
+- [ ] **推导**：从"设备自主 DMA"推出你的 VMM 为什么必须先 VFIO_IOMMU_MAP_DMA 再启动设备。
+
+---
+
+## 🚀 下一步
+
+- **Phase 10（性能测量）**：给你的 VMM 做可信的性能测量（测量纪律 + 结论分级）
+- **Phase 11（调试诊断）**：VMM 出问题时怎么定位（ftrace/perf/bpftrace）
 
 ---
 
