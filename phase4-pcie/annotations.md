@@ -146,6 +146,9 @@ Bus 01: Switch Upstream Port
   Subordinate = 05（最远的下游 Bus）
 ```
 
+**链尾**：bus 号分配完，拓扑就位——内核在这套拓扑上怎么判定"哪些设备互相隔离"？
+→ §3（ACS 检查问题链）；真机上看 bus 号分配 → 实验 ex1。
+
 ---
 
 ## 3. ACS（Access Control Services）检查
@@ -422,6 +425,9 @@ struct pci_dev {
 **注意**：
 - Bus Number 通过 `dev->bus->number` 访问
 - IOMMU group 通过 `dev->dev.iommu_group` 访问
+
+**链尾**：数据结构是词汇表，`acs_cap` 缓存的动机接 §4 链尾（配置读贵）。
+带着 §1–4 的答案去真机取证 → 实验 ex1–ex4；结果与直觉矛盾 → corrections.md。
 
 ---
 

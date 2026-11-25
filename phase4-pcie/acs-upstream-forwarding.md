@@ -1,6 +1,11 @@
 # ACS Upstream Forwarding (UF) 详解
 
 > 基于 PCIe Base Specification r6.0 和实际系统分析
+>
+> **承接**：[`basics.md`](basics.md) §5 能力概览——你已知道 ACS 管隔离、P2P 流量会绕过 IOMMU。
+> **本文回答**：RR 把流量重定向后，UF 凭什么保证它真能到 RC？UF 和 RR 怎么分工？
+> **引出**：内核怎么判定"隔离成立"（quirk 为什么优先）→ [`annotations.md`](annotations.md) §3 问题链；
+> 真机验证 → [`practice/`](practice/README.md) ex3/ex4。
 
 ---
 
@@ -189,6 +194,9 @@ UF：确保 RR/CR 重定向的流量不会丢失
 - Linux Kernel: `drivers/pci/pci.c` - ACS 检查逻辑
 
 ---
+
+**下一步**：[`annotations.md`](annotations.md) §3（内核 ACS 判定问题链：quirk 优先 / 未声明算启用 / probe 主动写）
+→ [`practice/`](practice/README.md) ex3/ex4（真机取证）
 
 **文档版本**: v1.0  
 **最后更新**: 2026-11-15  

@@ -66,15 +66,35 @@
 
 ## 📂 本章文件
 
-| 文件 | 内容 | 何时读 |
-|------|------|--------|
-| `README.md` | 本文件：第一性原理 + 全景 + 问题链入口 | 入口 |
-| [`basics.md`](basics.md) | PCIe 硬件基础：拓扑、BDF、配置空间、BAR、能力概览（含 SR-IOV/AER 简介） | 步 2 |
-| [`acs-upstream-forwarding.md`](acs-upstream-forwarding.md) | ACS Upstream Forwarding (UF) 深入：UF 与 RR 分工、完整 ACS 配置 | 步 2 深入 |
-| [`ats.md`](ats.md) | ATS 深入：设备侧翻译、失效机制、与 IOMMU 协作、启用时序 | 步 2 深入 |
-| [`annotations.md`](annotations.md) | 问题链精读：设备发现 / Bridge / ACS 检查 / 配置访问 / 数据结构 | 步 4 |
-| [`corrections.md`](corrections.md) | 勘误记录 | 步 7 |
-| [`practice/`](practice/README.md) | 4 个编号实验（拓扑 / 配置空间 / ACS / IOMMU group） | 步 5 |
+文件不是清单，是问题链的接力站——每个文件回答上一站引出的问题，再把自己的问题交给下一站：
+
+```
+README 第一性原理（核心问题：隔离粒度为什么是物理事实？）
+  │ 引出：拓扑长什么样？BDF/配置空间怎么读？
+  ▼
+basics.md（硬件词汇表：拓扑/BDF/配置空间/BAR/能力概览）
+  │ 引出①：ACS 怎么关掉 P2P 短路？UF 和 RR 什么分工？
+  │ 引出②：ATS 省了什么、代价是什么？
+  ├──────────────────────────────┐
+  ▼                              ▼
+acs-upstream-forwarding.md     ats.md
+  │ 引出：内核怎么判定隔离？       │ 引出：失效时序谁管？直通怎么用？
+  ▼                              ▼
+annotations.md §3             phase7 §1.5 + phase3 invalidation.md
+  │ 链尾：隔离怎么落成 group 粒度？
+  ▼
+practice ex1–ex4（真机取证）── 与直觉矛盾？──→ corrections.md + AGENTS.md #10–14
+```
+
+| 文件 | 回答什么 | 引出什么 → 去哪 |
+|------|---------|----------------|
+| `README.md` | 核心问题 + 第一性原理四问 | 拓扑怎么读 → [`basics.md`](basics.md) |
+| [`basics.md`](basics.md) | 拓扑/BDF/配置空间/BAR/能力概览（含 SR-IOV/AER 简介） | ACS 隔离细节 → [`acs-upstream-forwarding.md`](acs-upstream-forwarding.md)；ATS 取舍 → [`ats.md`](ats.md) |
+| [`acs-upstream-forwarding.md`](acs-upstream-forwarding.md) | UF/RR 分工、完整 ACS 配置 | 内核判定逻辑 → [`annotations.md`](annotations.md) §3；真机验证 → ex3/ex4 |
+| [`ats.md`](ats.md) | 设备侧翻译、失效机制、启用时序 | 直通依赖 → [`phase7 §1.5`](../phase7-vfio/README.md)；失效实现 → [`phase3 invalidation.md`](../phase3-iommu/invalidation.md)；陷阱 → AGENTS.md #14 |
+| [`annotations.md`](annotations.md) | 问题链精读 §1–5（设备发现/Bridge/ACS/配置访问/数据结构） | 每节链尾 → 对应实验 ex1–ex4 |
+| [`practice/`](practice/README.md) | ex1–ex4 取证（每个实验标注验证哪个问题） | 矛盾与待办 → [`corrections.md`](corrections.md) |
+| [`corrections.md`](corrections.md) | 概念性错误证据、待审计登记 | 蒸馏 → AGENTS.md 全局陷阱 / 本文件「陷阱与勘误」 |
 
 > VFIO 集成（IOMMU group 划分、ACS/ATS 直通依赖）的完整讨论在
 > [`../phase7-vfio/README.md`](../phase7-vfio/README.md) §1.4–1.5，本章先打好 PCIe 地基。

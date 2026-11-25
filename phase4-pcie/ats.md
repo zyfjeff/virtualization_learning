@@ -1,6 +1,13 @@
 # ATS (Address Translation Services) 详解
 
 > 基于 PCIe Base Specification r6.0 和 Intel VT-d 规范
+>
+> **承接**：[`basics.md`](basics.md) §5 能力概览——你已知道 ATS 是设备侧地址缓存。
+> **本文回答**：缓存省了什么？失效时付出什么？启用/关闭时序为什么有坑？
+> **引出**：直通场景的 ATS 依赖 → [`phase7 README §1.5`](../phase7-vfio/README.md)；
+> Device-TLB 失效的内核实现 → [`phase3 invalidation.md`](../phase3-iommu/invalidation.md)；
+> 命名/时序陷阱 → AGENTS.md 全局陷阱 #14。
+> ⚠️ 本文「性能分析」数字是无出处推算（见 [`corrections.md`](corrections.md) 勘误 11），不得当实测引用。
 
 ---
 
@@ -466,6 +473,10 @@ lspci -vvv | grep ATS
 - "Address Translation Services (ATS) in PCIe", PCI-SIG
 
 ---
+
+**下一步**：[`phase7 README §1.5`](../phase7-vfio/README.md)（ACS/ATS 直通依赖的实测讨论）
+＋ [`phase3 invalidation.md`](../phase3-iommu/invalidation.md)（Device-TLB 失效实现）；
+读前过一遍 AGENTS.md #14（STU/bit5/队列深度/关闭时序四个坑）
 
 **文档版本**: v1.0  
 **最后更新**: 2026-11-15  
