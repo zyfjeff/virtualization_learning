@@ -1,6 +1,15 @@
-# Phase 0 实践练习
+# Phase 0 实践练习 — 理论取证链
 
-> KVM 框架层实践练习
+> 五段式（COURSE_FRAMEWORK §3.5）：理论 → 预测 → 操作 → 对照 → 反馈。
+> 下列练习均为**手工步骤**（无脚本），需运行中的 VM（`boot-vm.sh` 默认 -enable-kvm -cpu host）。
+
+## 📋 取证总览
+
+| 编号 | 验证的理论 | 预测 | 对照判据 |
+|------|-----------|------|---------|
+| 1 | ioctl→VMENTER 调用链（annotations §1-5） | ftrace 见 kvm_dev_ioctl→vcpu_enter_guest→kvm_entry | 调用链 vs 源码对照 |
+| 2 | vCPU 线程调度模型（kvm-framework 并发） | 每 vCPU 一个线程，halt 让出 CPU | perf sched 对照 vCPU 数 |
+| 3 | memslot 管理（GPA→HVA） | QEMU monitor info mtree 与内核 memslot 一致 | 两侧对照 |
 
 ---
 

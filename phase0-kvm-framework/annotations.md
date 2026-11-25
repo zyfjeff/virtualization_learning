@@ -2,10 +2,21 @@
 
 > 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
 > 行号可能随版本变化，用函数名 grep 定位更可靠。
+>
+> **体例：问题链**（COURSE_FRAMEWORK §3.2）。节序沿 ioctl→VMENTER 路径：
+> ioctl 入口 → 创建 VM → vCPU ioctl → 运行入口 → 主循环 → 可运行性 → halt-polling。
 
 ---
 
 ## 1. KVM 设备 ioctl 入口
+
+**问题链**（入口来自第一性原理："用户态怎么驱动内核虚拟化？"）：
+
+1. 入口：/dev/kvm 怎么分发 ioctl？→ 三级 fd（kvm/vm/vcpu）
+2. 引申：为什么是三级 fd 而不是一个？（能力分层：系统级/VM 级/vCPU 级，
+   每级 ioctl 集不同，对应 struct kvm / kvm_vcpu 的生命周期）
+3. 引申（反事实）：如果 VMM 直接碰 VMX 指令会怎样？（ring0 特权，用户态碰不了 → 必须经内核）
+4. 链尾：KVM_RUN 进来后怎么走到 VMENTER？→ §4-5；真机观测 → practice 练习 1
 
 ### Q: `/dev/kvm` 的 ioctl 支持哪些操作？其他操作去哪？
 
