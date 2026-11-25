@@ -1,29 +1,31 @@
-# Phase 1 深度实践 — CPU 虚拟化源码精读配套练习
+# Phase 1 实践练习 — 理论取证链
 
-> 基于 Linux 6.12.93 源码。每个练习连接 `../annotations.md` 的源码精读，
-> 要求**先读懂源码，再做实验验证**。
+> 统一学习循环第 5 步。实验是对课程结论**取证**（COURSE_FRAMEWORK §3.5 五段式）：
+> 理论 → 预测 → 操作 → 对照 → 反馈。先押注预测，再看证据。
 >
 > **执行环境**：
-> - ex1/ex2/ex3/ex4/ex5 在 **Guest 内**执行（读取虚拟化的硬件状态）
-> - trace/profile 脚本在**宿主侧**执行（观测 KVM 行为）
-> - VM 启动必须带 `-enable-kvm -cpu host`（`boot-vm.sh` 默认已带）
+> - ex1 在**宿主**执行（读物理 VMX capability MSR，`modprobe msr`）
+> - ex2/ex3/ex4/ex5 的 C 程序在 **Guest 内**执行（读虚拟化后的状态）
+> - trace/profile 脚本在**宿主侧**观测 KVM 行为
+> - VM 启动必须带 `-enable-kvm -cpu host`（`boot-vm.sh` 默认已带，AGENTS.md #7）
 
 ---
 
-## 练习总览
+## 📋 实验总览（取证链）
 
-| # | 名称 | 核心问题 | 连接 annotations.md | 执行位置 |
-|---|------|---------|-------------------|---------|
-| 1 | VMX Capability 深度解码 | KVM 为什么只启用这些 VMX 特性？依赖链是什么？ | §5 VMX 特性检测 | Guest |
-| 2 | MSR Bitmap 可视化与热 MSR 分析 | MSR Bitmap 如何减少 VM-Exit？哪些 MSR 最热？ | §5, §6 | 宿主 + Guest |
-| 3 | VM-Exit Reason Profiling | 不同工作负载的 VM-Exit 分布有何差异？ | §3 VM-Exit 分发 | 宿主 |
-| 4 | CPUID 虚拟化双机制对比 | 静态过滤 vs 动态拦截，KVM 如何选择？ | §5, annotations §2 | Guest + 宿主 |
-| 5 | vCPU 调度与 Halt-Polling 观测 | halt-polling 如何在延迟和 CPU 占用间权衡？ | phase0 §7 halt-polling | 宿主 |
+| 编号 | 验证的理论（来源） | 预测 | 对照判据 | 执行位置 |
+|------|------------------|------|---------|---------|
+| ex1 | VMX capability MSR 编码 + 依赖链（annotations §5，SDM App A） | 7 MSR 解出 allowed-0/1；VMX_BASIC bit55=1 ⟺ true-CTLS MSR 0x48D 存在 | 程序结尾自动对照 bit55 vs 0x48D 可读性（PASS/FAIL） | 宿主 |
+| ex2 | MSR Bitmap 逐 MSR 拦截（cpu-virt §2） | 透传 MSR 无 kvm_msr trace，拦截的有 | ftrace kvm_msr 对照 bitmap 配置 | 宿主+Guest |
+| ex3 | VM-Exit 快/慢路径分发（annotations §3） | CPU/IO/内存负载的 exit reason 分布不同 | perf kvm stat 分布对照负载类型 | 宿主 |
+| ex4 | CPUID 无条件 exit（cpu-virt §1，SDM 25.1.2） | Guest 每次 CPUID 必产生 kvm_cpuid trace | trace 计数 vs Guest CPUID 次数 | Guest+宿主 |
+| ex5 | halt-polling 自适应（phase0 §7） | 四档 poll 参数改变 halt 延迟/CPU 占用 | perf sched + 四档对照 | 宿主 |
 
-> **历史版本留档**：`ex5-vmexit-overhead-202606.c` 是 2026-06 的旧版 ex5
-> （比现行版多 RDMSR IA32_TSC/IA32_EFER 两组测试），是
-> `../../phase10-performance/index.md` §2.2 B 级微基准数字的实际出处。
-> 不参与 `make`，仅作出处保留；重测请按 phase10 measurement.md 重新设计实验。
+**链式衔接**：ex1 硬件能力 → ex2 MSR 拦截粒度 → ex3 exit 分发 → ex4 CPUID 必 exit → ex5 调度权衡。
+
+> **历史版本留档**：`ex5-vmexit-overhead-202606.c` 是 2026-06 旧版 ex5
+> （多 RDMSR TSC/EFER 两组测试），是 `../../phase10-performance/index.md` §2.2
+> B 级微基准数字的实际出处。不参与 `make`，仅作出处保留。
 
 ---
 

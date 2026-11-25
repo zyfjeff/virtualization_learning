@@ -1,405 +1,225 @@
-# 第一阶段：Intel VT-x 与 CPU 虚拟化
+# Phase 1｜Intel VT-x 与 CPU 虚拟化
 
-## 学习目标
+> Guest 如何既接近原生速度执行，又让 VMM 保留控制权？VT-x 用 root/non-root + VMCS 给出答案。
+> 前置：phase0（KVM 框架 / KVM_RUN ioctl）
+> 版本基线：Linux 6.12.93 / QEMU 10.1.0-rc2 | Intel SDM Vol.3 Ch 23-29
+>
+> 章节骨架遵循 [`../COURSE_FRAMEWORK.md`](../COURSE_FRAMEWORK.md)。
 
-1. 理解VMX Root/Non-root模式切换机制
-2. 掌握VMCS结构和关键控制字段
-3. 追踪从ioctl(KVM_RUN)到VMENTER的完整路径
-4. 理解VM-Exit的分类和处理流程
-5. 熟悉KVM核心数据结构和回调表
-6. 掌握CPUID虚拟化机制（静态过滤 vs 动态拦截）
-7. 理解MSR Bitmap和MSR虚拟化策略
-8. 列举触发VM-Exit的指令及KVM处理方式
-9. 理解vCPU唤醒机制：immediate_exit vs 信号，竞态陷阱，三种VMM的设计权衡
+---
+
+## 📋 学习目标
+
+**核心问题**：Guest 代码要跑得接近原生快（不能逐条模拟），但 VMM 必须保留控制权
+（隔离、资源管理）。VT-x 怎么调和这对矛盾？哪些事件交给硬件自动 trap、哪些要软件补？
+
+完成本阶段后，你应该能够：
+
+1. 理解 VMX Root/Non-root 模式切换机制
+2. 掌握 VMCS 结构和关键控制字段
+3. 追踪从 ioctl(KVM_RUN) 到 VMENTER 的完整路径
+4. 理解 VM-Exit 的分类和处理流程
+5. 熟悉 KVM 核心数据结构和回调表
+6. 掌握 CPUID 虚拟化机制（CPUID 总是 exit + CPUID Faulting 补充）
+7. 理解 MSR Bitmap 和 MSR 虚拟化策略
+8. 列举触发 VM-Exit 的指令及 KVM 处理方式
+9. 理解 vCPU 唤醒机制：immediate_exit vs 信号，竞态陷阱，三种 VMM 的设计权衡
+
+---
+
+## 📚 前置与衔接
+
+- **前序 phase**：phase0 的 KVM 框架（`kvm_vcpu_ioctl` → `vcpu_run` → `kvm_x86_ops`）。
+  本章展开 `kvm_x86_ops` 的 VMX 实现层。
+- **VMM 经验衔接**：你在 QEMU 里调 `ioctl(KVM_RUN)` 后阻塞、返回时处理 `kvm_run->exit_reason`。
+  本章讲内核侧 `vmx_vcpu_run()` 如何在 root/non-root 间切换、为什么多数 VM-Exit 不必回用户态。
+
+---
 
 ## 📂 本章文件
 
-| 文件 | 内容 |
-|------|------|
-| `README.md` | 本文件：VT-x硬件基础 + 学习指南 |
-| `annotations.md` | 源码精读：vmx_x86_ops, vmx_hardware_setup, vmx_vcpu_run |
-| `cpu-virtualization.md` | ★ CPU虚拟化：CPUID / MSR / 指令虚拟化 / vCPU唤醒机制与竞态陷阱 |
-| `practice/` | ★ 实战练习：VMX深度解码 / MSR Bitmap分析 / VM-Exit Profiling / CPUID双机制 / vCPU调度观测 |
-
-## 推荐阅读顺序
+文件是问题链的接力站（§3.2 规则 6）：
 
 ```
-第1步: README.md (本文件)
-  → 理解 VMX 硬件模式、VMCS 结构
-  → 运行 vmx-info.ko 查看 CPU 虚拟化能力
-
-第2步: annotations.md
-  → vt_x86_ops 回调表: KVM 的完整接口
-  → vmx_hardware_setup(): 硬件能力检测
-  → vmx_vcpu_run(): VM-Entry/Exit 主循环
-  → vmx_handle_exit(): Exit 处理分发
-
-第3步: cpu-virtualization.md ← CPU 虚拟化深入
-  → CPUID 虚拟化: 两种机制对比
-  → MSR Bitmap: 4KB 位图控制逐 MSR 拦截
-  → 指令虚拟化: 哪些指令触发 VM-Exit
-  → kvm_x86_ops: 通用层 ↔ VMX 桥梁
-  → vCPU 唤醒机制: immediate_exit vs 信号，竞态陷阱
-
-第4步: practice/ ← 实战练习（5 个递进式深度实验）
-  → ex1: VMX Capability 深度解码（7 个 MSR 全解码）
-  → ex2: MSR Bitmap 可视化 + ftrace 热 MSR 分析
-  → ex3: VM-Exit Reason Profiling（perf kvm stat）
-  → ex4: CPUID 虚拟化双机制对比（Faulting vs KVM 拦截）
-  → ex5: vCPU 调度与 halt-polling 观测
-
-第5步: 运行示例 + ftrace 追踪
-  → kvm-demo: 完整 VM 生命周期
-  → ftrace kvm_cpuid / kvm_msr: 观察拦截效果
+README 第一性原理（核心问题：速度 vs 控制权怎么调和？）
+  │ 引出：硬件 trap 了哪些？VMCS 怎么控制粒度？
+  ▼
+annotations.md §1-8（VMX 分层 / Entry-Exit 汇编 / Exit 分发 / 特性检测）
+  │ 引出：CPUID/MSR/指令这三大信息接口硬件不全自动虚拟化，软件怎么补？
+  ▼
+cpu-virtualization.md（CPUID 总 exit / MSR Bitmap 逐 MSR / 指令拦截 / vCPU 唤醒）
+  │ 链尾：这些机制在真机上长什么样？
+  ▼
+practice ex1–ex5（取证）── 与直觉矛盾？──→ corrections.md + AGENTS.md #7
 ```
 
-## 硬件理论准备
+| 文件 | 回答什么 | 引出什么 → 去哪 |
+|------|---------|----------------|
+| `README.md` | 核心问题 + 第一性原理 + VMCS 全景 | 硬件 trap 粒度 → [`annotations.md`](annotations.md) |
+| [`annotations.md`](annotations.md) | 问题链精读 §1-8（VMX 实现层） | 三大信息接口软件补充 → [`cpu-virtualization.md`](cpu-virtualization.md) |
+| [`cpu-virtualization.md`](cpu-virtualization.md) | CPUID / MSR / 指令虚拟化 / vCPU 唤醒 | 真机取证 → [`practice/`](practice/README.md) ex1–ex5 |
+| [`practice/`](practice/README.md) | 5 个编号实验（标注验证哪条理论） | 矛盾与待办 → [`corrections.md`](corrections.md) |
+| [`corrections.md`](corrections.md) | 概念性错误证据、待审计 | 蒸馏 → AGENTS.md / 本文件陷阱节 |
 
-### 必读文档
-- Intel SDM Vol.3 Chapter 23-28: VMX基础
-- Intel SDM Vol.3 Chapter 29: VMCS结构
+---
 
-### 关键硬件概念
+## 📖 学习路线
+
+```
+第1步: 定位与目标 — 核心问题：速度 vs 控制权
+第2步: 第一性原理与硬件全景 — 本文件「第一性原理与技术全景」
+  → 想：为什么 trap-and-emulate 需要硬件？VMCS 控制什么？
+第3步: VMM 对比 — 本文件「VMM视角对比」
+  → 想：为什么多数 VM-Exit 内核态处理就够了？
+第4步: 问题链精读 — annotations.md §1-8，先看下方「问题链精读入口」
+  → 顺着引申问题读：Exit 怎么分发？特性怎么按依赖裁剪？
+第5步: 软件补充 — cpu-virtualization.md
+  → CPUID 为什么总 exit？MSR Bitmap 为什么逐 MSR？vCPU 唤醒竞态
+第6步: 动手验证 — practice ex1–ex5（每个取证一条理论）
+第7步: 性能与测量 — 指针 → phase10
+第8步: 陷阱与勘误 + 自测 — corrections + AGENTS.md #7；深度自测
+  → 通过 → phase2（内存虚拟化）
+```
+
+---
+
+## 🏗️ 第一性原理与技术全景
+
+### 根本问题
+
+Guest 要执行**真实指令**（接近原生速度），不能逐条模拟；但 VMM 必须能拦截
+特权/敏感操作以维持隔离与资源管理。纯 trap-and-emulate 在 x86 上行不通——
+有些敏感指令在 ring3 不 trap（经典虚拟化漏洞）。
+
+### 不可变约束
+
+| 约束 | 内容 | 依据 |
+|------|------|------|
+| 硬件漏洞 | x86 部分敏感指令非特权级执行不 trap，纯软件 trap-and-emulate 不完备 | Intel SDM Vol.3 Ch 23（VMX 动机） |
+| 向后兼容 | 不能要求改 Guest OS（区别于半虚拟化） | VT-x 设计目标 |
+| 性能 | 模式切换有成本，不能每条指令都 exit | VMCS 控制粒度 |
+
+### 设计空间与取舍
+
+- **全模拟**（TCG）：每条指令翻译，慢但完备 → 对照基线。
+- **半虚拟化**：改 Guest 用 hypercall，快但不兼容。
+- **硬件辅助 trap-and-emulate（VT-x）**：新增 root/non-root 模式，Guest 在 non-root
+  原生执行，**只有 VMCS 配置的事件**才 VM-Exit 回 root。用硬件换速度+控制权的平衡。
+- **软件补充**：CPUID/MSR/特权指令三大信息接口硬件不全自动虚拟化
+  → CPUID 无条件 exit（SDM 25.1.2）、MSR Bitmap 逐 MSR 粒度、VM-Execution Controls 配指令拦截
+  （详见 [`cpu-virtualization.md`](cpu-virtualization.md)）。
+
+### 机制全景：VMX 模式与 VMCS
 
 ```
 ┌──────────────────────────────────────────────────┐
-│                  CPU执行模式                       │
-│                                                    │
-│  ┌──────────────────┐  ┌────────────────────────┐ │
-│  │  VMX Root Mode    │  │  VMX Non-Root Mode     │ │
-│  │  (VMM/Hypervisor) │  │  (Guest/虚拟机)         │ │
-│  │                   │  │                         │ │
-│  │  执行VMM代码       │  │  执行Guest代码           │ │
-│  │  管理VMCS         │  │  受限于VMCS控制          │ │
-│  │  处理VM-Exit      │  │  触发VM-Exit的条件:      │ │
-│  │                   │  │   - 特定指令执行          │ │
-│  │  VMENTER ──────────────► 进入Guest              │ │
-│  │  VM-Exit ◄────────────── 特定事件触发           │ │
-│  └──────────────────┘  └────────────────────────┘ │
+│  VMX Root Mode (VMM)        VMX Non-Root (Guest)  │
+│  执行 VMM 代码              执行 Guest 代码        │
+│  管理 VMCS                  受 VMCS 控制           │
+│  处理 VM-Exit             VMENTER ──► 进入 Guest   │
+│                          VM-Exit ◄── 配置事件触发  │
 └──────────────────────────────────────────────────┘
 ```
 
-### VMCS (Virtual Machine Control Structure)
-```
-VMCS 布局 (6.12.93 arch/x86/include/asm/vmx.h):
+VMCS 四区（`arch/x86/include/asm/vmx.h`）：
 
-┌─ Guest State Area ──────────────────────────────────┐
-│  CR0, CR3, CR4          ← Guest控制寄存器             │
-│  DR7                    ← 调试寄存器                  │
-│  RSP, RIP, RFLAGS       ← 通用寄存器                  │
-│  CS/DS/ES/FS/GS/SS/TR   ← 段寄存器(选择子/基址/限制/AR)│
-│  GDTR/IDTR              ← 描述符表寄存器               │
-│  IA32_EFER              ← 扩展特性寄存器               │
-└──────────────────────────────────────────────────────┘
+- **Guest State Area**：CR0/CR3/CR4、RSP/RIP/RFLAGS、段寄存器、EFER —— VM-Entry 加载
+- **Host State Area**：CR0/CR3/CR4、RSP/RIP —— VM-Exit 恢复
+- **VM-Execution Controls**：PIN/CPU_BASED、EXCEPTION_BITMAP、EPT_POINTER、VPID —— 控制哪些事件 exit
+- **VM-Exit Information**：EXIT_REASON、EXIT_QUALIFICATION、GUEST_PHYSICAL_ADDRESS —— exit 现场
 
-┌─ Host State Area ───────────────────────────────────┐
-│  CR0, CR3, CR4          ← Host控制寄存器              │
-│  RSP, RIP               ← VM-Exit后恢复              │
-│  CS/DS/ES/FS/GS/SS/TR   ← Host段寄存器               │
-│  GDTR/IDTR              ← Host描述符表                │
-└──────────────────────────────────────────────────────┘
-
-┌─ VM-Execution Controls ─────────────────────────────┐
-│  PIN_BASED_VM_EXEC_CONTROL   ← 引脚控制 (NMI/外部中断) │
-│  CPU_BASED_VM_EXEC_CONTROL   ← CPU控制 (MSR/IO/CPUID) │
-│  EXCEPTION_BITMAP            ← 哪些异常触发VM-Exit     │
-│  VM_ENTRY_CONTROLS           ← VM-Entry控制           │
-│  VM_EXIT_CONTROLS            ← VM-Exit控制            │
-│  EPT_POINTER                 ← EPT页表基址 ★           │
-│  VPID                        ← 虚拟处理器ID ★          │
-└──────────────────────────────────────────────────────┘
-
-┌─ VM-Exit Information Fields ────────────────────────┐
-│  EXIT_REASON               ← 退出原因 (16位)         │
-│  EXIT_QUALIFICATION         ← 退出限定信息            │
-│  VM_EXIT_INTR_INFO          ← 中断信息                │
-│  GUEST_PHYSICAL_ADDRESS     ← EPT Violation的GPA     │
-│  GUEST_LINEAR_ADDRESS       ← 触发退出的线性地址       │
-└──────────────────────────────────────────────────────┘
-```
-
-## 源码精读指南
-
-### 文件阅读顺序
-
-```
-第1步: arch/x86/kvm/vmx/main.c (171行, 入口注册)
-  └→ vt_x86_ops 回调表: VMX操作的完整接口
-  └→ vt_init_ops 初始化回调表
-  └→ vmx_init(): 模块入口
-
-第2步: arch/x86/kvm/vmx/vmx.c (8500+行, VMX核心)
-  └→ 模块参数: ept, vpid, apicv, nested...
-  └→ vmx_hardware_setup(): 硬件能力检测和初始化
-  └→ vmx_vcpu_create(): vCPU创建 (分配VMCS)
-  └→ vmx_vcpu_run(): ★ 核心执行函数
-  └→ vmx_handle_exit(): VM-Exit处理入口
-
-第3步: arch/x86/kvm/vmx/vmx.h (结构定义)
-  └→ struct vcpu_vmx: VMX vCPU扩展结构
-  └→ union vmx_exit_reason: Exit原因位域
-
-第4步: include/linux/kvm_host.h (核心数据结构)
-  └→ struct kvm: VM实例
-  └→ struct kvm_vcpu: 虚拟CPU
-
-第5步: virt/kvm/kvm_main.c (KVM框架核心)
-  └→ kvm_dev_ioctl(): ioctl入口
-  └→ kvm_vcpu_ioctl(): vCPU ioctl
-```
-
-### 关键函数深度注释
-
-详见 [annotations.md](./annotations.md)
-
-## 实践练习
-
-> **重要**：完整的实践练习和实验脚本已经整理到 `practice/` 目录中。
-
-### 快速开始
-
-```bash
-# 进入实践目录
-cd practice/
-
-# 查看详细指南
-cat README.md
-
-# 编译练习程序
-make
-
-# 运行不需要 VM 的实验
-sudo ./ex1-vmx-verify        # VMX Capability 深度解码（7 个 MSR）
-
-# 运行需要 VM 的实验：先在另一个终端启动 VM
-cd ../../scripts/vm && ./boot-vm.sh ubuntu --memory 4G --cpus 4
-# 回到 practice 目录运行分析脚本
-./trace-msr-access.sh        # MSR Bitmap 热 MSR 分析
-./profile-vmexit.sh          # VM-Exit Reason Profiling
-./trace-vcpu-sched.sh        # vCPU 调度观测
-# 清理：在 Guest 内执行 poweroff
-```
-
-### 实验列表
-
-| 编号 | 实验名称 | 需要 VM | 难度 | 预计时间 | 核心知识点 |
-|------|---------|---------|------|---------|-----------|
-| 1 | VMX Capability 深度解码 | 否 | ★★☆ | 30min | VMX MSR 完整解码、特性依赖链 |
-| 2 | MSR Bitmap 可视化与热 MSR 分析 | 是 | ★★☆ | 20min | ftrace kvm_msr、透传 vs 拦截 |
-| 3 | VM-Exit Reason Profiling | 是 | ★★★ | 25min | perf kvm stat、快速/慢速路径 |
-| 4 | CPUID 虚拟化双机制对比 | 是 | ★★★ | 25min | CPUID Faulting vs KVM 拦截 |
-| 5 | vCPU 调度与 Halt-Polling 观测 | 是 | ★★★ | 20min | perf sched、halt-polling 自适应 |
-
-### 统一测试环境
-
-需要 VM 的实验使用统一的 VM 启动脚本：
-
-- **启动脚本**: `scripts/vm/boot-vm.sh`（前台运行 QEMU）
-- **详细说明**: 参见 `scripts/README.md` 与 `practice/README.md`
-
-### 快速体验（不需要 VM）
-
-如果只是想快速了解 VT-x 基础，可以运行不需要 VM 的实验：
-
-```bash
-# 实验 1: 检查 CPU 虚拟化支持
-grep -E "vmx|ept|vpid" /proc/cpuinfo
-
-# 关键特性解读:
-# vmx          - Intel VT-x支持
-# ept          - Extended Page Tables
-# vpid         - Virtual Processor ID (避免TLB flush)
-# ept_ad       - EPT Accessed/Dirty位
-# flexpriority - TPR Shadow (灵活优先级)
-# vnmi         - 虚拟NMI
-
-# 实验 2: 查看 KVM 模块参数
-for f in /sys/module/kvm_intel/parameters/*; do
-    echo "$(basename $f) = $(cat $f 2>/dev/null)"
-done
-
-# 实验 3: ftrace 追踪 VM-Exit
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_exit/enable
-echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_entry/enable
-cat /sys/kernel/debug/tracing/trace_pipe
-```
-
-### 关键 tracepoints 列表
-```bash
-# 列出所有KVM tracepoints
-ls /sys/kernel/debug/tracing/events/kvm/
-
-# 核心tracepoints:
-# kvm_entry          ← VM-Entry (进入Guest前)
-# kvm_exit           ← VM-Exit (退出原因+qualification)
-# kvm_inj_virq       ← 虚拟中断注入
-# kvm_page_fault     ← 页错误 (GPA + error_code)
-# kvm_msr            ← MSR读写
-# kvm_cpuid          ← CPUID处理
-# kvm_apic           ← APIC操作
-# kvm_eoi            ← EOI处理
-```
-
-### ftrace 函数追踪
-```bash
-# 追踪vmx_vcpu_run函数调用链
-echo function > /sys/kernel/debug/tracing/current_tracer
-echo vmx_vcpu_run > /sys/kernel/debug/tracing/set_ftrace_filter
-echo 1 > /sys/kernel/debug/tracing/tracing_on
-
-# 运行一个VM然后查看结果
-cat /sys/kernel/debug/tracing/trace
-
-# 恢复
-echo nop > /sys/kernel/debug/tracing/current_tracer
-echo > /sys/kernel/debug/tracing/set_ftrace_filter
-echo 0 > /sys/kernel/debug/tracing/tracing_on
-```
-
-## 可运行示例 (动手实践)
-
-> 参考 Hypervisor 101 in Rust 模式：每学完一个概念，就运行对应示例验证
-
-### 示例1: VMX能力检测 (安全入门)
-
-```bash
-cd ../../examples/minimal-vmx/vmx-info/
-make
-sudo insmod vmx-info.ko
-dmesg | tail -30    # 查看CPU虚拟化能力
-sudo rmmod vmx-info
-```
-
-这个模块 **不会执行VMXON**，只读取MSR报告CPU的虚拟化能力。
-对应源码: `vmx_hardware_setup()` 中的特性检测逻辑。
-
-### 示例2: KVM API完整演示
-
-```bash
-cd ../../examples/kvm-api-demo/
-make
-sudo ./kvm-demo     # 创建VM、设置vCPU、运行Guest代码
-```
-
-这个程序完整演示了 `ioctl(KVM_CREATE_VM)`, `ioctl(KVM_CREATE_VCPU)`, `ioctl(KVM_RUN)` 的用法。
-对应源码: `kvm_dev_ioctl()` → `kvm_vcpu_ioctl()` → `vcpu_run()` 的完整路径。
-
-### 示例3: 用ftrace观察示例运行
-
-```bash
-# 开启KVM tracepoints
-echo 1 > /sys/kernel/debug/tracing/events/kvm/enable
-
-# 运行kvm-demo，同时观察trace输出
-cat /sys/kernel/debug/tracing/trace_pipe &
-sudo ./kvm-demo
-# 你应该能看到 kvm_entry, kvm_exit 等事件
-```
-
-## 验证清单
-
-完成后确认能回答：
-- [ ] `vt_x86_ops` 包含哪些关键回调？它们分别在什么时候被调用？
-- [ ] `vmx_hardware_setup()` 检测了哪些CPU特性？如何禁用不支持的特性？
-- [ ] `vmx_vcpu_run()` 的完整执行流程？VMENTER在哪里发生？
-- [ ] VM-Exit后 `vmx_handle_exit()` 如何根据exit_reason分发处理？
-- [ ] `struct vcpu_vmx` 中 `vmcs01` 和 `loaded_vmcs` 的关系？
-- [ ] VMCS的Guest State和Host State分别保存什么？何时加载？
-- [ ] EPT Pointer在VMCS中如何配置？与kvm->arch.eptp的关系？
+> VMCS 完整字段布局见旧版讲义存档（git 历史）；关键控制字段在 annotations §4/§5 精读。
 
 ---
 
 ## 🔍 VMM视角对比
 
-### 用户态VMM vs KVM内核态实现
-
-| 方面 | 用户态VMM (QEMU) | KVM内核态 |
+| 方面 | 用户态 VMM (QEMU) | KVM 内核态 |
 |------|------------------|-----------|
-| **VMCS管理** | ioctl(KVM_SET_SREGS)等间接设置 | 直接`vmcs_write()`，零系统调用开销 |
-| **VM-Entry/Exit** | ioctl(KVM_RUN)返回到用户态 | `vmx_vcpu_run()`内核态循环，快速路径无切换 |
-| **VM-Exit处理** | 每次VM-Exit都返回用户态 | 简单VM-Exit（HLT、外部中断）内核态直接处理 |
-| **寄存器同步** | 通过ioctl读取/设置 | 直接使用vmcs_read/vmcs_write |
+| VMCS 管理 | ioctl(KVM_SET_SREGS) 等间接设置 | 直接 `vmcs_write()`，零系统调用 |
+| VM-Entry/Exit | ioctl(KVM_RUN) 返回用户态 | `vmx_vcpu_run()` 内核态循环 |
+| VM-Exit 处理 | 每次回用户态 | 简单 exit（HLT/外部中断）内核态直接处理 |
+| 寄存器同步 | ioctl 读/设 | 直接 vmcs_read/vmcs_write |
 
-### 关键差异：VM-Exit处理路径
-
-```
-用户态VMM:
-  Guest → VM-Exit → 内核态 → 用户态(QEMU) → 内核态 → Guest
-  每次VM-Exit: 4次模式切换
-
-KVM内核态:
-  Guest → VM-Exit → 内核态处理 → Guest
-  快速路径: 2次模式切换 (减少50%)
-```
-
-### 为什么KVM要在内核态处理部分VM-Exit？
-
-1. **性能**：避免用户态/内核态切换开销（~1μs/次）
-2. **延迟**：减少VM-Exit到VM-Entry的延迟
-3. **并发**：多个vCPU可以并发处理VM-Exit
+**为什么这样分工**：模式切换有成本（root↔non-root + 用户↔内核）。把能在内核态闭环的
+VM-Exit 留在内核（快速路径），只把需要设备模拟的 exit 回 QEMU（慢速路径）——
+这是"速度 vs 控制权"权衡在 exit 处理上的延伸。量化开销见 phase10（本章不复制数字）。
 
 ---
 
-## ⚡ 性能优化技术
+## 📖 问题链精读入口
 
-### 1. VPID (Virtual Processor ID)
+> 完整链 + 答案在 annotations.md 各节；这里给入口与关键引申。
 
-**问题**：VM-Entry/Exit时需要刷新TLB，导致性能下降
-
-**解决**：VPID为每个vCPU分配唯一ID，避免TLB刷新
-
-```c
-/* vmx_hardware_setup() 中检测VPID支持 */
-if (!cpu_has_vmx_vpid() || !cpu_has_vmx_invvpid())
-    enable_vpid = 0;
-```
-
-**配置**：
-```bash
-# 查看是否启用
-cat /sys/module/kvm_intel/parameters/vpid
-# 输出: Y (启用) 或 N (禁用)
-
-# 手动启用 (需要重新加载模块)
-modprobe -r kvm_intel
-modprobe kvm_intel vpid=1
-```
-
-**效果**：减少VM-Entry开销10-15%
-
-### 2. EPTP Switching
-
-**问题**：多VM切换时需要切换EPT页表
-
-**解决**：使用VMCS中的EPT_POINTER字段，快速切换
-
-```c
-/* vmx_vcpu_run() 中加载EPT */
-if (kvm->arch.eptp != vmx->loaded_vmcs->eptp) {
-    vmcs_write64(EPT_POINTER, kvm->arch.eptp);
-    vmx->loaded_vmcs->eptp = kvm->arch.eptp;
-    /* 可能需要INVEPT刷新TLB */
-}
-```
-
-**优化**：使用INVEPT_SINGLE_CONTEXT代替INVEPT_ALL_CONTEXTS
-
-### 3. VMCS Shadow
-
-**问题**：嵌套虚拟化时，L1 VMM频繁读写VMCS触发VM-Exit
-
-**解决**：使用VMCS Shadow，L1 VMM直接读写shadow，减少VM-Exit
-
-```c
-/* vmx_create_vcpu() 中分配VMCS shadow */
-if (nested) {
-    vmx->nested.vmcs02.vmcs_shadow = alloc_vmcs_shadow();
-    vmcs_write64(VMCS_LINK_POINTER, __pa(vmcs_shadow));
-}
-```
-
-**效果**：嵌套虚拟化性能提升20-30%
+| annotations 节 | 入口问题 | 关键引申问题 | 源码入口 |
+|---------------|---------|-------------|---------|
+| §1 VMX 架构分层 | KVM 怎么把通用层和 VMX 硬件接起来？ | 为什么用回调表而不是直接调用？ | `vt_x86_ops` — `vmx/main.c` |
+| §2 Entry/Exit 汇编 | VMENTER 在哪发生？ | 为什么用汇编而不是 C？ | `vmx_vcpu_run` — `vmx/vmx.c` |
+| §3 VM-Exit 分发 | exit 怎么找到处理函数？ | 快速路径 vs 慢速路径怎么分？Bus lock 为什么回用户态？ | `vmx_handle_exit` — `vmx.c:6615` |
+| §4 vcpu_vmx 结构 | vmcs01 和 loaded_vmcs 什么关系？ | 嵌套时为什么要多个 VMCS？ | `struct vcpu_vmx` — `vmx/vmx.h` |
+| §5 特性检测 | 硬件支持的特性怎么按依赖裁剪？ | 为什么 EPT 要四个条件全满足？ | `vmx_hardware_setup` — `vmx.c:8404` |
+| §6-8 参数/初始化/数据结构 | 模块参数怎么映射到特性开关？ | （接 §5） | `vmx.c` 模块参数 |
 
 ---
 
+## 🔬 实践练习
 
+5 个实验串成取证链（详见 [`practice/README.md`](practice/README.md)，五段式 §3.5）：
+
+| 编号 | 验证的理论 | 预测 | 入口 |
+|------|-----------|------|------|
+| ex1 | VMX capability MSR 编码（§5） | 7 个 MSR 的 allowed-0/1 解出特性依赖链 | `practice/ex1-vmx-verify.c` |
+| ex2 | MSR Bitmap 逐 MSR 拦截（cpu-virt §2） | 透传 MSR 无 kvm_msr trace，拦截的有 | `practice/ex2-cpuid-fault.c` + `trace-msr-access.sh` |
+| ex3 | VM-Exit 快/慢路径（§3） | 不同负载 exit reason 分布不同 | `practice/ex3-msr-test.c` + `profile-vmexit.sh` |
+| ex4 | CPUID 总 exit（cpu-virt §1，SDM 25.1.2） | Guest CPUID 必产生 kvm_cpuid trace | `practice/ex4-cpuid-analysis.c` |
+| ex5 | halt-polling 自适应（phase0 §7） | 四档 poll 参数改变 halt 延迟/CPU 占用 | `practice/ex5-vmexit-overhead.c` + `trace-vcpu-sched.sh` |
+
+---
+
+## ⚡ 性能与测量
+
+- 跨 phase 实测结论与分级：[`../phase10-performance/index.md`](../phase10-performance/index.md)
+- 测量方法：[`../phase10-performance/measurement.md`](../phase10-performance/measurement.md)
+- 模块参数（存在吗/运行时可改吗）：[`../phase10-performance/parameters.md`](../phase10-performance/parameters.md)
+- 本章现状：VPID 收益、VMCS Shadow 收益、VM-Exit 往返开销**无本仓实测**。
+  旧讲义的 "VPID 10-15%"、"VMCS Shadow 20-30%"、"~1μs/次" 是无出处推算，
+  已登记 corrections 待审计，不得当实测引用。VM-Exit 微基准见 phase10 §2.2（B 级）。
+
+---
+
+## ⚠️ 陷阱与勘误
+
+1. **CPUID 不是"可拦截可不拦截"**：CPUID 在 non-root **无条件** VM-Exit（SDM 25.1.2），
+   不存在 "CPUID exiting" 控制位（Secondary Exec bit12 是 INVPCID）。详见 cpu-virtualization.md §1.1。
+2. **AGENTS.md #7**：启动 VM 必须 `-enable-kvm -cpu host`，否则静默回退 TCG，
+   所有 KVM 追踪实验得出"没有 VM-Exit"的错误结论。
+3. **tracefs 全局状态**（AGENTS.md 硬约束 2）：`set_event`/`set_ftrace_filter`/`set_event_pid`
+   带 O_TRUNC 的写清掉全部配置；加用 `>>`，清场显式写。
+
+- 本章勘误：[`corrections.md`](corrections.md)
+
+---
+
+## ✅ 阶段检验清单
+
+操作性：
+
+- [ ] `vt_x86_ops` 关键回调及调用时机？
+- [ ] `vmx_hardware_setup()` 检测哪些特性、怎么禁用不支持的？
+- [ ] `vmx_vcpu_run()` 完整流程？VMENTER 在哪？
+- [ ] `vmx_handle_exit()` 怎么按 exit_reason 分发？
+- [ ] `vmcs01` 和 `loaded_vmcs` 关系？Guest/Host State 何时加载？
+- [ ] EPT Pointer 在 VMCS 怎么配置？与 kvm->arch.eptp 关系？
+
+深度自测（答不出 = 没学会）：
+
+- [ ] **反事实**：如果没有 VMX（只有 ring3），为什么纯 trap-and-emulate 虚拟化 x86 不完备？
+- [ ] **不可简化**：MSR Bitmap 为什么不能省成"全拦截"或"全透传"一个开关？
+- [ ] **推导**：从"模式切换有成本"推出"为什么多数 VM-Exit 要留在内核态快速路径"。
+
+---
+
+## 🚀 下一步
+
+- **Phase 2（内存虚拟化）**：EPT——VT-x 解决 CPU，EPT 解决内存地址翻译
+- **本章进阶**：嵌套虚拟化（vmcs02/VMCS Shadow）、vCPU 唤醒竞态（cpu-virtualization.md）

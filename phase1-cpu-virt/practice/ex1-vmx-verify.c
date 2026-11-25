@@ -413,9 +413,13 @@ int main(void)
     uint64_t val;
 
     printf("================================================================\n");
-    printf("  Exercise 1: VMX Capability 深度解码\n");
-    printf("  连接: ../annotations.md §5「VMX 特性检测」\n");
-    printf("  源码: arch/x86/kvm/vmx/vmx.c:2590 — setup_vmcs_config()\n");
+    printf("  ex1 验证 VMX capability MSR 编码与特性依赖链\n");
+    printf("================================================================\n");
+    printf("【理论】annotations §5：vmx_hardware_setup 读 capability MSR 后按依赖裁剪。\n");
+    printf("        SDM Vol.3 Appendix A：每个控制 MSR 高32位=allowed-1，低32位=allowed-0。\n");
+    printf("【预测】P1: 7 个 MSR 可解出 allowed-0/1 特性位。\n");
+    printf("        P2: VMX_BASIC bit55=1 ⟺ true-CTLS MSR(0x48D) 存在（结尾自动对照）。\n");
+    printf("【操作】只读 /dev/cpu/0/msr，不写任何 MSR。\n");
     printf("================================================================\n\n");
 
     /* Step 1: CPUID leaf 1 — 检查 VMX 支持 */
@@ -535,8 +539,6 @@ int main(void)
     }
     printf("\n");
 
-    close(msr_fd);
-
     /* Summary */
     printf("================================================================\n");
     printf("  特性依赖链总结\n");
@@ -567,9 +569,24 @@ int main(void)
     printf("          要求: VIRTUAL_TPR (PROCBASED bit 21)\n");
     printf("\n");
 
+    /* 【对照】P2 自动验证：VMX_BASIC bit55=1 ⟺ true-CTLS MSR 0x48D 可读 */
     printf("================================================================\n");
-    printf("  ✓ VMX Capability 深度解码完成\n");
+    printf("【对照】P2: VMX_BASIC bit55=1 ⟺ true-CTLS MSR(0x48D) 存在\n");
+    {
+        uint64_t basic = 0, truectls = 0;
+        int has_basic = (read_msr(msr_fd, 0x480, &basic) == 0);
+        int bit55 = has_basic ? (int)((basic >> 55) & 1) : 0;
+        int has_true = (read_msr(msr_fd, 0x48D, &truectls) == 0);
+        if (!has_basic)
+            printf("  INCONCLUSIVE: 0x480 读取失败\n");
+        else if (bit55 == has_true)
+            printf("  PASS: bit55=%d, 0x48D 可读=%d — 一致\n", bit55, has_true);
+        else
+            printf("  FAIL: bit55=%d 但 0x48D 可读=%d — 与 SDM Appendix A.1 不符\n", bit55, has_true);
+    }
+    printf("【反馈】依赖链成立 → ex2 验证 MSR Bitmap 逐 MSR 拦截（trace-msr-access.sh）\n");
     printf("================================================================\n");
 
+    close(msr_fd);
     return 0;
 }

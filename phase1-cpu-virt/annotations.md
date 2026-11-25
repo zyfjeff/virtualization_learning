@@ -2,10 +2,21 @@
 
 > 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
 > 行号可能随版本变化，用函数名 grep 定位更可靠。
+>
+> **体例：问题链**（COURSE_FRAMEWORK §3.2）。每节开头给问题链——
+> 先带着问题读代码，再对答案；引申问题从上一个答案长出来，链尾指向下一节/实验。
 
 ---
 
 ## 1. VMX 架构分层
+
+**问题链**（入口来自第一性原理："硬件辅助 trap-and-emulate 怎么落到代码？"）：
+
+1. 入口：KVM 怎么把 x86 通用逻辑和 VMX 硬件 specifics 解耦？→ 下方回调表
+2. 引申：为什么用 `kvm_x86_ops` 回调表而不是直接调 VMX 函数？
+   （AMD SVM 要共用同一套 x86 通用层——抽象是为了多厂商）
+3. 引申（反事实）：如果去掉这层抽象，KVM 支持 AMD 要改多少？→ 体会接口边界
+4. 链尾：回调表里 `vcpu_run` 怎么真正进 Guest？→ §2（Entry/Exit 汇编）
 
 ### Q: KVM 如何把「x86 通用逻辑」和「Intel VMX  specifics」解耦？
 
@@ -174,6 +185,16 @@ field。`__vmx_vcpu_run` 检测到后跳到错误处理路径，把 `vmx->fail =
 ---
 
 ## 3. VM-Exit 分发
+
+**问题链**（入口来自 VMM 对比："为什么多数 exit 不回用户态？"）：
+
+1. 入口：VM-Exit 怎么找到对应处理函数？→ `vmx_handle_exit()`（vmx.c:6615）
+2. 引申：`__vmx_handle_exit()` 怎么按 exit_reason 分发？快速路径 vs 慢速路径怎么分？
+   （能内核态闭环的留内核，需要设备模拟的才回 QEMU）
+3. 引申（反事实）：Bus Lock 检测为什么**必须**退出到用户态？
+   （`bus_lock_detected` → KVM_EXIT_X86_BUS_LOCK，让 QEMU 处理——内核态闭环不了）
+4. 链尾：exit 处理依赖哪些 vCPU 状态？→ §4（vcpu_vmx 结构）；
+   真机看 exit 分布 → 实验 ex3（profile-vmexit.sh）
 
 ### Q: VM-Exit 是怎么找到对应处理函数的？
 
@@ -381,6 +402,16 @@ struct pi_desc {
 ---
 
 ## 5. VMX 特性检测
+
+**问题链**（入口来自第一性原理："硬件能力怎么变成 KVM 的可用特性？"）：
+
+1. 入口：`vmx_hardware_setup()` 怎么决定启用哪些特性？→ vmx.c:8404
+2. 引申：为什么先读 capability MSR 再"按依赖裁剪"？
+   （硬件告诉你支持什么，KVM 按依赖链决定启用什么）
+3. 引申（反事实）：EPT 为什么要 ept/4levels/mt_wb/invept_global **四个条件全满足**？
+   缺一个会怎样？（缺 invept_global 无法安全失效 → 宁可不用 EPT）
+4. 链尾：这些特性开关怎么暴露成运行时参数？→ §6；
+   真机解码 capability MSR → 实验 ex1（ex1-vmx-verify）
 
 ### Q: `vmx_hardware_setup()` 怎么决定启用哪些特性？
 
