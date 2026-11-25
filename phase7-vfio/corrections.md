@@ -657,3 +657,28 @@ static bool vmx_can_use_vtd_pi(struct kvm *kvm)
   - `include/linux/dmar.h:201` —— `struct irte` 位域定义
 - 规范：intel-vtd.pdf（Section 9.9 Remapped IRTE / 9.10 Posted IRTE）；
   intel-vmx.pdf（Section 30.6 Posted-Interrupt Processing）；PCIe Base Spec（ACS）
+
+---
+
+## 勘误 10：性能优化节无出处数字 + 疑似伪代码（2026-11-25 登记，待审计）
+
+旧 README「⚡ 性能优化技术」含"IOTLB 缓存 DMA 负载 20-30%""DMA 批处理 10-15%"
+无本仓实测出处；示例代码 `iommu_enable_iotlb_cache()` / `VTD_CAP_IOTLB_CACHE`
+未在内核核实，疑似伪代码（AGENTS.md 要求代码示例来自实际源码）。
+
+**已做**：README 性能节改「⚡ 性能与测量」纯指针（→ phase10），移除未核实代码，
+数字标待审计；机制（IOTLB 缓存/批处理/中断亲和性）保留为定性描述。
+**待做**：收益数字按 measurement.md 实测分级；IOTLB 缓存真实实现查
+`drivers/iommu/intel/`（iova 缓存/rwsem）后补 annotations。
+
+**状态**: ⚠️ 待审计
+
+## 勘误 11：practice README 标题旧编号（2026-11-25 已修）
+
+`practice/README.md:1` "Phase 6 实践练习" → "Phase 7"。已同步修正。
+
+## 结构变更记录（2026-11-25 框架拆分，非错误）
+
+README >1000 行强制拆分：§1.4 group 划分 → [group-division.md](group-division.md)，
+§1.5 ACS/ATS → [acs-ats.md](acs-ats.md)，内容未改。README 保留同标题锚点 stub
+（`#15-acs-与-ats直通依赖的两个-pcie-能力` 等跨章引用不变）。

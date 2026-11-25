@@ -1,10 +1,22 @@
-# Phase 6 实践练习
+# Phase 7 实践练习 — 理论取证链
 
+> 五段式（COURSE_FRAMEWORK §3.5）：理论 → 预测 → 操作 → 对照 → 反馈。
 > VFIO 设备直通实践。练习 1、2 在**宿主上直接运行**，不需要 Guest ——
 > 目的是看清 VFIO 与 IOMMU 子系统的交互，Guest 只是这套机制的使用者。
 > 练习 3 分两段：前半段（VFIO 侧建立 Remapped IRTE）仍是纯宿主，
 > 后半段（IRTE 转为 Posted 模式）**必须真起一个带直通设备的 VM**，因为
 > Posted 化的触发方 KVM 只在有 irqfd 消费者时才出现。
+>
+> ⚠️ **安全纪律（AGENTS.md #15/#16）**：unbind/复位前确认无在途 I/O、无 opener；
+> 绝不通过 /dev/mem 摸驱动着的设备 BAR；实验结束恢复 vfio-pci 安全绑定。
+
+## 📋 取证总览
+
+| 编号 | 验证的理论 | 预测 | 对照判据 |
+|------|-----------|------|---------|
+| 1 | DMA ownership 认领时机（corrections 勘误 1） | 绑 vfio-pci 成功但 SET_CONTAINER 才认领；组内有普通驱动则 -EPERM | kprobe 时序对照 |
+| 2 | IOVA→HPA 映射（README §2） | VFIO_IOMMU_MAP_DMA 建 IOMMU 页表，页大小按对齐选 | 映射前后页表对照 |
+| 3 | MSI-X Posted 化（README §3.3） | 有 irqfd 消费者时 IRTE IM=1，宿主 IRQ 计数停涨 | IRTE 位 + /proc/interrupts 对照 |
 
 ---
 
