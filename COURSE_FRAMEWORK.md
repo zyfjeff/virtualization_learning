@@ -3,11 +3,11 @@
 > 本文是**课程内容结构**的唯一来源：所有 phase 复用同一套学习框架。
 > AI 协作规范、事实核查流程、全局已知陷阱仍以 `AGENTS.md` 为唯一来源，本文不重复。
 >
-> 状态：深度修订 + 试点完成（2026-11-25）。P0 事实修复已提交（实际修复 27 个文件，
-> 多于 §1.2 初查清单）；phase4 试点已按 §4 骨架重组。
+> 状态：**全部 12 phase 改造完成**（2026-11-25）。P0 事实修复（27 文件）→ phase4 试点
+> → P2 知识类铺开（phase1/3/6/5/0/2/7/8）→ P3 横切/毕业类（phase9/10/11）均已提交。
 > **2026-11-25 深度修订**：应读者要求，把第一性原理（§3.1）与问题链（§3.2–3.3）
-> 升级为框架核心机制——结构统一只是骨架，深度才是课程的本体；phase4 试点已同步落地。
-> 迁移须按 §8 计划逐 phase 执行，结构迁移**内容只搬不改**，深度注入是新增内容，
+> 升级为框架核心机制——结构统一只是骨架，深度才是课程的本体。
+> 后续维护按本框架执行，结构迁移**内容只搬不改**，深度注入是新增内容，
 > 技术结论变动必须走 AGENTS.md 的事实核查流程。
 
 ---
@@ -321,10 +321,10 @@ corrections.md 必备（已有，含事故复盘）。
 | 10 | ✓ | ✓ | ✓ | ✓ | —职责声明 | — | — | ✓E1–E5 | ✓本体 | ✓ | ✓ | △ | 标题旧编号 |
 | 11 | ✓ | ✓ | ✓ | ✓导航 | —场景 | — | — | △eN→exN | ✓指针 | ✓ | ✗ | ✓关联 | 标题旧编号+3处旧交叉引用（P0 已修） |
 
-**深度维度（2026-11-25 修订新增）**：第一性原理四问与问题链目前**全库缺失**，
-但有两个现成种子可以升级而非从零写：phase3 README 的"围绕主流程的 8 个问题"
-（问题驱动结构的雏形）、phase2/4 annotations 的 Q&A 体例（链式化的基础）。
-phase4 试点已示范完整落地（README 四问 + 问题链入口 + annotations 链式块）。
+**深度维度（2026-11-25 修订新增，✅ 已全库落地）**：第一性原理四问与问题链已注入全部
+12 phase。种子升级：phase3 README 的"8 问"升级为问题链入口表、phase2/4 annotations
+的 Q&A 体例链式化。各 phase README 含核心问题 + 第一性原理四问 + 问题链入口 + ≥3 深度自测；
+annotations 关键节加问题链块；practice 改五段式取证链。
 
 ---
 
@@ -340,14 +340,14 @@ phase4 试点已示范完整落地（README 四问 + 问题链入口 + annotatio
 3. phase2 archive/ 悬空引用处理。
 4. 以上记入对应 corrections.md（phase6 先建占位）。
 
-### P1 — 试点（phase4）（✅ 已完成 2026-11-25，待验收）
+### P1 — 试点（phase4）（✅ 已完成并验收 2026-11-25）
 
 选 phase4：体量小（228 行）、骨架最接近、改名无外部引用。
 按 §4 补齐 VMM对比 / 陷阱勘误 / 性能指针 / 下一步，主题文档改名
 （`ACS_UF_EXPLANATION.md` → `acs-upstream-forwarding.md`、`ATS_EXPLANATION.md` → `ats.md`），
 practice 报告（PHASE4_SUMMARY.md）移入 reports/。**试点验收后冻结骨架，再铺开。**
 
-### P2 — 知识类铺开（每 phase 两条工作线，各自成 commit）
+### P2 — 知识类铺开（✅ 已完成 2026-11-25，每 phase 一个 commit）
 
 顺序（先易后难）：phase1 → phase3 → phase6 → phase5 → phase0 → phase2 → phase7 → phase8。
 
@@ -370,11 +370,20 @@ practice 报告（PHASE4_SUMMARY.md）移入 reports/。**试点验收后冻结�
 - phase8：`vmclock-phase1-analysis.md` → `vmclock-analysis-stage1.md`（仅 README 引用）。
 - phase11：practice `eN-*` → `exN-*`（8 处内部引用同步）。
 
-### P3 — 横切/毕业类对齐 + 收尾
+### P3 — 横切/毕业类对齐 + 收尾（✅ 已完成 2026-11-25）
 
-- phase9/10/11 按 §6 变体对齐 README 骨架。
-- 根 README 目录树、AGENTS.md 增加本文指针；本文状态从"设计稿"改"已实施"。
-- 全局验收：每个 phase 对照 §7 表逐项打勾；`grep` 全库无悬空文件链接。
+- phase9/10/11 按 §6 变体对齐 README 骨架（commit `011f540`）。
+- 根 README 目录树、AGENTS.md 已挂本文指针；本文状态改"已实施"。
+- 全局验收：各 phase README 已对齐骨架；巨石 README 已拆分
+  （phase0 1169→192、phase5 1104→210、phase7 2213→893、phase8 2914→537）；
+  性能无出处数字各章登记待审计；phase11 practice eN→exN。
+
+### 遗留待办（后续维护）
+
+- 各章性能数字**待实测审计**（corrections 已登记）：按 measurement.md 实测后汇入 phase10 index 分级。
+- phase4 勘误 12（header type bit 非可靠 bridge 判据）待核查内核 hdr_type/class 调和。
+- phase7 IOTLB 缓存真实实现待查 `drivers/iommu/intel/` 补 annotations。
+- 各 phase 实验的 Guest 侧五段式取证可在实际 VM 环境进一步跑通验证。
 
 ### 不做的事
 
