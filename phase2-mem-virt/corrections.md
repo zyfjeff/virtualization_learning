@@ -9,5 +9,6 @@
 - **位置**: 根 `README.md` 项目结构树 phase2 块
 - **错误**: 列出 `└── archive/ ← 已归档的过程性文档`，但 `phase2-mem-virt/archive/`
   目录不存在（`ls` 验证）。
-- **正确**: 删除该行。archive/ 按需创建（COURSE_FRAMEWORK.md §5），不预列。
+- **正确**: 删除该行。2026-11-25 起不再设 archive/ 目录（git 历史即归档，
+  COURSE_FRAMEWORK.md §5）。
 - **已同步修正**: 根 `README.md`

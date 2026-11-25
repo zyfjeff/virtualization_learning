@@ -7,8 +7,7 @@ scripts/
 ├── vm/        构建与启动实验 VM
 ├── trace/     宿主侧观测（ftrace / perf）
 ├── images/    构建产物（已 gitignore）
-├── shared/    9p 共享暂存区 → guest /mnt/shared
-└── archive/   已弃用脚本与历史文档
+└── shared/    9p 共享暂存区 → guest /mnt/shared
 ```
 
 ---
@@ -211,12 +210,6 @@ zcat images/initramfs-allinone.img | cpio -t | grep '^init$'
 ### 镜像 / 内核不存在
 
 按报错提示跑对应的构建脚本；`boot-vm.sh` 会直接告诉你该跑哪一个。
-
----
-
-## archive/
-
-存放已弃用的脚本与历史文档，**不要用于新实验**。弃用原因见 [archive/README.md](archive/README.md)。
 
 ---
 

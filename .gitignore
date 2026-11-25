@@ -53,11 +53,6 @@ phase10-performance/practice/bench/
 # perf 运行时采集数据（perf.data / perf.data.guest / perf.data.old 等）
 perf.data*
 
-# 旧 9p 暂存区归档（2026-06 遗留，已被 scripts/shared/ 取代；只跟踪源码与说明）
-scripts/archive/legacy-shared/*
-!scripts/archive/legacy-shared/*.c
-!scripts/archive/legacy-shared/README.md
-
 # 9p 共享暂存区（只放拷进 guest 的产物）
 scripts/shared/*
 !scripts/shared/.gitkeep

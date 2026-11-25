@@ -1,7 +1,7 @@
 # Phase N 实践练习
 
 > 统一学习循环第 5 步（动手验证）。实验编号 `exN-<slug>` 连续；
-> 实验报告/记录放 `reports/`，被取代的过程性文档放 `../archive/`。
+> 实验报告/记录放 `reports/`；被取代的文档直接删除（git 历史即归档，不设 archive/）。
 > 测量纪律（重复/噪声/清场）遵循 `../../phase10-performance/measurement.md`。
 
 ## 📋 实验总览

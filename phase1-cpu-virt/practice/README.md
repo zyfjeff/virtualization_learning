@@ -20,6 +20,11 @@
 | 4 | CPUID 虚拟化双机制对比 | 静态过滤 vs 动态拦截，KVM 如何选择？ | §5, annotations §2 | Guest + 宿主 |
 | 5 | vCPU 调度与 Halt-Polling 观测 | halt-polling 如何在延迟和 CPU 占用间权衡？ | phase0 §7 halt-polling | 宿主 |
 
+> **历史版本留档**：`ex5-vmexit-overhead-202606.c` 是 2026-06 的旧版 ex5
+> （比现行版多 RDMSR IA32_TSC/IA32_EFER 两组测试），是
+> `../../phase10-performance/index.md` §2.2 B 级微基准数字的实际出处。
+> 不参与 `make`，仅作出处保留；重测请按 phase10 measurement.md 重新设计实验。
+
 ---
 
 ## 环境准备

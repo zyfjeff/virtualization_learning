@@ -87,8 +87,7 @@ kvm-study/
 │   ├── vhost-user-protocol-latest.md        ← 协议字段速查
 │   ├── vhost-user-new-features-factcheck-v2.md ← 新特性核查(QEMU 11.1.0+DPDK)
 │   ├── vhost-user-new-features-usecases.md  ← 新特性使用场景
-│   ├── practice/                ← 全部练习与实测数据
-│   └── archive/                 ← 已被取代的过程性文档
+│   └── practice/                ← 全部练习与实测数据
 ├── phase7-vfio/                 ← 第七阶段：VFIO设备直通
 │   ├── README.md                ← VMM对比 + ACS/ATS + IOTLB/DMA批处理优化
 │   ├── corrections.md           ← 勘误
@@ -154,8 +153,7 @@ kvm-study/
     │   └── setup-vfio-vm.sh         ← VFIO 设备直通 VM
     ├── trace/                   ← 宿主侧观测 (trace-vmexit.sh, kvm-overview.sh 等)
     ├── images/                  ← 构建产物（已 gitignore）
-    ├── shared/                  ← 9p 共享暂存区 → guest /mnt/shared
-    └── archive/                 ← 已弃用脚本与历史文档
+    └── shared/                  ← 9p 共享暂存区 → guest /mnt/shared
 ```
 
 ## 实验 VM 环境

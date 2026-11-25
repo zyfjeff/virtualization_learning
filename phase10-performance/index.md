@@ -101,7 +101,7 @@
 | 项 | 内容 |
 |---|---|
 | 数字 | CPUID 约 **1522 ns**、RDTSC 约 **10 ns**（`clock_gettime` 包裹的 ns-per-op 微基准） |
-| 出处 | `../scripts/archive/legacy-shared/ex5-vmexit-overhead.c`（2026-11-25 自根目录 `shared/` 归档；注意与 phase1 practice 同名源码**不是同一版本**）；结论记录在 `../phase1-cpu-virt/practice/SUMMARY.md` |
+| 出处 | `../phase1-cpu-virt/practice/ex5-vmexit-overhead-202606.c`（2026-06 旧版 ex5，比现行版多 RDMSR TSC/EFER 测试；原在根目录 `shared/`，2026-11-25 移入 phase1 practice 留档）；结论记录在 `../phase1-cpu-virt/practice/SUMMARY.md` |
 | 评级说明 | 真跑过，但**无对照组、单次运行、无离散度**，且把"VM-Exit 往返"与"指令本身开销"混在一个数里 → 只可引用量级 |
 
 ---
@@ -114,7 +114,7 @@
 | 主题 | 流传的说法 | 现状 | 待验证于 |
 |---|---|---|---|
 | Posted Interrupts 收益 | "延迟 <1 µs、吞吐提升 10–100 倍" | `../phase5-interrupts/posted-interrupts.md` 有机制详解（机制部分有规范支撑，见下 D 节勘误），但**收益倍数无任何实测** | `../phase5-interrupts/practice/ex4-pi-vs-remapped.sh` **已有脚本但结果未回写** → 优先补这个，不用新写 |
-| EPT 缺页快慢路径 | "快速路径 ~200 ns / 慢速 2–5 µs / RCU ~50 ns" | 反复出现在 `../phase2-mem-virt/tdp-mmu-concurrency.md` 与 `archive/` 多处，**互相复制、无出处** | `practice/bench-huge-dirty.md` + `bench-observer-cost.md` |
+| EPT 缺页快慢路径 | "快速路径 ~200 ns / 慢速 2–5 µs / RCU ~50 ns" | 反复出现在 `../phase2-mem-virt/tdp-mmu-concurrency.md` 等处，**互相复制、无出处** | `practice/bench-huge-dirty.md` + `bench-observer-cost.md` |
 | A/D 位与写保护 | "A/D 硬件置位 ~1 ns vs 写保护 ~200 ns" | `../phase2-mem-virt/ept-violation-handling.md`，推算值 | 同上 |
 | 内存类型延迟 | "WB / WT / UC 延迟表" | `../phase2-mem-virt/mmio-identification.md`，无实测 | — |
 | 各时钟源读取成本 | "PIT 1000 ns / HPET 500 / APIC 300 / TSC 20 / kvmclock 30" | `../phase8-timer-virt/README.md:1076-1114`，**无实测** | 移交 `../phase8-timer-virt/practice/`（时钟基准归 phase7） |

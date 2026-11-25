@@ -224,7 +224,6 @@ phaseN-slug/
 ├── corrections.md     # 勘误（所有 phase 必备，可先建占位；记录范围按 AGENTS.md
 │                      #   瘦身策略：概念性错误/独家复盘/待办三类，机械修复只走 git）
 ├── <topic>.md         # 深度主题文档：小写 kebab-case，名词短语
-├── archive/           # 已被取代的过程性文档（按需创建）
 └── practice/
     ├── README.md      # 实验总览表 + 环境准备 + 运行 + 清理纪律
     ├── exN-<slug>.sh  # 编号实验（shell / C 统一 exN- 前缀）
@@ -240,8 +239,9 @@ phaseN-slug/
    名字里的 "phase/step/stage" 一律写全（`vmclock-analysis-stage1.md`，不用 `vmclock-phase1-analysis.md`）。
 3. **实验**：`exN-<slug>`，编号从 1 连续。例外：phase10 的 `bench-*`（E1–E5）
    是跨章引用密集的实验名，**保留**，在 practice/README 里注明 exN ↔ EN 映射。
-4. **报告与脚本分离**：实验记录放 `practice/reports/`；被取代的环境状态/过程报告
-   放 `phaseN/archive/`。practice/ 根目录只放可运行材料与总览。
+4. **报告与脚本分离**：实验记录放 `practice/reports/`。practice/ 根目录只放可运行材料与总览。
+   **不设 archive/ 目录**（2026-11-25 起）：被取代的文档直接删除，**git 历史即归档**；
+   仍有引用价值的源码（如实测数字出处）移到所属 phase 的 practice/ 带日期留档。
 5. **改名前先查引用**：`grep -rn "<旧名>" --include="*.md" .`，同步更新全部引用
    （含 AGENTS.md 里的锚点链接），改名与引用更新同一个 commit。
 6. **二进制不入库**：可由 Makefile 重建的 ELF/.o/.ko 一律 gitignore（2026-11-25 已清理）。
@@ -333,7 +333,7 @@ practice 报告（PHASE4_SUMMARY.md）移入 reports/。**试点验收后冻结�
 结构工作线内容：
 
 - 补齐缺失章节；缺 corrections.md 的建占位。
-- phase3：practice 报告分离（实验记录 → reports/，4 份重复环境状态报告 → archive/）。
+- phase3：practice 报告分离（实验记录 → reports/，4 份重复环境状态报告 → 删除，git 历史保留）。
 - phase0/5/6：性能章节数字审计（§1.3），改"性能与测量（指针）"。
 - phase0/5/7/8：README 拆分（>1000 行强制），深度内容移主题文档。
   phase7/8 是重活，各自可再拆成多个 commit（先拆文档、再补章节）。

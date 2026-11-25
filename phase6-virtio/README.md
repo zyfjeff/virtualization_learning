@@ -166,7 +166,6 @@ Phase 6 的正文按主题拆分，建议按下表顺序阅读：
 | [vhost-user-new-features-usecases.md](vhost-user-new-features-usecases.md) | 新特性的实际使用场景 |
 | `annotations.md` | 源码精读：vhost 关键路径逐行注解 |
 | `practice/` | ★ 全部实践练习与实测数据 |
-| `archive/` | 已被取代的过程性文档 |
 
 ---
 

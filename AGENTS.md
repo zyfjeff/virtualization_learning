@@ -30,7 +30,6 @@ examples/  notes/  scripts/  shared/
 | `scripts/trace/` | 宿主侧观测脚本（ftrace + perf） |
 | `scripts/images/` | 构建产物，已 gitignore |
 | `scripts/shared/` | 9p 共享暂存区 → guest `/mnt/shared` |
-| `scripts/archive/` | 已弃用脚本与历史文档，不要用于新实验 |
 
 入口文档：`scripts/README.md`。
 
