@@ -170,7 +170,7 @@ static int vfio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 声明此驱动自己管理 DMA，probe 时**不**占用 default domain（`owner_cnt` 不变）。
 DMA ownership 的实际认领推迟到 `VFIO_GROUP_SET_CONTAINER` 或 `VFIO_GROUP_GET_DEVICE_FD`。
 
-详见 phase6 corrections.md 勘误 1。
+详见本章 corrections.md 勘误 1。
 
 ---
 
@@ -468,7 +468,7 @@ KVM 侧:   irq_bypass_register_consumer()  → token = irqfd->eventfd
                            └→ modify_irte()  ← ★ IRTE 写成 Posted 模式
 ```
 
-详见 phase6 corrections.md 勘误 4。
+详见本章 corrections.md 勘误 4。
 
 ### Q: `kvm_vfio_update_coherency()` 做什么？
 
@@ -649,7 +649,7 @@ ret = iommu_group_claim_dma_owner(group->iommu_group, group);
 
 认领时如果同组有其他设备绑在普通驱动上，`owner_cnt > 0` → 返回 `-EPERM`。
 
-详见 phase6 corrections.md 勘误 1。
+详见本章 corrections.md 勘误 1。
 
 ### Q: 认领时的安全联锁？
 
@@ -680,7 +680,7 @@ static int __iommu_take_dma_ownership(struct iommu_group *group, void *owner)
 ```
 
 blocking domain 确保 ownership 转移期间 DMA 窗口始终关闭。
-详见 phase6 corrections.md 勘误 3。
+详见本章 corrections.md 勘误 3。
 
 ---
 
