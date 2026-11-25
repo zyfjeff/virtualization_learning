@@ -38,6 +38,7 @@ kvm-study/
 ├── COURSE_FRAMEWORK.md          ← ★ 统一课程框架：学习循环 + 章节骨架 + 迁移计划
 ├── templates/phase-template/    ← 各 phase 复用的 README/corrections/practice 模板
 ├── notes/                       ← 学习笔记汇总
+│   ├── README.md                ← 笔记索引
 │   ├── source-navigation.md     ← 源码导航图
 │   ├── debugging-guide.md       ← ★ KVM调试实战指南 (新增!)
 │   └── issue.md                 ← 早期学习笔记（EPT/VMX 主题清单，归档）
@@ -123,6 +124,7 @@ kvm-study/
 │   ├── corrections.md           ← 11条常见错误
 │   └── practice/                ← 3个场景实验
 ├── examples/                    ← 可运行示例代码 (★ 重点!)
+│   ├── README.md                ← 示例索引（配合 phase / 构建运行 / 安全提示）
 │   ├── kvm-api-demo/            ← KVM API用户空间演示 (C语言)
 │   │   ├── kvm-demo.c           ← ★ 完整VM生命周期 (make && ./kvm-demo)
 │   │   ├── kvm-demo-regs.c      ← ★ 寄存器操作演示 (make && ./kvm-demo-regs)

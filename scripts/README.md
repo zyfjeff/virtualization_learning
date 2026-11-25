@@ -69,6 +69,11 @@ ls -l /proc/$(pgrep -f '^qemu-system-x86_64')/fd | grep -c kvm   # > 0 表示走
 | `boot-vm.sh` | 启动实验 VM | - | qemu-system-x86 |
 | `setup-vfio-vm.sh` | 带 VFIO 设备直通的 VM（phase5/phase7） | - | qemu, vfio-pci |
 | `test-in-vm.sh` | VM 内跑的测试脚本 | - | - |
+| `test-vm-env.sh` | VM 环境自检 | - | - |
+| `vm-access.sh` / `vm-ssh-access.sh` | VM 访问辅助（历史工具，phase3 报告引用） | - | - |
+
+> 启动 VM 统一用 `boot-vm.sh`（任意 QEMU 参数走 `--qemu` 透传）。
+> 早期迭代调试脚本 `start_vm_*.sh` 已于 2026-11-25 清理（git 历史保留）。
 
 安装依赖：
 

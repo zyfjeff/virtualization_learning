@@ -232,7 +232,7 @@ mmio_caching=1         ← MMIO缓存（`0444` 只读，arch/x86/kvm/mmu/spte.c:
 
 ---
 
-## ★ Phase 9: 性能优化相关源码
+## ★ Phase 10: 性能优化相关源码
 
 ★ 本节只留"去哪找符号"的坐标。机制走读各有归属：halt-polling 在
 [`../phase0-kvm-framework/annotations.md`](../phase0-kvm-framework/annotations.md) §9，
@@ -277,7 +277,7 @@ arch/x86/kvm/trace.h          ← kvm_track_tsc, kvm_write_tsc_offset trace even
 
 ---
 
-## ★ Phase 10: 调试与测试相关源码
+## ★ Phase 11: 调试与测试相关源码
 
 ### Trace Events 定义位置
 ```
