@@ -1,285 +1,146 @@
 #!/usr/bin/env bash
-# ex3-acs-analysis.sh — ACS（Access Control Services）能力分析
+# ex3-acs-analysis.sh — 验证 ACS 三层判定（quirk → cap 掩码 → ctl 检查）
 #
-# 目标：
-#   1. 检查哪些设备支持 ACS
-#   2. 分析 ACS Control 寄存器中哪些位已启用
-#   3. 分析 ACS 对 IOMMU group 的影响
-#   4. 对比有/无 ACS 设备的 group 划分
+# 五段式（COURSE_FRAMEWORK §3.5）
 #
-# 连接 annotations.md：
-#   - §3「ACS 检查」— pci_acs_flags_enabled() 和 pci_acs_enabled() 的实现
-#   - §3「IOMMU group」— iommu_group_get_for_pci_dev() 的算法
-#   - basics.md §5 — PCIe 能力链表
-#   - CLAUDE.md 已知陷阱 #11 — ACS 判定的 quirk 层
+# 【理论来源】
+#   annotations.md §3 pci_acs_flags_enabled()（pci.c:3583）；
+#   AGENTS.md 陷阱 #11（quirk 优先 + 未声明算启用 + REQ_ACS_FLAGS=SV|RR|CR|UF）、
+#   #13（pci_enable_acs probe 时主动写 ACS Control）。
+#   规范：PCIe Spec §6.12（ACS 默认关闭，由软件启用；RCiEP 建议先过 TA）。
 #
-# 用法：
-#   sudo ./ex3-acs-analysis.sh
+# 【预测】
+#   P1: 有 ACS cap 的设备，Ctl ⊇ (Cap ∩ REQ_ACS_FLAGS)
+#       （因为 pci_enable_acs 在 probe 时按 cap 掩码启用了 SV/RR/CR/UF）
+#   P2: Intel RCiEP（vendor 8086 + port type RCiEP）即使无 ACS cap，
+#       也独占一个 IOMMU group（pci_quirk_rciep_acs 判隔离成立）
+#   P3a: 无 ACS 多功能但命中 Intel RCiEP quirk → 各 function 被 quirk 单独隔离（分散 group）
+#   P3b: 无 ACS 多功能 Endpoint（非 bridge）且无 quirk → 各 function 同 group
+#   （P3a/P3b 合起来验证 AGENTS.md #11：quirk 优先于多功能聚合逻辑。
+#    多功能 bridge/root port 每个端口本就是独立隔离域，不适用聚合，故排除）
+#
+# 用法：sudo ./ex3-acs-analysis.sh
+# 只读取证，不写 ACS 寄存器。
 
 set -euo pipefail
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+divider() { echo "════════════════════════════════════════════════════════════════"; }
+[[ $EUID -ne 0 ]] && { echo -e "${RED}需要 root：sudo $0${NC}"; exit 1; }
+command -v lspci setpci >/dev/null || { echo "安装 pciutils"; exit 1; }
+[[ -d /sys/kernel/iommu_groups ]] || { echo -e "${YELLOW}IOMMU 未启用，P2/P3 无法验证${NC}"; }
 
-# ─── 颜色定义 ───────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+REQ=$((0x0001 | 0x0004 | 0x0008 | 0x0010))   # SV|RR|CR|UF
 
-divider() {
-    echo "════════════════════════════════════════════════════════════════"
+divider
+echo -e "${GREEN}  ex3 验证 ACS 三层判定${NC}"
+divider
+echo -e "${CYAN}【理论】${NC} annotations §3 + AGENTS.md #11/#13：quirk 优先 → cap 掩码 → ctl 检查；"
+echo "        REQ_ACS_FLAGS=SV|RR|CR|UF；pci_enable_acs probe 时主动启用。"
+echo -e "${CYAN}【预测】${NC} P1 Ctl⊇(Cap∩REQ)；P2 Intel RCiEP 无 cap 独占 group；"
+echo "        P3a 无 ACS 多功能+quirk→分散；P3b 无 ACS 多功能+无 quirk→同 group。"
+echo
+
+# 一次性 dump port type（避免 350 次 lspci -vv）
+VV=$(lspci -vv 2>/dev/null || true)
+group_of() { # BDF → group 号（无则空）
+    local g
+    g=$(readlink "/sys/bus/pci/devices/0000:$1/iommu_group" 2>/dev/null || true)
+    [[ -n "$g" ]] && basename "$g" || true
 }
+group_size() { [[ -n "$1" ]] && ls "/sys/kernel/iommu_groups/$1/devices" 2>/dev/null | wc -l || echo 0; }
 
-# ─── ACS 标志定义 ──────────────────────────────────────
-# 对应 annotations.md §3 中的 ACS 标志
-# 来源: include/uapi/linux/pci_regs.h
-declare -A ACS_FLAGS=(
-    [SV]="0x0001"   # Source Validation
-    [TB]="0x0002"   # Translation Blocking
-    [RR]="0x0004"   # P2P Request Redirect
-    [CR]="0x0008"   # P2P Completion Redirect
-    [UF]="0x0010"   # Upstream Forwarding
-    [EC]="0x0020"   # P2P Egress Control
-    [DT]="0x0040"   # Direct Translated P2P
-)
-
-# REQ_ACS_FLAGS — 内核用于 IOMMU group 判定的标志
-# 对应 CLAUDE.md 陷阱 #11: "REQ_ACS_FLAGS 只含 SV/RR/CR/UF"
-REQ_ACS_FLAGS=$((0x0001 | 0x0004 | 0x0008 | 0x0010))  # SV + RR + CR + UF
-
-# ─── 检查权限 ───────────────────────────────────────────
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}错误: 此脚本需要 root 权限读取 ACS 扩展能力${NC}"
-    echo "用法: sudo $0"
-    exit 1
-fi
-
-divider
-echo -e "${GREEN}  ACS（Access Control Services）分析工具${NC}"
-echo "  连接 annotations.md §3 + CLAUDE.md 陷阱 #11-13"
-divider
-echo
-
-# ─── 1. ACS Capability 检查 ────────────────────────────
-echo -e "${CYAN}[1] ACS Capability 扫描${NC}"
-echo "    对应 annotations.md §3: pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ACS)"
-echo
-
-acs_count=0
-declare -A acs_devices
-
-for bdf in $(lspci 2>/dev/null | awk '{print $1}'); do
-    # ACS 是 Extended Capability (ID = 0x000D)
-    # Extended Capability 从配置空间 0x100 开始
-    # 检查 Extended Capability Header
-    has_acs=0
-    ecap_offset=0x100
-
-    while [[ $ecap_offset -lt 0x1000 ]]; do
-        ecap_hdr=$(setpci -s "$bdf" ${ecap_offset}.l 2>/dev/null || echo "00000000")
-        ecap_val=$((16#${ecap_hdr}))
-
-        # Extended Capability ID = bits 15:0
-        ecap_id=$((ecap_val & 0xFFFF))
-        # Next offset = bits 31:20
-        ecap_next=$(( (ecap_val >> 20) & 0xFFF ))
-
-        if [[ $ecap_id -eq 0x000D ]]; then
-            has_acs=1
-            acs_count=$((acs_count + 1))
-            acs_devices[$bdf]=$ecap_offset
+# ── 扫 ACS extended cap（ID 0x000D），记录 cap/ctl ──
+declare -A ACS_OFF ACS_CAP ACS_CTL
+while read -r bdf _; do
+    off=0x100
+    while [[ $off -lt 0x1000 ]]; do
+        hdr=$(setpci -s "$bdf" ${off}.l 2>/dev/null || echo 0)
+        v=$((16#$hdr)); id=$((v & 0xFFFF)); nxt=$(((v >> 20) & 0xFFF))
+        if [[ $id -eq 0x000D ]]; then
+            cap=$(setpci -s "$bdf" $(printf '%x' $((16#$off+4))).w 2>/dev/null || echo 0)
+            ctl=$(setpci -s "$bdf" $(printf '%x' $((16#$off+6))).w 2>/dev/null || echo 0)
+            ACS_OFF[$bdf]=$off; ACS_CAP[$bdf]=$((16#$cap)); ACS_CTL[$bdf]=$((16#$ctl))
             break
         fi
-
-        if [[ $ecap_next -eq 0 ]]; then
-            break
-        fi
-        ecap_offset=$ecap_next
+        [[ $nxt -eq 0 ]] && break
+        off=$nxt
     done
-done
+done < <(lspci 2>/dev/null | awk '{print $1}')
 
-echo -e "  找到 ${GREEN}${acs_count}${NC} 个设备支持 ACS"
-echo
+pass=0; fail=0; incon=0
+check() { case $4 in
+    0) echo -e "  ${GREEN}PASS${NC} $1 $2 — $3"; pass=$((pass+1));;
+    1) echo -e "  ${RED}FAIL${NC} $1 $2 — $3"; fail=$((fail+1));;
+    *) echo -e "  ${YELLOW}INCONCLUSIVE${NC} $1 $2 — $3"; incon=$((incon+1));; esac; }
 
-if [[ $acs_count -eq 0 ]]; then
-    echo -e "  ${YELLOW}没有设备支持 ACS${NC}"
-    echo "  这意味着所有连接在同一 Root Port 下的设备"
-    echo "  将被划分到同一个 IOMMU group"
-    echo
-    echo "  → 对应 CLAUDE.md 陷阱 #11: Intel RCiEP 有 quirk 判定"
-    echo "    pci_dev_specific_acs_enabled() 可能通过 quirk 返回隔离成立"
-    echo
-fi
-
-# ─── 2. ACS Control 寄存器解码 ─────────────────────────
-echo -e "${CYAN}[2] ACS Control 寄存器详细解码${NC}"
-echo "    对应 annotations.md §3: ACS 标志含义"
-echo
-
-for bdf in "${!acs_devices[@]}"; do
-    ecap_off="${acs_devices[$bdf]}"
-    desc=$(lspci -s "$bdf" 2>/dev/null | cut -d' ' -f2-)
-
-    echo -e "  ${GREEN}${bdf}${NC} — ${desc}"
-    echo "    ACS Extended Capability 偏移: 0x${ecap_off}"
-
-    # ACS Capability 结构 (PCIe Spec Section 7.16):
-    # Offset 0: Extended Capability Header (32b)
-    # Offset 4: ACS Capability Register (16b)
-    # Offset 6: ACS Control Register (16b)
-    acs_cap_off=$(printf '%x' $((16#${ecap_off} + 4)))
-    acs_ctl_off=$(printf '%x' $((16#${ecap_off} + 6)))
-
-    acs_cap=$(setpci -s "$bdf" ${acs_cap_off}.w)
-    acs_ctl=$(setpci -s "$bdf" ${acs_ctl_off}.w)
-    acs_ctl_val=$((16#${acs_ctl}))
-
-    echo "    ACS Capability (0x${acs_cap_off}): 0x${acs_cap}"
-    echo "    ACS Control    (0x${acs_ctl_off}): 0x${acs_ctl}"
-
-    # 解码 ACS Control 位
-    echo "    ACS Control 位:"
-    all_supported=true
-    for flag in SV TB RR CR UF EC DT; do
-        flag_val=$((16#${ACS_FLAGS[$flag]}))
-        supported="否"
-        enabled="否"
-
-        # Capability 中对应位 = 1 表示支持该功能
-        # ACS Capability 的 bits 15:1 对应各功能的支持
-        acs_cap_val=$((16#${acs_cap}))
-        if [[ $((acs_cap_val & flag_val)) -ne 0 ]]; then
-            supported="是"
-        fi
-
-        # Control 中对应位 = 1 表示启用
-        if [[ $((acs_ctl_val & flag_val)) -ne 0 ]]; then
-            enabled="是"
-        fi
-
-        # 判断是否是 REQ_ACS_FLAGS 的一部分
-        is_req="否"
-        if [[ $((flag_val & REQ_ACS_FLAGS)) -ne 0 ]]; then
-            is_req="是"
-        fi
-
-        # 颜色标记
-        if [[ "$supported" == "是" && "$enabled" == "是" ]]; then
-            color="${GREEN}"
-        elif [[ "$supported" == "是" && "$enabled" == "否" ]]; then
-            color="${YELLOW}"
-        else
-            color="${NC}"
-        fi
-
-        printf "      %s%-4s${NC} (0x%04x): 支持=%-3s 启用=%-3s REQ_ACS=%-3s\n" \
-            "$color" "$flag" "$flag_val" "$supported" "$enabled" "$is_req"
-
-        # 检查 CLAUDE.md 陷阱 #11 的条件
-        # "Cap 里有、Ctl 里没开" = 隔离不通过
-        if [[ "$supported" == "是" && "$enabled" == "否" && "$is_req" == "是" ]]; then
-            echo -e "        ${RED}⚠ 该位在 Cap 中声明但 Ctl 中未启用 → 隔离判定不通过${NC}"
-            echo -e "        ${RED}  对应 CLAUDE.md 陷阱 #11: '只有 Cap 里有、Ctl 里没开才算不通过'${NC}"
-        fi
-    done
-    echo
-done
-
-# ─── 3. ACS 对 IOMMU Group 的影响 ─────────────────────
-echo -e "${CYAN}[3] ACS 对 IOMMU Group 的影响分析${NC}"
-echo "    对应 annotations.md §3: iommu_group_get_for_pci_dev() 算法"
-echo "    对应 CLAUDE.md 陷阱 #11: quirk 层先于 PCIe 类型判断"
-echo
-
-# 列出 IOMMU groups
-if [[ -d /sys/kernel/iommu_groups ]]; then
-    echo "  当前系统的 IOMMU Group:"
-    echo
-
-    for group_dir in /sys/kernel/iommu_groups/*/; do
-        group_num=$(basename "$group_dir")
-        devices=()
-
-        for dev_link in "$group_dir"devices/*; do
-            [[ -e "$dev_link" ]] || continue
-            dev_bdf=$(basename "$dev_link")
-            desc=$(lspci -s "$dev_bdf" 2>/dev/null | cut -d' ' -f2- || echo "(unknown)")
-            devices+=("${dev_bdf}: ${desc}")
-        done
-
-        if [[ ${#devices[@]} -gt 0 ]]; then
-            echo -e "  ${GREEN}IOMMU Group ${group_num}${NC} (${#devices[@]} 个设备):"
-            for dev in "${devices[@]}"; do
-                echo "    ${dev}"
-            done
-
-            # 分析 group 内的设备是否在同一 Bridge 下
-            if [[ ${#devices[@]} -gt 1 ]]; then
-                echo -e "    ${YELLOW}→ 多个设备在同一 group: 说明它们之间的 Bridge 没有 ACS 隔离${NC}"
-                echo -e "    ${YELLOW}  对应 CLAUDE.md 陷阱 #11: REQ_ACS_FLAGS = SV|RR|CR|UF${NC}"
-            fi
-            echo
-        fi
-    done
-else
-    echo -e "  ${YELLOW}IOMMU 未启用（/sys/kernel/iommu_groups 不存在）${NC}"
-    echo "  要启用 IOMMU，在 grub 中添加:"
-    echo "    Intel VT-d: intel_iommu=on"
-    echo "    AMD-Vi:     amd_iommu=on"
-    echo
-fi
-
-# ─── 4. Intel RCiEP Quirk 分析 ─────────────────────────
-echo -e "${CYAN}[4] Intel RCiEP Quirk 分析${NC}"
-echo "    对应 CLAUDE.md 陷阱 #11: pci_quirk_rciep_acs 把所有 Intel RCiEP 判成隔离成立"
-echo "    对应 annotations.md §3: pci_acs_enabled() 开头先调 pci_dev_specific_acs_enabled()"
-echo
-
-echo "  Root Complex Integrated Endpoint (RCiEP) 设备:"
-found_rciep=0
-for bdf in $(lspci 2>/dev/null | awk '{print $1}'); do
-    port_type=$(lspci -vv -s "$bdf" 2>/dev/null | grep "Port type" || true)
-    if echo "$port_type" | grep -qi "root complex integrated endpoint"; then
-        desc=$(lspci -s "$bdf" 2>/dev/null | cut -d' ' -f2-)
-        vendor=$(setpci -s "$bdf" 0.w)
-        echo -e "  ${GREEN}${bdf}${NC} — ${desc}"
-        echo "    Vendor ID: 0x${vendor}"
-        if [[ "${vendor,,}" == "8086" ]]; then
-            echo -e "    ${YELLOW}→ Intel 设备: 命中 pci_quirk_rciep_acs quirk${NC}"
-            echo -e "    ${YELLOW}  即使没有 ACS capability，隔离也被判定为成立${NC}"
-        fi
-        echo "    对应源码: drivers/pci/quirks.c: pci_quirk_rciep_acs()"
-        found_rciep=1
+# ── P1：Ctl ⊇ (Cap ∩ REQ) ──
+echo -e "${CYAN}【对照 P1】${NC} ${#ACS_OFF[@]} 个设备有 ACS cap，检查 Ctl⊇(Cap∩REQ)："
+for bdf in "${!ACS_OFF[@]}"; do
+    cap=${ACS_CAP[$bdf]}; ctl=${ACS_CTL[$bdf]}
+    need=$((cap & REQ)); got=$((ctl & REQ))
+    if [[ $((got & need)) -eq $need ]]; then
+        check P1 "$bdf" "$(printf 'cap∩REQ=0x%02x ⊆ ctl=0x%02x' "$need" "$got")" 0
+    else
+        check P1 "$bdf" "$(printf 'cap∩REQ=0x%02x 但 ctl=0x%02x 缺位' "$need" "$got")" 1
     fi
 done
-if [[ $found_rciep -eq 0 ]]; then
-    echo -e "  ${YELLOW}(未找到 RCiEP 设备)${NC}"
-fi
 echo
 
-# ─── 5. 思考题 ─────────────────────────────────────────
-echo -e "${CYAN}[5] 思考题${NC}"
+# ── P2：Intel RCiEP 无 cap 也独占 group ──
+echo -e "${CYAN}【对照 P2】${NC} Intel RCiEP（quirk 层，AGENTS.md #11）："
+rciep_checked=0
+declare -A QUIRK
+while read -r bdf; do
+    [[ -z "$bdf" ]] && continue
+    vendor=$(setpci -s "$bdf" 0.w 2>/dev/null || echo 0)
+    [[ "${vendor,,}" == "8086" ]] || continue
+    if [[ -n ${ACS_OFF[$bdf]:-} ]]; then continue; fi   # 有 cap 的不算 quirk 案例
+    QUIRK[$bdf]=1
+    g=$(group_of "$bdf"); sz=$(group_size "$g")
+    if [[ -z "$g" ]]; then check P2 "$bdf" "无 IOMMU group（IOMMU 未启用？）" 2; continue; fi
+    rciep_checked=1
+    [[ "$sz" -eq 1 ]] && check P2 "$bdf" "无 ACS cap 但独占 group $g（quirk 生效）" 0 \
+                      || check P2 "$bdf" "无 ACS cap 却在 ${sz} 成员 group $g" 1
+done < <(awk '/^[0-9a-f][0-9a-f]:/{bdf=$1} /Root Complex Integrated Endpoint/{print bdf}' <<< "$VV" | sort -u)
+[[ $rciep_checked -eq 0 ]] && check P2 "-" "本机无『无 cap 的 Intel RCiEP』案例" 2
 echo
-echo "  1. 系统中有哪些设备支持 ACS？它们是什么类型的设备？"
-echo "     → 对应 annotations.md §3: ACS 通常在 Downstream Port / Root Port 上"
-echo
-echo "  2. 对于支持 ACS 的设备，ACS Control 中的 SV/RR/CR/UF 是否全部启用？"
-echo "     → 对应 CLAUDE.md 陷阱 #11: REQ_ACS_FLAGS = SV|RR|CR|UF"
-echo "       只有这四个位全部启用，设备才算通过隔离检查"
-echo
-echo "  3. 有没有 Intel RCiEP 设备？它们是否命中了 quirk？"
-echo "     → 对应 CLAUDE.md 陷阱 #11: pci_quirk_rciep_acs 把所有 Intel RCiEP"
-echo "       判成隔离成立，即使它们没有 ACS capability"
-echo
-echo "  4. 观察 IOMMU group 的划分，是否有多设备共享一个 group 的情况？"
-echo "     这些设备之间的 Bridge 是否缺少 ACS 隔离？"
-echo "     → 对应 annotations.md §3: iommu_group_get_for_pci_dev() 的算法"
-echo
-echo "  5. （进阶）如果需要用 setpci 手动启用 ACS，需要写哪些位？"
-echo "     对应 CLAUDE.md 陷阱 #13: pci=disable_acs_redir= 和 pci=config_acs="
-echo "     注意 config_acs 的位串是从右往左解析的！"
+
+# ── P3a/P3b：无 ACS 多功能设备，按是否命中 quirk 分两类 ──
+echo -e "${CYAN}【对照 P3】${NC} 无 ACS 多功能设备（quirk 优先于多功能聚合，AGENTS.md #11）："
+p3a=0; p3b=0
+declare -A slot_devs
+while read -r bdf class _; do
+    [[ "$class" == "0604:" ]] && continue        # 多功能 bridge 各端口独立隔离，不适用聚合
+    slot=${bdf%.*}
+    [[ -n ${ACS_OFF[$bdf]:-} ]] && continue
+    slot_devs[$slot]+="$bdf "
+done < <(lspci -n 2>/dev/null)
+for slot in "${!slot_devs[@]}"; do
+    read -ra fns <<< "${slot_devs[$slot]}"
+    [[ ${#fns[@]} -ge 2 ]] || continue
+    g0=$(group_of "${fns[0]}"); [[ -n "$g0" ]] || continue
+    # 该 slot 是否命中 quirk（任一 function 是 Intel RCiEP）
+    hit=0; for f in "${fns[@]}"; do [[ -n ${QUIRK[$f]:-} ]] && hit=1; done
+    same=1; for f in "${fns[@]}"; do [[ "$(group_of "$f")" == "$g0" ]] || same=0; done
+    if [[ $hit -eq 1 ]]; then
+        p3a=1
+        [[ $same -eq 0 ]] && check P3a "$slot" "命中 quirk → ${#fns[@]} function 分散 group（quirk 优先）" 0 \
+                          || check P3a "$slot" "命中 quirk 却同 group" 1
+    else
+        p3b=1
+        [[ $same -eq 1 ]] && check P3b "$slot" "无 quirk → ${#fns[@]} function 同 group $g0" 0 \
+                          || check P3b "$slot" "无 quirk 却分散 group" 1
+    fi
+done
+[[ $p3a -eq 0 ]] && check P3a "-" "本机无『无 ACS 多功能+quirk』案例" 2
+[[ $p3b -eq 0 ]] && check P3b "-" "本机无『无 ACS 多功能+无 quirk』案例" 2
 echo
 
 divider
-echo -e "${GREEN}完成！${NC} 连接下一个练习: ./ex4-iommu-group.sh"
+echo -e "${CYAN}【结论与反馈】${NC}  ${GREEN}PASS=$pass${NC}  ${RED}FAIL=$fail${NC}  ${YELLOW}INCONCLUSIVE=$incon${NC}"
+echo "  P1 验证 #13（probe 主动启用）；P2 验证 #11（quirk 优先于 cap）；"
+echo "  P3a/P3b 验证 #11（quirk 优先于多功能聚合）——无 ACS 多功能本该同 group，"
+echo "  但命中 Intel RCiEP quirk 的会被单独隔离。这就是『quirk 优先』的实证。"
+echo "  INCONCLUSIVE 表示本机缺该案例，不是理论被证伪——换硬件或 vIOMMU 环境再验。"
+echo -e "  ${CYAN}链尾${NC}：判定结果怎么落成 IOMMU group 边界？→ ex4-iommu-group.sh"
 divider

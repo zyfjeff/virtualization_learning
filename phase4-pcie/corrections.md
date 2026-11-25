@@ -129,6 +129,24 @@ basics.md 中仍有部分行号引用错误，需要逐一定位正确行号。
 
 ---
 
+### ⚠️ 12. "Type 1 头 = bridge" 是简化——header type bit 不是可靠 bridge 判据（2026-11-25 ex1 发现）
+
+`basics.md` 用 Header Type bit7（0=Type0/Endpoint，1=Type1/bridge）区分设备类型。
+ex1 实测发现反例：`17:00.0`（Intel Sky Lake-E Root Port）与 `02:00.0`（ASPEED AST1150
+PCI-to-PCI Bridge）class=0x0604（bridge），但 config[0x0e] bit7=0（setpci 与
+`/sys/bus/pci/devices/*/config` 双路核实，非读取 bug）。
+
+**结论**：可靠的 bridge 判据是 class code 0x0604（及 PCIe Cap 的 Port Type），
+不是 header type bit。ex1/ex3/ex4 已改用 class code 识别 bridge。
+
+**待核查**：内核 `pci_setup_device()` 读 hdr_type 决定头布局，与 class 判 bridge
+如何调和这些 bit7=0 的 bridge？（涉及 `drivers/pci/probe.c` hdr_type 处理）——
+查清后回写 basics.md §3 的简化说法。
+
+**状态**: ⚠️ 待核查（概念边界 + 待办，符合勘误瘦身策略）
+
+---
+
 ## 2026-11-25 统一课程框架试点（P1）修正记录
 
 ### ✅ 8. README 本章文件表列出不存在的文件

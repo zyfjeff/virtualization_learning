@@ -257,16 +257,20 @@ PCIe 的作用：
 
 ## 🔬 实践练习
 
-4 个编号实验（均在宿主执行，需 root + `pciutils`，详见 [`practice/README.md`](practice/README.md)）：
+4 个实验串成一条**取证链**（均在宿主物理机执行，需 root + `pciutils`）。
+每个按五段式（§3.5）：先押注预测，再跑观察，脚本自动给 PASS/FAIL/INCONCLUSIVE。
+详见 [`practice/README.md`](practice/README.md)。
 
-| 编号 | 主题 | 验证问题链中的哪个问题 | 入口 |
-|------|------|----------------------|------|
-| ex1 | PCIe 拓扑分析 | §1/§2 链：物理拓扑长什么样？bus 号如何分配？ | `practice/ex1-pcie-topology.sh` |
-| ex2 | 配置空间读写 | §4 链：Type 0/1 区别？BAR 如何解析？ | `practice/ex2-config-space.sh` |
-| ex3 | ACS 能力分析 | §3 链：能力 vs 实际启用？quirk 命中了谁？ | `practice/ex3-acs-analysis.sh` |
-| ex4 | IOMMU Group 分析 | §3 链尾：隔离判定如何落成 group 粒度？ | `practice/ex4-iommu-group.sh` |
+| 编号 | 验证的理论 | 预测（理论成立必然观察到） | 入口 |
+|------|-----------|--------------------------|------|
+| ex1 | bus 号递归分配（§1-2） | 子树最远 bus == subordinate；secondary 唯一 | `practice/ex1-pcie-topology.sh` |
+| ex2 | Type 0/1 + BAR 编码（basics §3-4） | BAR0 bit0 ↔ lspci 区域类型；64 位 BAR 占两槽 | `practice/ex2-config-space.sh` |
+| ex3 | ACS 三层判定（§3 + #11/#13） | Ctl⊇(Cap∩REQ)；Intel RCiEP 无 cap 独占 group；quirk 优先 | `practice/ex3-acs-analysis.sh` |
+| ex4 | group=最小隔离集（phase3） | 多成员 group 可归因到隔离缺口 | `practice/ex4-iommu-group.sh` |
 
-实验报告在 `practice/reports/`。
+**链式衔接**：ex1 拓扑就位 → ex2 配置空间承载能力 → ex3 ACS 判定隔离 → ex4 落成 group 边界 → phase7 直通。
+ex4 直接回答本章核心问题：本机 157 个设备落在多成员 group，必须整组直通。
+实验报告在 `practice/reports/`；实测发现（含 header-type 边界）见 practice/README 与 corrections。
 
 ---
 
