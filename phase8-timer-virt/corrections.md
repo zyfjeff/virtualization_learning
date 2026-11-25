@@ -590,3 +590,21 @@ guest 发起的 WRMSR 经 `kvm_emulate_wrmsr()`（`x86.c:2079`）→
   - `arch/x86/kvm/vmx/vmx.c` — VMX TSC
   - `arch/x86/kvm/x86.c` — TSC, kvmclock
   - `arch/x86/include/asm/pvclock-abi.h` — pvclock 结构体
+
+---
+
+## 勘误（2026-11-25 框架改造）：性能数字无出处 + 结构变更
+
+**性能数字待审计**：旧 README「⚡ 性能优化技术」与 VMM 对比含
+"TSC-deadline 减少 VM-Exit 90%""中断延迟 ~20ns""读 PIT ~1000/300ns、kvmclock ~30ns"
+无本仓实测出处。已改「⚡ 性能与测量」纯指针（→ phase10），机制（TSC-deadline 硬件比较/
+Timer Advance 自适应/TSC 同步）保留，数字标待审计。Timer Advance 参数权限（0444 只读、
+per-vCPU 自适应）已正确指向 phase10 parameters.md，保留。
+
+**practice README 标题旧编号**：`practice/README.md:1` "Phase 7" → "Phase 8"，已修。
+
+**结构变更（非错误）**：README >1000 行强制拆分——
+Linux 时钟基础(508行) → [clock-basics.md](clock-basics.md)，
+KVM 时钟虚拟化详解(1941行) → [kvm-clock-virtualization.md](kvm-clock-virtualization.md)，内容未改。
+`vmclock-phase1-analysis.md` → [vmclock-analysis-stage1.md](vmclock-analysis-stage1.md)
+（避免与 phase1-cpu-virt 混淆，COURSE_FRAMEWORK §5 命名规范）。

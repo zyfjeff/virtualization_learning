@@ -2,6 +2,9 @@
 
 > 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
 > 行号可能随版本变化，用函数名 grep 定位更可靠。
+>
+> **体例：问题链**（COURSE_FRAMEWORK §3.2）。入口问题来自第一性原理：
+> "guest 怎么拿到稳定时间？"——kvmclock 共享页 → TSC 偏移/缩放 → lapic timer advance。
 
 ---
 

@@ -1,16 +1,15 @@
-# Phase 7 时钟虚拟化 — 动手实验
+# Phase 8 实践练习 — 理论取证链
 
-> 基于 KVM API 的 C 程序实验，验证时钟虚拟化的核心机制。
+> 五段式（COURSE_FRAMEWORK §3.5）：理论 → 预测 → 操作 → 对照 → 反馈。
+> 基于 KVM API 的 C 程序实验，取证时钟虚拟化核心机制。
 
----
+## 📋 取证总览
 
-## 📋 实验列表
-
-| 实验 | 目标 | 对应章节 |
-|------|------|---------|
-| `experiment1-tsc` | 验证 `guest_TSC = host_TSC × ratio + offset` 公式 | README §3 TSC 虚拟化 |
-| `experiment2-kvmclock` | 观察 KVM_GET_CLOCK / KVM_SET_CLOCK 时间跳变 | README §4 kvmclock |
-| `experiment3-lapic` | 验证 TSC-deadline 到期 → preemption timer VM-Exit → 中断注入 guest | README §2 APIC Timer |
+| 实验 | 验证的理论 | 预测 | 对应文档 |
+|------|-----------|------|---------|
+| `experiment1-tsc` | TSC 偏移/缩放公式 | guest_TSC = host_TSC × ratio + offset | [kvm-clock-virtualization.md](../kvm-clock-virtualization.md) TSC |
+| `experiment2-kvmclock` | kvmclock 迁移补偿 | KVM_SET_CLOCK 补偿后 guest 时间连续 | [kvm-clock-virtualization.md](../kvm-clock-virtualization.md) kvmclock |
+| `experiment3-lapic` | TSC-deadline 定时器路径 | 到期 → preemption timer VM-Exit → 注入 guest | [kvm-clock-virtualization.md](../kvm-clock-virtualization.md) APIC Timer |
 
 ---
 
