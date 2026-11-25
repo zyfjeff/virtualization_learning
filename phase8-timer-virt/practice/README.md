@@ -317,8 +317,8 @@ grep -oE "constant_tsc|nonstop_tsc|tsc_deadline_timer|tsc_known_freq|tsc_adjust"
 
 ## 📚 参考资料
 
-- Phase 7 主文档: `../README.md`
+- Phase 8 主文档: `../README.md`
 - 源码注释: `../annotations.md`
 - 勘误: `../corrections.md`
 - Linux KVM API: `/root/code/linux-6.12.93/Documentation/virt/kvm/api.rst`
-- Intel VMX 规范: `../../intel-vmx.pdf`
+- Intel VMX 规范: `../../spec/intel-vmx.pdf`

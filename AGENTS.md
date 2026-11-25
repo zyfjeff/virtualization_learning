@@ -45,12 +45,12 @@ examples/  scripts/  templates/   (notes/ 与根 shared/ 已清理，见 git 历
 | QEMU 源码（基线） | `/root/code/qemu-10.1.0-rc2/` | VMM 侧实现、设备模拟、KVM API 调用 |
 | QEMU 源码（新版） | `/root/code/qemu-11.1.0/` | vhost-user 新特性等需要较新行为的核查 |
 | DPDK 源码 | `/root/code/dpdk/` | vhost-user 后端实现、用户态数据面 |
-| Intel VMX 规范 | `intel-vmx.pdf` | VMCS、VM-Exit/Entry、EPT/VPID、Posted Interrupt |
-| Intel VT-d 规范 | `intel-vtd.pdf` | IOMMU、中断重映射、IRTE/PI Descriptor |
-| Virtio 规范 | `virtio-v1.3-csd01.pdf` | virtqueue、设备类型、feature bits |
-| AMD IOMMU 规范 | `amd-virtualization.pdf` | AMD-Vi IOMMU、AVIC (Guest Virtual APIC)、IRTE 格式、GA Log |
-| ARM SMMU v3 规范 | `arm-smmuv3.pdf` | ARM SMMUv3 架构、Stage-1/2 翻译、STE/CD 格式、CMDQ 命令 |
-| PCIe Base 规范 | `pcie-base-spec-r6.0.pdf` | PCIe 6.0、TLP/DLLP、ACS/ATS/AER、MSI/MSI-X、配置空间 |
+| Intel VMX 规范 | `spec/intel-vmx.pdf` | VMCS、VM-Exit/Entry、EPT/VPID、Posted Interrupt |
+| Intel VT-d 规范 | `spec/intel-vtd.pdf` | IOMMU、中断重映射、IRTE/PI Descriptor |
+| Virtio 规范 | `spec/virtio-v1.3-csd01.pdf` | virtqueue、设备类型、feature bits |
+| AMD IOMMU 规范 | `spec/amd-virtualization.pdf` | AMD-Vi IOMMU、AVIC (Guest Virtual APIC)、IRTE 格式、GA Log |
+| ARM SMMU v3 规范 | `spec/arm-smmuv3.pdf` | ARM SMMUv3 架构、Stage-1/2 翻译、STE/CD 格式、CMDQ 命令 |
+| PCIe Base 规范 | `spec/pcie-base-spec-r6.0.pdf` | PCIe 6.0、TLP/DLLP、ACS/ATS/AER、MSI/MSI-X、配置空间 |
 
 已有文档大多以 QEMU 10.1.0-rc2 为基线；phase5 的 `vhost-user-new-features-factcheck-v2.md` 与 `-usecases.md` 基于 11.1.0 + DPDK。**引用时必须写明版本**，两个版本行为不一致时说明差异。
 
@@ -160,12 +160,12 @@ grep -rn "VFIO_DEVICE_SET_IRQS" /root/code/qemu-10.1.0-rc2/hw/vfio/
 grep -rn "KVM_SET_GSI_ROUTING" /root/code/qemu-10.1.0-rc2/accel/kvm/
 
 # 规范 PDF（poppler-utils）
-pdftotext intel-vmx.pdf /tmp/vmx-spec.txt && grep -n "Posted-Interrupt Processing" /tmp/vmx-spec.txt
-pdftotext intel-vtd.pdf /tmp/vtd-spec.txt
-pdftotext amd-virtualization.pdf /tmp/amd-vtd-spec.txt && grep -n "AVIC\|Guest Virtual APIC\|IRTE.*GuestMode" /tmp/amd-vtd-spec.txt
-pdftotext virtio-v1.3-csd01.pdf /tmp/virtio-spec.txt
-pdftotext arm-smmuv3.pdf /tmp/smmuv3-spec.txt && grep -n "Stage-2\|STE\|Context Descriptor" /tmp/smmuv3-spec.txt
-pdftotext pcie-base-spec-r6.0.pdf /tmp/pcie-spec.txt && grep -n "ACS\|ATS\|MSI-X\|AER" /tmp/pcie-spec.txt
+pdftotext spec/intel-vmx.pdf /tmp/vmx-spec.txt && grep -n "Posted-Interrupt Processing" /tmp/vmx-spec.txt
+pdftotext spec/intel-vtd.pdf /tmp/vtd-spec.txt
+pdftotext spec/amd-virtualization.pdf /tmp/amd-vtd-spec.txt && grep -n "AVIC\|Guest Virtual APIC\|IRTE.*GuestMode" /tmp/amd-vtd-spec.txt
+pdftotext spec/virtio-v1.3-csd01.pdf /tmp/virtio-spec.txt
+pdftotext spec/arm-smmuv3.pdf /tmp/smmuv3-spec.txt && grep -n "Stage-2\|STE\|Context Descriptor" /tmp/smmuv3-spec.txt
+pdftotext spec/pcie-base-spec-r6.0.pdf /tmp/pcie-spec.txt && grep -n "ACS\|ATS\|MSI-X\|AER" /tmp/pcie-spec.txt
 
 # 实验 VM 环境
 

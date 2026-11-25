@@ -130,5 +130,5 @@ VMM 代码由你自己实现。每个项目文档的"内核侧代码路径"表�
 
 - Linux KVM API 文档：`/root/code/linux-6.12.93/Documentation/virt/kvm/api.rst`
 - x86 boot protocol：`/root/code/linux-6.12.93/Documentation/arch/x86/boot.rst`
-- Virtio 规范：`../virtio-v1.3-csd01.pdf`
-- Intel VMX 规范：`../intel-vmx.pdf`；VT-d 规范：`../intel-vtd.pdf`
+- Virtio 规范：`../spec/virtio-v1.3-csd01.pdf`
+- Intel VMX 规范：`../spec/intel-vmx.pdf`；VT-d 规范：`../spec/intel-vtd.pdf`

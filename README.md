@@ -37,6 +37,7 @@ kvm-study/
 ├── README.md                    ← 本文件
 ├── COURSE_FRAMEWORK.md          ← ★ 统一课程框架：学习循环 + 章节骨架 + 迁移计划
 ├── templates/phase-template/    ← 各 phase 复用的 README/corrections/practice 模板
+├── spec/                        ← ★ 硬件/协议规范 PDF（VMX/VT-d/Virtio/AMD-Vi/SMMUv3/PCIe）+ 索引
 ├── phase0-kvm-framework/        ← 第零阶段：KVM框架层深度解析
 │   ├── README.md                ← 框架层核心概念 + 本章文件导航
 │   ├── annotations.md           ← kvm_dev_ioctl→vcpu_enter_guest 全链路注释
@@ -61,9 +62,11 @@ kvm-study/
 │   ├── corrections.md           ← 勘误
 │   └── practice/                ← 4 个实验 + 引用核查脚本
 ├── phase4-pcie/                 ← 第四阶段：PCIe 总线与设备直通
-│   ├── README.md                ← 技术全景 + 学习路线
+│   ├── README.md                ← 第一性原理 + 全景 + 问题链入口
 │   ├── basics.md                ← PCIe 硬件基础（拓扑/BDF/配置空间/BAR）
-│   ├── annotations.md           ← 源码精读（设备发现/ACS/IOMMU group）
+│   ├── acs-upstream-forwarding.md← ★ ACS UF 深入
+│   ├── ats.md                   ← ★ ATS 深入
+│   ├── annotations.md           ← 问题链精读（设备发现/ACS/配置访问）
 │   └── corrections.md           ← 勘误
 ├── phase5-interrupts/           ← 第五阶段：中断虚拟化 + VT-d中断重映射
 │   ├── README.md                ← 技术全景 + 中断路径 + 数据结构速览
@@ -85,12 +88,16 @@ kvm-study/
 │   ├── vhost-user-new-features-usecases.md  ← 新特性使用场景
 │   └── practice/                ← 全部练习与实测数据
 ├── phase7-vfio/                 ← 第七阶段：VFIO设备直通
-│   ├── README.md                ← VMM对比 + ACS/ATS + IOTLB/DMA批处理优化
-│   ├── corrections.md           ← 勘误
+│   ├── README.md                ← 第一性原理 + 架构 + DMA/桥接
+│   ├── group-division.md        ← ★ IOMMU group 划分（直通粒度）
+│   ├── acs-ats.md               ← ★ ACS 与 ATS（直通依赖）
+│   ├── corrections.md           ← 勘误（含事故复盘）
 │   └── practice/                ← VFIO 认领/DMA映射/MSI-X 实测练习
 ├── phase8-timer-virt/           ← 第八阶段：时钟虚拟化
-│   ├── README.md                ← VMM对比 + TSC-deadline/kvmclock优化 + 概念区分
-│   ├── annotations.md           ← 源码级注释
+│   ├── README.md                ← 第一性原理 + 全景 + 问题链入口
+│   ├── clock-basics.md          ← ★ Linux 时钟框架 + 硬件时钟源
+│   ├── kvm-clock-virtualization.md← ★ kvmclock/pvclock/TSC 偏移/PTP
+│   ├── annotations.md           ← 问题链精读
 │   ├── corrections.md           ← 勘误
 │   └── practice/                ← 3 个可运行实验（TSC/kvmclock/LAPIC Timer）
 ├── phase9-capstone/             ← ★ 第九阶段：毕业建造——最小 VMM
@@ -184,8 +191,12 @@ sudo ./build-rootfs-ubuntu.sh
 
 ## 学习方法论
 
-> 面向VMM专家的优化学习路径：
-> **VMM对比 → 内核态深入 → 性能优化 → 实战调试**
+> 统一学习循环的权威定义见 [`COURSE_FRAMEWORK.md`](COURSE_FRAMEWORK.md)：
+> **定位与目标 → 第一性原理与硬件全景 → VMM对比 → 问题链精读 → 动手取证 → 性能测量 → 陷阱勘误 → 自测衔接**。
+> 每章从"为什么这么设计"（第一性原理）出发，用引申问题引导读码，实验按五段式取证。
+
+面向VMM专家的快速学习路径：
+**VMM对比 → 内核态深入 → 性能优化 → 实战调试**
 
 每个阶段的学习流程：
 1. **VMM对比** (30分钟): 理解用户态VMM vs KVM内核态的差异
@@ -218,26 +229,28 @@ sudo bpftrace examples/bpf-programs/trace-vmexit.bpf
 | 0 | ★ KVM框架层 | 1-2周 | kvm_main.c, x86.c | ✓ | kvm-demo |
 | 1 | VT-x + CPU虚拟化 | 1-2周 | vmx.c, cpuid.c, x86.c | ✓ | vmx-info.ko |
 | 2 | 内存虚拟化(EPT) | 2-3周 | mmu.c, tdp_mmu.c, spte.c | ✓ | trace-ept-faults.bpf |
-| 3 | ★ IOMMU 层（phase6 的地基） | 2-3周 | iommu.c, intel/iommu.c, dma-iommu.c | ✓ | iommu-analysis.sh |
-| 4 | 中断虚拟化 + VT-d IR | 2-3周 | lapic.c, posted_intr.c, irq_remapping.c | ✓ | trace-irq-latency.bpf |
-| 5 | ★ vhost内核态加速 | 1周 | vhost.c, net.c | ✓ | iperf3+vhost |
-| 6 | VFIO设备直通 | 2-3周 | vfio_main.c, vfio_pci_core.c | ✓ | trace-vfio-dma.bpf |
-| 7 | 时钟虚拟化 | 1周 | i8254.c, lapic.c(timer), x86.c(kvmclock) | ✓ | 3 个 practice 实验 |
-| 8 | ★ 毕业建造：最小 VMM | 持续 | 全部（KVM API 综合） | - | kvm-api-demo 起步 |
-| 9 | ★ 性能测量方法论 + 独占机制 + 结论索引 | 1-2周 | vmx.c(PLE), mmu.c(大页/PML), x86.c(主时钟), kvm_main.c(directed yield) | ✓ | bench-*.sh（E1–E5） |
-| 10 | ★ KVM运行时调试与诊断 | 1周 | trace.h, vmx.c(exit), x86.c(exception) | - | 3个场景实验 + bpftrace脚本集 |
+| 3 | ★ IOMMU 层（phase7 的地基） | 2-3周 | iommu.c, intel/iommu.c, dma-iommu.c | ✓ | iommu-analysis.sh |
+| 4 | PCIe 总线与设备直通 | 1-2周 | pci/probe.c, pci.c, quirks.c | ✓ | ex1–ex4（拓扑/配置空间/ACS/group） |
+| 5 | 中断虚拟化 + VT-d IR | 2-3周 | lapic.c, posted_intr.c, irq_remapping.c | ✓ | trace-irq-latency.bpf |
+| 6 | ★ virtio / vhost 内核态加速 | 1周 | vhost.c, net.c | ✓ | iperf3+vhost |
+| 7 | VFIO设备直通 | 2-3周 | vfio_main.c, vfio_pci_core.c | ✓ | trace-vfio-dma.bpf |
+| 8 | 时钟虚拟化 | 1周 | i8254.c, lapic.c(timer), x86.c(kvmclock) | ✓ | 3 个 practice 实验 |
+| 9 | ★ 毕业建造：最小 VMM | 持续 | 全部（KVM API 综合） | - | kvm-api-demo 起步 |
+| 10 | ★ 性能测量方法论 + 独占机制 + 结论索引 | 1-2周 | vmx.c(PLE), mmu.c(大页/PML), x86.c(主时钟) | ✓ | bench-*.sh（E1–E5） |
+| 11 | ★ KVM运行时调试与诊断 | 1周 | trace.h, vmx.c(exit), x86.c(exception) | - | 3个场景实验 + bpftrace脚本集 |
 
-> 建议阅读顺序（子系统间依赖）：phase2 → **phase3(IOMMU)** → phase4 → phase6；
-> phase3 同时是 phase6(VFIO) 的地基。phase8 毕业建造建议放在 0-7 之后。
+> 建议阅读顺序（子系统间依赖）：phase2 → **phase3(IOMMU)** → phase4(PCIe) → phase5(中断) → phase7(VFIO)；
+> phase3 同时是 phase7(VFIO) 的地基，phase4 提供 ACS/ATS 物理基础。phase9 毕业建造建议放在 0-8 之后。
+> 统一学习循环（第一性原理→问题链→取证实验）见 [`COURSE_FRAMEWORK.md`](COURSE_FRAMEWORK.md)。
 
 **新增特性**：
 - ✓ 每章包含VMM视角对比，帮助理解KVM设计决策
-- ✓ 每章包含性能优化技术，指导实际调优；**实测结论统一收在 phase9/index.md**，
+- ✓ 每章包含性能优化技术，指导实际调优；**实测结论统一收在 phase10/index.md**，
   按可信度分级，其他章节只留指针、不复制数字
 - ✓ 每章包含常见陷阱，避免踩坑
 - ✓ ★ IOMMU 专题 (phase3)：与 EPT 同一心智模型，8 问深入 + 三后端对照
-- ✓ ★ 毕业建造 (phase8)：从裸 KVM API 写可启动最小 VMM，逐级加 virtio/VFIO/性能对标
-- ✓ ★ 性能专题 (phase9): 测量纪律与观测者扰动预算 + 三块独占机制源码走读
+- ✓ ★ 毕业建造 (phase9)：从裸 KVM API 写可启动最小 VMM，逐级加 virtio/VFIO/性能对标
+- ✓ ★ 性能专题 (phase10): 测量纪律与观测者扰动预算 + 三块独占机制源码走读
   （PLE 与定向让出 / EPT 粒度与 PML / 主时钟与 TSC offset）+ E1–E5 可跑实验
   + 参数默认值唯一来源 + 跨章结论索引
 - ✓ ★ 调试与测试专题 (phase11): 场景驱动的运行时诊断（启动失败/vCPU退出/性能瓶颈）
