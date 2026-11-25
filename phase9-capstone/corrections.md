@@ -1578,3 +1578,165 @@ mini-kvm 的 `make` 均 rc=0、无新增警告，模块十个文件行数与 J13
 | `project3-minivmm-vfio.md:7` | "phase6 的地基" | phase7 |
 
 注：`README.md:35` 项目4 的 "phase9/10/11" 已是现行编号，未改。
+
+---
+
+## L. 2026-11-25 事实核查轮：CPUID bit24 前提错误等 15 项（原文已同步修正）
+
+本轮复审四个 project 文档 + `README.md` + `practice/README.md` 的当前结论，
+对照 Linux 6.12.93 / QEMU 10.1.0-rc2 / virtio-v1.3 规范与本机实测
+（宿主 6.8.0-51-generic，`/dev/kvm` 即其模块）。"内核侧代码路径"表的全部
+file:line 抽验无错行；不符项集中在环境/机器类断言与 API 名称上。
+
+### L1.（高）`project1:73` 起、`practice/README.md` CPUID 表、`minivmm.c:766` ——"leaf1 ECX bit24 TSC_DEADLINE_TIMER 必须保留" 的前提错误
+
+原文暗示 `KVM_GET_SUPPORTED_CPUID` 的返回里有 bit24、照抄保留即可。
+**实际：supported CPUID 从不包含 bit24。**
+
+- 内核侧：`arch/x86/kvm/cpuid.c:647-660` 的
+  `kvm_cpu_cap_mask(CPUID_1_ECX, …)` 白名单在 bit24 位置显式写
+  `0 /* Reserved*/`（Linux 功能字 word 4 = leaf1 ECX，
+  `arch/x86/include/asm/cpufeatures.h:113-144`，bit24=
+  `X86_FEATURE_TSC_DEADLINE_TIMER`、bit31=`X86_FEATURE_HYPERVISOR`）；
+  全树唯一的 `X86_FEATURE_TSC_DEADLINE_TIMER` 引用是 `cpuid.c:399` 的
+  **读取**（依 guest CPUID 定 `timer_mode_mask`），无任何
+  `kvm_cpu_cap_set(...TSC_DEADLINE_TIMER)`；`cpuid.h:61-68` 的
+  `cpuid_entry_override()` 用 kvm_cpu_caps **整体覆盖** ECX。
+  → 6.12.93 在任何宿主上 supported CPUID bit24 恒 0。
+- QEMU 自证：`target/i386/kvm/kvm.c:461-467` 注释
+  "tsc-deadline flag is not returned by GET_SUPPORTED_CPUID, but it can be
+  enabled if the kernel has KVM_CAP_TSC_DEADLINE_TIMER, and the irqchip is
+  in the kernel"，随后 `ret |= CPUID_EXT_TSC_DEADLINE_TIMER;` 自行补位。
+- 本机实测（运行内核 6.8.0-51 的 kvm）：leaf1 `ECX=0x76fab223`
+  （与文档引用的值一致），其中 **bit24=0**、bit31=0、bit21=1，8 个核采样恒定；
+  `KVM_CHECK_EXTENSION(KVM_CAP_TSC_DEADLINE_TIMER)=1`。
+- 连带事实：`practice/minivmm.c` 的 `setup_cpuid()` 只清 bit21、置 bit31，
+  **从未置 bit24** ——照原"保留"指引实现恰好落进陷阱 2 警告的
+  `timer_mode_mask=1<<17`/deadline 设不上。phase8 对照实验
+  `experiment3-lapic.c:125` 实际就是手动 `(1u << 24)`。
+
+**正确结论**：bit24 与 bit31 同理，必须 **VMM 自己置位**（前提：
+`KVM_CAP_TSC_DEADLINE_TIMER`=1 + in-kernel irqchip）。已改写
+`project1`（M3 条目 + 陷阱 2 加注）、`practice/README.md` CPUID 表
+（"保留"→"置位"，并注明 minivmm.c 现状未置、PIC 阶段无影响）与
+`minivmm.c` 注释。**行为未改**：本仓既有实测数据均在 bit24=0 的 PIC
+/virtual-wire 配置下采集，改代码会使数据失效；deadline 场景请以
+phase8 实验 3 为准。
+
+### L2.（中）`project2:15` ——"x86 上 QEMU/Firecracker 靠 ACPI 表描述设备"与源码不符
+
+QEMU 10.1.0-rc2 的 x86 microvm 对 virtio-mmio 是往**内核命令行**追加
+`virtio_mmio.device=512@0x%lx:%ld`（`hw/i386/microvm.c:362-366`），不是
+ACPI 表。项目采用的 cmdline 通道正是 QEMU/Firecracker 的标准做法
+（Firecracker 无本地源码，标待核实）。原文把设计动机（"为不手写 ACPI"）
+建立在错误前提上，已改写。
+
+### L3.（中）`project3:55-57` —— `VFIO_DEVICE_READ/WRITE` 不存在、config 不是 region 0
+
+6.12.93 `include/uapi/linux/vfio.h` 中没有任何名为
+`VFIO_DEVICE_READ/WRITE` 的 ioctl；配置空间读写是对 device fd 直接
+`pread/pwrite`（本项目 `minivmm.c:2060-2068` 即正确实现）。region 索引
+枚举为 BAR0-5 = 0-5、ROM = 6、**CONFIG = 7**
+（`include/uapi/linux/vfio.h:620-627`），常量全名
+`VFIO_PCI_CONFIG_REGION_INDEX`。原文"作用于 `VFIO_PCI_CONFIG_REGION`
+（region 0）"三处均误，已改写。
+
+### L4.（中）`project4:33` —— perf 示例缺 `-a`，与同文"测量陷阱备忘"自相矛盾
+
+`perf kvm stat record -- sleep 30`：6.12.93
+`tools/perf/builtin-kvm.c:1959-1960` 仅在 target 为空时才置
+`system_wide=true`；该写法 target=sleep，vCPU 线程退出全部丢失（且 sleep
+自身无任何 kvm 事件）。原文 :502-505 与 `practice/README.md`
+项目 4 M2（`record -a -- sleep 15`）都明确"必须 `-a`"。已补 `-a` 并加注释。
+
+### L5.（中）`practice/README.md:297` ——"q35 为默认 machine"不符合 10.1.0-rc2
+
+QEMU 10.1.0-rc2 `hw/i386/` 下无任何 machine 设 `is_default`；
+`system/vl.c:852-866` 的 `find_default_machine()` 返回 NULL，此时不带
+`-machine` 直接报 "No machine specified, and there is no default"。
+bench 实际是脚本显式 `-machine q35`（`bench-boot.sh:57-58`），历史上
+QEMU x86 默认也从来是 pc(i440fx) 而非 q35。已改为"bench 选用"。
+
+### L6.（中）`project4:11/24/122`、`practice/README.md:343` —— `../phase11-microvm/README.md` 悬空引用 ×4
+
+仓库中不存在 `phase11-microvm/`（phase11 只有 debugging），全仓检索亦无
+MicroVM 章节文档。四处引用已删除或改指 `hw/i386/microvm.c` 源码与
+本文档项目 4 M1 实测。
+
+### L7.（低）`project1:34-35` —— `ext_ramdisk_image/size` 不是 setup_data 条目
+
+它们是 **struct boot_params 的直接字段**（`bootparam.h:128-129`，原行号
+引用正确），内核 `get_ramdisk_image()` 以
+`(u64)boot_params.ext_ramdisk_image << 32` 拼 64 位地址
+（`arch/x86/kernel/setup.c:233-243`）。已改写措辞。
+
+### L8.（低）`project1:54-55` —— TSS/identity map "VMX 需要"是 !URG/旧内核前提
+
+api.rst:1427/:1611 仍写 "This ioctl is required on Intel-based hosts"，
+原文照搬。但 6.12.93 在 unrestricted guest（默认开 `vmx.c:101`；本机
+`kvm_intel.unrestricted_guest=Y`）下：`vmx_set_tss_addr()` 直接
+`return 0` 不分配（`vmx.c:5110-5111`），identity map 仅在
+`enable_ept && !enable_unrestricted_guest` 时初始化（`vmx.c:7599`）。
+已加注（保留调用无害、兼容 !URG）。
+
+### L9.（低）`project1:86`、`practice/README.md:121` —— 机器常量不可复现
+
+leaf1 的 EBX 来自**执行 ioctl 的那个核**的宿主 CPUID（6.12.93
+`cpuid.c:974-979`：`get_cpu()` + `do_host_cpuid()`，EBX 不在 override 白名单
+内）；本机按核采样 EBX[31:24] = 0x00/0x1a/0x38/0x56/0x74… 浮动，
+"本机 0x60"并非机器常数；EBX[23:16] 实测恒 0x40=64（96 是 nproc 概念）。
+归零/改 1 的建议不变，表述已修正。
+
+### L10.（低）`project4:67` —— `override_halt_poll_ns` 行号偏一
+
+6.12.93 `virt/kvm/kvm_main.c:5064` 是 `smp_wmb()`，
+`kvm->override_halt_poll_ns = true` 在 `:5065`。已改。
+
+### L11.（低）`project2:6/99/156` —— 残留旧编号 "phase5"（应为 phase6）
+
+K 节的改号表未覆盖 project2：前置、M3"数据面下沉"出处、参考资料标签
+三处 phase5→phase6（同文件 :156 的链接路径本来就是 `../phase6-virtio/`，
+自相矛盾）。已改。
+
+### L12.（低）`project2:7/155` —— spec 路径悬空
+
+commit 6448085 已把规范 PDF 归入 `spec/`；`../virtio-v1.3-csd01.pdf`
+→ `../spec/virtio-v1.3-csd01.pdf`（README.md:133-134 已是新路径）。已改。
+
+### L13.（低）`README.md:87` —— 环境表"内核 6.12.93"与实机不符
+
+本章 file:line 全部基于 6.12.93 **源码**，但运行时 KVM 是宿主 6.8.0-51
+的内建模块，存在可测的版本差异（如 supported CPUID leaf1 的 VMX 位：
+6.8 实测透传、6.12.93 白名单已排除）。已把该差异写进环境行。
+
+### L14.（低）`practice/README.md:388` —— `/tmp/mvidle.kvmexit15` 证据不可复核
+
+该原始 trace 未归档进 `bench/exits-20260901-101641/`，文件已不存在。
+4 次 PIO 机制与 `drivers/irqchip/irq-i8259.c`
+（`mask_and_ack_8259A()` :134 起：IN/OUT 0x21 + OUT 0x20；
+`enable_8259A_irq()`：OUT 0x21）静态一致，但已加"不可复核、下轮重跑归档"
+标注。
+
+### L15.（低）`project4:9` —— halt-polling 机制节号错
+
+`../phase0-kvm-framework/annotations.md` 中 halt-polling 是
+`## 7. halt-polling`（:284），§9 是"底层阻塞原语"（:402）。已改 §9→§7。
+
+### 本轮核过且无误的部分（免再查）
+
+project1/2/3/4 与 practice 的"内核侧代码路径"表 file:line 全部命中：
+`kvm_main.c:4516/4542/5170/5257/5266/5311/5552/78-95/3680-3682/3686/3689-3706/3787-3802/3865/3872-3874/5035/5052/5056`，
+`x86.c:3215/3890/5957/6528/7069/7072/7090-7125/4652`，
+`cpuid.c:399-402/457/647-660`，`lapic.c:2391/2585/3308-3313`，
+`eventfd.c:48-52/579/999`，`irq_comm.c:375-385`，
+`virtio_mmio.c:718/768`，`virtio_blk.h:165/166/174/317-319`，
+`virtio_pci.h:74-80`，`bootparam.h`/`boot.rst`（含 :189、:1348-1352、
+:1366-1372 的 32-bit 入口约定），`reboot.c:667/698`，
+`8250_port.c:1175/1215-1219/1241/1305`，`autoprobe.c:61/81`，
+`i8042.c:1556`/`i8042.h:34`，`acpi/boot.c:983-988`，
+`builtin-kvm.c:602-613/1959-1960`，`vmx.c:204-219`（ple_* 全 0444），
+`vfio_pci_intrs.c:510/854-857`，`msi.c:725/740/756/758`，`msi.h:43-55`。
+机器常量复核：ECX=`0x76fab223`、`0x40000001` eax=`0x01007efb`、
+halt_poll 残留 `200000/2/10000/0`、`4b:00.0`=1af4:1001 绑 vfio-pci
+且独占 group 35、`CONFIG_HZ=250`、`kvm_halt_poll_ns` tracepoint 存在——
+均与文档一致。

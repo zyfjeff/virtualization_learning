@@ -20,12 +20,18 @@
 | # | 预测 | 否证意味着 | 判据所在 |
 |---|---|---|---|
 | **P1** | 宿主 `tsc → hpet`，**不重启 VM**，几毫秒内该 VM 的 `use_master_clock` 翻成 0 | 说明失效链不在 notifier 上，`../../annotations.md` §3.1.1 的链路读错了 | §4.1-A2 |
-| **P2** | 宿主 `hpet → tsc`，同一台 VM **永远不会**自己翻回 1（哪怕跑满一个采样窗） | 说明还有一条我没找到的 on-edge 触发路径 | §4.1-A3 |
-| **P3** | P2 之后新建的第二台 VM **立刻能拿到** masterclock 1，而第一台仍是 0 | 说明主时钟不是全局状态而是 per-VM 状态，§3.1.1 的六个重算点分类错 | §4.1-A4 |
+| **P2** | 宿主 `hpet → tsc`，同一台 VM 在**静默窗内**不会自己翻回 1（A3 全程只跑 E3 的无锁负载，不创建 vCPU、不动 MSR/hypercall、不切 memslot 标志） | 说明还有一条**由 clocksource 换回这一事件驱动**的 on-edge 路径（`pvclock_gtod_notify()` `arch/x86/kvm/x86.c:9687-9689` 的 `&&` 只判离边，故预期不会发生） | §4.1-A3 |
+| **P3** | P2 之后新建的第二台 VM **立刻能拿到** masterclock 1，而第一台仍是 0 | 说明主时钟不是全局状态而是 per-VM 状态，§3.1.1 的 **9 个**重算入口分类错 | §4.1-A4 |
 | **P4** | "主时钟 off + 宿主在 tsc 上"的 VM，其 `kvm:kvm_pvclock_update` 速率显著高于"主时钟 on"的同构 VM，且**上界符合 §3.1.2 的限流模型** | 说明 `x86.c:5034` 那个乘积项其实不发生，或被别的路径吞掉 | §4.1-A5 |
 
-P2 + P3 是本章真正的收获：**同一台宿主上两台 VM 的时钟快路径可以永久分叉**，
+P2 + P3 是本章真正的收获：**同一台宿主上两台 VM 的时钟快路径可以长期分叉**，
 而且这个分叉态恰好是 A5 的干净对照组（见 §3 末尾）。
+
+★ 但"长期"不等于"永久"，本实验**不声称**永久：把关闭态点亮只需要一次重算事件，
+而这类入口有 9 个且都与 clocksource 切换无关（新建 vCPU、`KVM_SET_CLOCK`、
+guest 动 MSR/Hyper-V/Xen 接口等，全表见 `../annotations.md` §3.1.1）。
+所以 A3 的判据是"**这一段静默窗里**一条 `masterclock 1` 都没有"，
+写结论时不得升格成"该 VM 再也不会恢复"。
 
 ---
 
@@ -41,7 +47,7 @@ x86 上只有 `tsc-early` 与 `tsc` 两个时钟源的 `vdso_clock_mode` 是
 
 - `clocksource_enqueue_watchdog()`（`kernel/time/clocksource.c:623-636`）把
   MUST_VERIFY 的都塞进 `watchdog_list`；
-- `clocksource_watchdog()`（`:424` 起）周期性拿 `watchdog`（一个非 MUST_VERIFY
+- `clocksource_watchdog()`（`kernel/time/clocksource.c:422` 起）周期性拿 `watchdog`（一个非 MUST_VERIFY
   的时钟源，本机是 hpet/acpi_pm）做基准比斜率，超了就
   `__clocksource_unstable()`（`:194-201`）—— 清 `CLOCK_SOURCE_VALID_FOR_HRES`、
   置 `CLOCK_SOURCE_UNSTABLE`、`rating` 归零。
@@ -271,7 +277,7 @@ sudo ./bench-clock-master.sh --until A3 --fallback acpi_pm --sample-s 30
 7. **别把 A5 的 `C-off` 与 A2 混为一谈**：`C-off` 的采样期宿主已经回到 `tsc`，
    它测的是"宿主在 TSC 上但主时钟被永久性地留在关闭态"这个**只有 P2 成立才存在**的状态。
 8. **★ 观测窗必须跨过触发点，稳态窗里的 0 没有任何信息量**：`kvm_update_master_clock`
-   只在六个重算点发出（`../annotations.md` §3.1.1 的表），VM 起来之后就**不再周期性地打**。
+   只在**有重算事件**时发出（`../annotations.md` §3.1.1 的表列了 9 个入口），VM 起来之后就**不再周期性地打**。
    所以"VM 已经跑了 20 s，这窗里 0 条 `masterclock 1`"完全不能证明主时钟是关的 ——
    它可能只是没人触发重算。脚本因此把每一臂的窗都开在**动作之前**、关在动作之后：
    A1 跨 boot、A2 跨切换、A4 跨 VM2 创建、A5 另开 boot / off-edge / 断言三个窗。

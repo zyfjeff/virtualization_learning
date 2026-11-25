@@ -106,7 +106,7 @@ Guest 要执行**真实指令**（接近原生速度），不能逐条模拟；�
 - **硬件辅助 trap-and-emulate（VT-x）**：新增 root/non-root 模式，Guest 在 non-root
   原生执行，**只有 VMCS 配置的事件**才 VM-Exit 回 root。用硬件换速度+控制权的平衡。
 - **软件补充**：CPUID/MSR/特权指令三大信息接口硬件不全自动虚拟化
-  → CPUID 无条件 exit（SDM 25.1.2）、MSR Bitmap 逐 MSR 粒度、VM-Execution Controls 配指令拦截
+  → CPUID 无条件 exit（SDM 26.1.2）、MSR Bitmap 逐 MSR 粒度、VM-Execution Controls 配指令拦截
   （详见 [`cpu-virtualization.md`](cpu-virtualization.md)）。
 
 ### 机制全景：VMX 模式与 VMCS
@@ -171,7 +171,7 @@ VM-Exit 留在内核（快速路径），只把需要设备模拟的 exit 回 QE
 | ex1 | VMX capability MSR 编码（§5） | 7 个 MSR 的 allowed-0/1 解出特性依赖链 | `practice/ex1-vmx-verify.c` |
 | ex2 | MSR Bitmap 逐 MSR 拦截（cpu-virt §2） | 透传 MSR 无 kvm_msr trace，拦截的有 | `practice/ex2-cpuid-fault.c` + `trace-msr-access.sh` |
 | ex3 | VM-Exit 快/慢路径（§3） | 不同负载 exit reason 分布不同 | `practice/ex3-msr-test.c` + `profile-vmexit.sh` |
-| ex4 | CPUID 总 exit（cpu-virt §1，SDM 25.1.2） | Guest CPUID 必产生 kvm_cpuid trace | `practice/ex4-cpuid-analysis.c` |
+| ex4 | CPUID 总 exit（cpu-virt §1，SDM 26.1.2） | Guest CPUID 必产生 kvm_cpuid trace | `practice/ex4-cpuid-analysis.c` |
 | ex5 | halt-polling 自适应（phase0 §7） | 四档 poll 参数改变 halt 延迟/CPU 占用 | `practice/ex5-vmexit-overhead.c` + `trace-vcpu-sched.sh` |
 
 ---
@@ -189,7 +189,7 @@ VM-Exit 留在内核（快速路径），只把需要设备模拟的 exit 回 QE
 
 ## ⚠️ 陷阱与勘误
 
-1. **CPUID 不是"可拦截可不拦截"**：CPUID 在 non-root **无条件** VM-Exit（SDM 25.1.2），
+1. **CPUID 不是"可拦截可不拦截"**：CPUID 在 non-root **无条件** VM-Exit（SDM 26.1.2），
    不存在 "CPUID exiting" 控制位（Secondary Exec bit12 是 INVPCID）。详见 cpu-virtualization.md §1.1。
 2. **AGENTS.md #7**：启动 VM 必须 `-enable-kvm -cpu host`，否则静默回退 TCG，
    所有 KVM 追踪实验得出"没有 VM-Exit"的错误结论。

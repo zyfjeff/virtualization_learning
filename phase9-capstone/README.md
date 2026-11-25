@@ -84,7 +84,7 @@ VFIO 直通，最后与 QEMU/Firecracker 对标性能。
 | 项 | 要求 |
 |----|------|
 | CPU | Intel VT-x + EPT（`grep -E 'vmx|ept' /proc/cpuinfo`），TSC-deadline timer |
-| 内核 | 6.12.93（本项目基线），加载 `kvm` + `kvm_intel` |
+| 内核 | 源码基线 6.12.93（本章全部 file:line 指向它），需加载 `kvm` + `kvm_intel`。注意：**本仓实测宿主实际运行 6.8.0-51-generic**，运行时 KVM 即其自带模块——行号与个别行为随运行内核漂移（如 supported CPUID leaf1 的 VMX 位：6.8 实测透传，6.12.93 白名单 `cpuid.c:647-660` 已排除），对照前先确认当前运行内核 |
 | 权限 | `/dev/kvm` 读写（实验均需 root） |
 | 工件 | 自编内核（`scripts/vm/build-kernel.sh` 产物 bzImage）+ initramfs（`scripts/vm/build-rootfs-*.sh`） |
 | 项目 3 额外 | 启用 VT-d（`intel_iommu=on`）、可直通的独立 IOMMU group 设备（详见 `../phase7-vfio/README.md` §1.4） |

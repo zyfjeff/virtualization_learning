@@ -5,7 +5,8 @@
 #   A0 无 VM 切一个来回 → A1 起 VM1 → A2 切走 → A3 切回 → A4 再起 VM2 → A5 迁移代价对照
 #
 # ★ 观测窗必须**跨过触发点**：稳态窗口里本来就不会有 master_clock 事件
-#   （只有六个重算点会发，见 bench-clock-master.md §6.8），窗内 0 条不等于机制没跑。
+#   （只有 9 个重算入口会发，见 bench-clock-master.md §6.8 与 ../annotations.md §3），
+#   窗内 0 条不等于机制没跑。
 # ★ 真跑必须带 --i-accept-clocksource-risk：clocksource 看门狗可能把宿主 TSC
 #   永久判死（只能重启恢复），理由与缓解见 bench-clock-master.md §2.1。
 # ★ 写 current_clocksource 之后一律**复读**判定，写入返回成功不代表切成了（§6.1）。

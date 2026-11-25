@@ -33,7 +33,7 @@
 |------|------|---------|
 | `README.md` | 本文件：场景导航 + 快速参考 | 入口 |
 | [`annotations.md`](annotations.md) | KVM trace events 完整目录 + bpftrace 脚本集 | 需要具体 tracepoint 参数或脚本时 |
-| [`corrections.md`](corrections.md) | 11 条常见错误（模块参数、trace 字段、tracefs 用法） | **写脚本前先扫一遍** |
+| [`corrections.md`](corrections.md) | 26 条常见错误（模块参数、trace 字段、tracefs 用法、QEMU 用法） | **写脚本前先扫一遍** |
 | [`launch-failures.md`](launch-failures.md) | VM 启动失败诊断 | KVM_CREATE_VM/VCPU/RUN 失败 |
 | [`vcpu-exit-diagnosis.md`](vcpu-exit-diagnosis.md) | vCPU 异常退出诊断 | VM 运行中崩溃、vCPU stopped |
 | [`performance-analysis.md`](performance-analysis.md) | 运行时性能瓶颈定位 | VM 性能不及预期 |
@@ -58,7 +58,7 @@
 9. 用 `kvm_halt_poll_ns` 跟踪 halt-polling 窗口自适应
 10. 区分 `>` 与 `>>` 在 `set_event` 上的行为差异（见 `corrections.md` C3）
 11. 知道 `kvm_exit` 的 `exit_reason` 在 trace 文本里是符号名、在 BPF 里是数字（见 `corrections.md` C6）
-12. 知道 `perf kvm stat` 必须 `-a` system-wide，否则丢 vCPU 线程数据（见 `corrections.md` C5）
+12. 知道 `perf kvm stat` 本章一律用 `-a` system-wide，避免 target 口径把"没采到"读成"没有退出"（`corrections.md` C5；成因见 C19——不是"vCPU 线程不在 `-p` 范围"）
 
 ---
 
@@ -88,7 +88,7 @@
 ### 场景 1: VM-Exit 频率过高
 
 ```bash
-# ★ 必须 -a system-wide（见 corrections.md C5）
+# ★ 用 -a system-wide（corrections.md C5；成因见 C19）
 sudo perf kvm stat record -a -- sleep 10
 sudo perf kvm stat report
 
@@ -108,7 +108,7 @@ echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_inj_virq >> /sys/kernel/debug/tracing/set_event
 echo kvm:kvm_apic_accept_irq >> /sys/kernel/debug/tracing/set_event
 
-# 测量延迟（详细脚本见 annotations.md §6.1）
+# 测量延迟（详细脚本见 annotations.md §10）
 sudo bpftrace -e '
 kprobe:vmx_handle_exit { @start[tid] = nsecs; }
 kretprobe:vmx_handle_exit {
@@ -228,7 +228,7 @@ dmesg | grep -A30 'VMCS'   # 如果 dump_invalid_vmcs 启用
     │   └─ TSC 不同步 → kvm_track_tsc → performance-analysis.md §7
     │
     └─ 测试新功能？
-        └─ KVM selftests → annotations.md §5
+        └─ KVM selftests → tools/testing/selftests/kvm/（本章无对应章节）
 ```
 
 ---
@@ -237,14 +237,19 @@ dmesg | grep -A30 'VMCS'   # 如果 dump_invalid_vmcs 启用
 
 | 场景 | 推荐工具 | 优势 | 文档 |
 |------|---------|------|------|
-| VM-Exit 分布统计 | `perf kvm stat` | 开箱即用，输出清晰 | `annotations.md` §2 |
-| 函数级调用跟踪 | ftrace function_graph | 显示完整调用栈 | `annotations.md` §4.2 |
-| 自定义延迟测量 | bpftrace | 脚本化，灵活 | `annotations.md` §6 |
-| 运行时状态查看 | debugfs | 直接读取 KVM 内部状态 | `annotations.md` §3 |
+| VM-Exit 分布统计 | `perf kvm stat` | 开箱即用，输出清晰 | `annotations.md` §8 |
+| 函数级调用跟踪 | ftrace function tracer | 显示 ioctl/入口链路 | `launch-failures.md` §5.1 |
+| 自定义延迟测量 | bpftrace | 脚本化，灵活 | `annotations.md` §10 |
+| 运行时状态查看 | debugfs | 直接读取 KVM 内部状态 | `annotations.md` §9 |
 | VMCS 状态导出 | `dump_invalid_vmcs` | VM-Entry 失败时的关键信息 | `launch-failures.md` §4 |
 | 异常注入跟踪 | `kvm:kvm_inj_exception` | triple fault 诊断 | `vcpu-exit-diagnosis.md` §5 |
-| 回归测试 | KVM selftests | 自动化，可重复 | `annotations.md` §5 |
-| 实时流式输出 | ftrace trace_pipe | 实时查看事件 | `annotations.md` §4.5 |
+| 实时流式输出 | ftrace trace_pipe | 实时查看事件 | `vcpu-exit-diagnosis.md` §5.3 |
+
+> ★ `annotations.md` 的实际章节是：§1 入口与退出、§2 中断、§3 内存、§4 时钟、
+> §5 性能调优、§6 tracefs 全局状态、§7 CPU 操作、§8 perf kvm stat、§9 debugfs、
+> §10 bpftrace 脚本集、§11 嵌套、§12 完整调用链。
+> 它**没有** ftrace function_graph / trace_pipe / KVM selftests 章节，
+> 旧表里指向 §2/§3/§4.x/§5/§6 的条目都按上面的真实位置改正了。
 
 ---
 
@@ -282,13 +287,13 @@ phase10 性能测量     → 测量纪律与观测成本看 phase10-performance/
 - [ ] 能根据调试决策树快速定位问题
 - [ ] 知道 `>` 与 `>>` 在 `set_event` 上的差异（C3）
 - [ ] 知道 `kvm_exit` 的 `exit_reason` 在 trace 里是符号名（C6）
-- [ ] 知道 `perf kvm stat` 必须 `-a` system-wide（C5）
+- [ ] 知道 `perf kvm stat` 用 `-a` system-wide，且能说清 C19 修正后的真实成因
 - [ ] 知道 `dump_invalid_vmcs` 默认关闭，需要手动启用
 - [ ] 能区分 `KVM_EXIT_FAIL_ENTRY` / `INTERNAL_ERROR` / `SHUTDOWN` 的诊断路径
 
 深度自测（答不出 = 没学会）：
 
-- [ ] **反事实**：如果 `perf kvm stat` 不加 `-a`，会丢什么数据？为什么诊断结论会错？
+- [ ] **反事实**：如果 `perf kvm stat` 不加 `-a` 而用 `-p`/`-t`，统计口径变成什么？为什么据此下的"没有 VM-Exit"结论不可信？（并解释为什么"vCPU 线程不在 -p 范围"这个说法是错的，见 C19）
 - [ ] **不可简化**：为什么诊断要先扫 corrections.md 再写脚本？省掉这步会踩哪些静默坑？
 - [ ] **推导**：从"trace 文本是符号名、BPF 是数字"推出"按 reason=[0-9] grep trace 永远抓不到"。
 

@@ -84,10 +84,17 @@ guest RAM 的后端
 
 同一个字段名，两个调用点传的东西不同：
 
-| 调用点 | 第三个实参 | 位含义 |
+| 调用点（`trace_kvm_page_fault()` 的三个发出点） | 第三个实参 | 位含义 |
 |---|---|---|
-| `handle_ept_violation()` → `arch/x86/kvm/vmx/vmx.c:5799` | **原始 `exit_qualification`** | EPT violation 位：bit0 R / bit1 W / bit2 X 是**访问类型**；bits5:3 是**当时 EPT 表项的 RWX** |
-| `kvm_mmu_do_page_fault()` → `arch/x86/kvm/mmu/mmu.c:4655` | 已合成的 #PF 风格 `error_code` | `PFERR_*`：bit0 present、bit1 write、bit2 user |
+| `handle_ept_violation()`（函数 `arch/x86/kvm/vmx/vmx.c:5782`）→ trace 在 `:5799` | **原始 `exit_qualification`** | EPT violation 位：bit0 R / bit1 W / bit2 X 是**访问类型**；bits5:3 是**当时 EPT 表项的 RWX** |
+| `kvm_handle_page_fault()`（函数 `arch/x86/kvm/mmu/mmu.c:4628`）→ trace 在 `:4655` | 已合成的 #PF 风格 `error_code` | `PFERR_*`：bit0 present、bit1 write、bit2 user |
+| `svm.c:2139`（AMD NPF，`exit_info_1` **原样**当 `error_code`） | 同 #PF 语义 | ★ 跨厂商：那里 bit2 是 **U/S**，不是"读" |
+
+> **勘误**：本行旧版写作 `kvm_mmu_do_page_fault() → mmu.c:4655`，函数名错了。
+> `mmu.c:4655` 是 `kvm_handle_page_fault()` 里的 trace 发出点；
+> `kvm_mmu_do_page_fault()` 是 **`static inline`**，定义在
+> `arch/x86/kvm/mmu/mmu_internal.h:293`，它**不**发这条 tracepoint。
+> 内联函数也就挂不上 function tracer（§4.2 的教训同样适用）。
 
 合成发生在 `__vmx_handle_ept_violation()`（`arch/x86/kvm/vmx/common.h:9`）
 —— 也就是说**打完 tracepoint 才换算**，trace 里看到的是换算**前**的值。
@@ -170,12 +177,33 @@ H5 就是为这笔拆页代价准备的：先把整块 guest RAM 触碰一遍建
 | **建表型 vs 写保护型缺页** | 同一条 `kvm:kvm_page_fault`，按 §2.3 的 EPT 位掩码分桶：`err & 0x38` 为 0 → 建表；非 0 且 `err & 0x10` 为 0 → 写保护后重放开。H5−H2 的取证就在这里 |
 | 粒度 | §2.1 三路推断 |
 | guest 负载耗时 | guest 内**分轮 `dd if=/dev/zero of=/e2 bs=1M count=$CNT`**，每轮后 `echo RN <i> <epoch>`；宿主按标记落盘时刻算每轮时长，取中位数 + 离散度。**★ 写 `/dev/null` 不算负载**：目标端直接丢弃，只有 `dd` 自己那块反复复用的缓冲区会被映射，**建表量与写入量无关**，测不出粒度差 |
-| 脏页日志是否真开着 | **唯一硬判据：数 `mark_page_dirty_in_slot` 的命中**（`virt/kvm/kvm_main.c:3604`），它命中即证明 `kvm_slot_dirty_track_enabled()` 为真（`:3617`）。用 §4.2 的函数统计器，别用 `current_tracer=function`。辅判据：H1→H3 的**缺页次数突变**。**不要用 `kvm:kvm_dirty_ring_*`**，见 §4.1 |
-| 大页是否**真的被拆了** | 数 `kvm_mmu_slot_try_split_huge_pages` 的命中（调用点 `arch/x86/kvm/x86.c:13251`）：**命中即该臂确有 2M 映射被拆**，是 H5−H2 的机制侧证据。`kvm_mmu_slot_remove_write_access`（`:13257`）每次开日志都命中，只能证明"日志开了"，不能证明拆过页 —— 两者必须分开数 |
+| 脏页日志是否真开着 | **硬判据：数 `kvm_mmu_slot_remove_write_access` 的命中**（调用点在 `kvm_mmu_slot_apply_flags()`（`arch/x86/kvm/x86.c:13185`）的**开日志分支**
+`else` 里，`:13242` 起；两个调用点 `:13255`（`PG_LEVEL_2M`，
+`cpu_dirty_log_size != 0` 即 PML 路径）与 `:13257`（`PG_LEVEL_4K`，无 PML 路径）。
+进入该分支的前提：`KVM_MEM_LOG_DIRTY_PAGES` 正在被翻转（`:13224-13225` 的
+`WARN_ON_ONCE` 保证）且不是 manual-protect 模式（`:13247-13248` 直接 `return`））→ **命中即"这一臂真的打开过脏日志"**。★ **不能**用 `mark_page_dirty_in_slot` 的命中当这个判据（本行旧版就是这么写的，见下方勘误）。辅判据：H1→H3 的**缺页次数突变**。**不要用 `kvm:kvm_dirty_ring_*`**，见 §4.1 |
+| 大页是否**真的被拆了** | 数 `kvm_mmu_slot_try_split_huge_pages` 的命中（调用点 `arch/x86/kvm/x86.c:13251`，前提 `eager_page_split=1`）：**命中即该臂确有 2M 映射被拆**，是 H5−H2 的机制侧证据。上一行的 `kvm_mmu_slot_remove_write_access`（两个调用点 `:13255`/`:13257`，函数统计器按名字计数、不分行）每次开日志都命中，只能证明"日志开了"，**不能**证明拆过页 —— 两者必须分开数 |
 | PML 记录量 vs 逐页写保护量 | `kvm:kvm_pml_full`（`arch/x86/kvm/trace.h:963`，参数**只有** `vcpu_id`）+ 退出号 **62**（`EXIT_REASON_PML_FULL`，`arch/x86/include/uapi/asm/vmx.h:88`）。PML 缓冲一次装 **512** 条（`PML_ENTITY_NUM`，`arch/x86/kvm/vmx/vmx.h:336`），处理函数 `handle_pml_full()`（`arch/x86/kvm/vmx/vmx.c:5962`）→ `pml_full 次数 × 512` 是"经 PML 记下的脏页条目数"的**上界** |
 | EPT violation 总量 | 退出号 **48**（`arch/x86/include/uapi/asm/vmx.h:74`）。H4（`pml=0`）的每一次脏页记录都要走一次 48，这是 Q3 的主对账量 |
 | 宿主 CPU% | `/proc/<qemu>/stat` utime+stime |
 | ring buffer 溢出 | `per_cpu/cpu*/stats` 的 `overrun`，非零则计数作废（`../measurement.md` §4(c)） |
+
+> **勘误（本轮源码核查）**：本节旧版把 `mark_page_dirty_in_slot` 的函数命中写成
+> "脏日志是否真开着的**唯一硬判据**，命中即证明 `kvm_slot_dirty_track_enabled()` 为真"。
+> **这个推论不成立**：`kvm_slot_dirty_track_enabled()` 的判断在函数**内部**
+> （`virt/kvm/kvm_main.c:3604` 是入口，`:3617` 才是那个 `if`），而调用方**并不预筛** ——
+> steal-time 那两个调用点是**无条件**的：`record_steal_time()`
+> （函数 `arch/x86/kvm/x86.c:3668`，写完后从 `dirty:` 标签 `:3763` 调它）与
+> `kvm_steal_time_set_preempted()`（`:5044` 起，`:5088` 调它）。两条路的触发频率
+> 与脏日志毫无关系：`KVM_REQ_STEAL_UPDATE` 在**每次** `kvm_arch_vcpu_load()` 里
+> 无条件置位（`:5041`），消费在 `vcpu_enter_guest()`（`:10867-10868`）；
+> `kvm_steal_time_set_preempted()` 由 `kvm_arch_vcpu_put()`（`:5091`）在 `:5106` 调。
+> 唯一的前置条件是 guest 启用了 steal time（`msr_val & KVM_MSR_ENABLED`，
+> `:3682-3683`；Linux guest 默认开）。于是**脏日志全关的臂也会有一堆命中**
+> —— 拿它当开关判据是系统性假阳。
+> 反过来用它数"脏页记账量"仍可用（§4.1 的汇聚点理由不变），但必须减去 steal-time 的
+> 贡献，或者只在 `kvm_mmu_slot_remove_write_access` 已命中的臂里解读。
+> 判据本身换成上表那条：`kvm_mmu_slot_remove_write_access` 只在开日志分支里被调用。
 
 **判据的与关系**：
 Q2 要成立必须 (i) H3 的缺页次数与 H1 同量级（粒度没变）、
@@ -209,8 +237,16 @@ QEMU 只有给了 `-accel kvm,dirty-ring-size=N` 才会置 `s->kvm_dirty_ring_si
 拿它做"日志没开"的证据，就是 `../measurement.md` §5 说的"测不到 ≠ 没有"。
 
 正确做法是给**汇聚点本身**下 `function` tracer：`mark_page_dirty_in_slot` 是
-`EXPORT_SYMBOL_GPL`（`:3627`）的全局函数、不会被内联进调用方，命中即等价于
-"有一个可写 SPTE 在开着脏日志的 slot 里被建立/放开"。
+`EXPORT_SYMBOL_GPL`（`virt/kvm/kvm_main.c:3627`）的全局函数、不会被内联进调用方，
+所以**统计器一定拿得到次数**。但★ 这个数只能当**"记账尝试"的上界**读，
+它**不等于**"记上的脏页数"，更不能当"日志开着"的证据：
+`kvm_slot_dirty_track_enabled()` 的判断在函数**内部**（`:3617`），
+而 steal-time 那两条路是无条件调用方（机制与行号见 §4 表下的勘误）。
+真正"记上了"只走两条分支：`kvm_dirty_ring_push()`（dirty ring 模式，`:3621-3622`）
+或 `set_bit_le()`（本仓走的 `dirty_bitmap` 模式，`:3623-3624`）。
+所以分工是：**判"日志开没开"** → 数 `kvm_mmu_slot_remove_write_access`；
+**估"记了多少页"** → 用汇聚点次数**减去同臂 steal-time 基线**
+（脚本可对 `record_steal_time` 单独计数后相减），否则跨臂比较会被 steal-time 淹掉。
 
 **下探针前的实存性检查有个坑**：`available_filter_functions` 里**模块符号带
 `[kvm]` 后缀**（实测本机是 `mark_page_dirty_in_slot [kvm]`），

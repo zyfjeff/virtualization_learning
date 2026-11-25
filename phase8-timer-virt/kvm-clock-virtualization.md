@@ -432,7 +432,10 @@ void vmx_write_tsc_multiplier(struct kvm_vcpu *vcpu)
 /* arch/x86/kvm/x86.c */
 
 /*
- * KVM_SET_TSC_OFFSET: 用户空间设置TSC偏移
+ * 用户态设置 guest TSC 的真实接口（⚠️ 不存在名为 KVM_SET_TSC_OFFSET 的 ioctl）:
+ *   - KVM_SET_MSRS 写 MSR_IA32_TSC → kvm_synchronize_tsc()（host_initiated，x86.c:3939-3940）
+ *   - KVM_VCPU_TSC_OFFSET **vCPU device attribute**（arch/x86/include/uapi/asm/kvm.h:920，
+ *     经 KVM_SET_DEVICE_ATTR 处理于 kvm_arch_tsc_set_attr，x86.c:5757/:5765）
  * kvm_synchronize_tsc(): 同步所有vCPU的TSC
  *   → 确保同一VM的所有vCPU看到一致的TSC
  *   → 在vCPU创建和迁移时调用
@@ -454,8 +457,11 @@ kvmclock 原理:
 │    struct pvclock_vcpu_time_info {  /* asm/pvclock-abi.h:26 */  │
 │        u32 version;         ← 版本号 (奇数=更新中)             │
 │        u32 pad0;            ← 对齐填充                        │
-│        u64 tsc_timestamp;   ← 写结构时的Host TSC              │
-│        u64 system_time;     ← 写结构时的Host monotonic时间     │
+│        u64 tsc_timestamp;   ← 更新时刻的 **guest(L1) TSC**     │
+│                               (kvm_read_l1_tsc, x86.c:3265)   │
+│        u64 system_time;     ← 更新时刻的 **guest kvmclock 时间**│
+│                               = kernel_ns + kvmclock_offset    │
+│                               (x86.c:3302，不是裸 host monotonic)│
 │        u32 tsc_to_system_mul; ← TSC→时间的缩放因子            │
 │        s8  tsc_shift;         ← TSC移位调整                    │
 │        u8  flags;             ← PVCLOCK_TSC_STABLE等 (u8!)    │
@@ -464,8 +470,9 @@ kvmclock 原理:
 │                                                                 │
 │  Host定期更新 (每秒或vCPU调度时):                               │
 │    version++ (变奇数)                                           │
-│    tsc_timestamp = 当前TSC                                      │
-│    system_time = 当前monotonic时间                              │
+│    tsc_timestamp = 当前 guest(L1) TSC                           │
+│    system_time = 当前 guest kvmclock                            │
+│                  (= kernel_ns + kvmclock_offset)                │
 │    计算新的 mul/shift                                            │
 │    version++ (变偶数, 表示更新完成)                             │
 └─────────────────────────────────────────────────────────────────┘
@@ -474,9 +481,13 @@ kvmclock 原理:
 │                                                                 │
 │  Guest 需要当前时间:                                           │
 │    1. 直接读共享内存中的 pvclock_vcpu_time_info                │
-│    2. current_tsc = RDTSC                                      │
+│    2. current_tsc = RDTSC   (guest 自己的 TSC)                 │
 │    3. delta_tsc = current_tsc - pvti.tsc_timestamp             │
-│    4. delta_ns = delta_tsc × mul >> (22 + shift)              │
+│    4. delta_ns = pvclock_scale_delta(delta_tsc, mul, shift)   │
+│         = ((delta_tsc << shift) × mul) >> 32                  │
+│         = delta_tsc × mul >> (32 - shift)                     │
+│         (arch/x86/include/asm/pvclock.h:44-77;                │
+│          旧文档的 ">> (22 + shift)" 常数与方向均错, 见勘误 30)  │
 │    5. current_ns = pvti.system_time + delta_ns                │
 │                                                                 │
 │    ★ 整个过程: 0次 VM-Exit! 纯内存读 + 算术运算              │
@@ -538,6 +549,8 @@ case KVM_SET_CLOCK:
 
 ```
 vDSO (Virtual Dynamic Shared Object) 是性能关键!
+（本节所有 ns/倍数均为量级估计，本仓未实测，标"待实测"；
+  测量方法与唯一数据来源见 ../phase10-performance/measurement.md）
 
 ┌─ 无 vDSO (纯 syscall) ─────────────────────────────────────┐
 │  clock_gettime()                                            │
@@ -569,7 +582,8 @@ vDSO 的前提:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│              时钟读取性能对比 (越低越好)                          │
+│        时钟读取性能对比 (越低越好; 数字为量级估计，本仓未实测，   │
+│                          待实测——方法见 phase10/measurement.md)  │
 │                                                                   │
 │  PIT:       ~1000 ns (IO端口 + VM-Exit × 2)                     │
 │  HPET:      ~500 ns  (MMIO + VM-Exit × 2)                       │
@@ -578,7 +592,8 @@ vDSO 的前提:
 │  kvmclock:  ~30 ns   (内存读 + 计算, 无VM-Exit)                 │
 │                                                                   │
 │  kvmclock 几乎和 TSC 一样快, 但:                                 │
-│    - 支持迁移 (TSC不行)                                          │
+│    - 迁移语义更直接 (tsc 也可迁移，但依赖 VMM 恢复 TSC 值 +     │
+│      offset/scaling 补偿，无 scaling 硬件时跨频迁移不可行)      │
 │    - 返回绝对时间 (TSC只是tick数)                                │
 │    - 多CPU一致 (TSC可能不同步)                                   │
 │                                                                   │
@@ -723,11 +738,13 @@ ptp_kvm 名字有误导性 —— 它不跑任何 IEEE 1588 报文!
 │  底层是一次 hypercall:                                         │
 │    KVM_HC_CLOCK_PAIRING (arch/x86/kvm/x86.c:9928)             │
 │                                                                  │
+│    /* arch/x86/include/uapi/asm/kvm_para.h:75-81 */           │
 │    struct kvm_clock_pairing {                                   │
-│        u64 sec;      /* host realtime 秒 */                    │
-│        u64 nsec;     /* host realtime 纳秒 */                  │
-│        u64 tsc;      /* 对应的 guest TSC */                    │
-│        u32 flags;                                              │
+│        __s64 sec;    /* host realtime 秒（注意是**有符号**）*/  │
+│        __s64 nsec;   /* host realtime 纳秒                    │
+│        __u64 tsc;    /* 对应的 guest TSC */                   │
+│        __u32 flags;                                           │
+│        __u32 pad[9];                                          │
 │    };                                                          │
 │                                                                  │
 │  Host 侧实现 (x86.c:9946-9951):                                │
@@ -830,7 +847,7 @@ kvm_arch_ptp_get_crosststamp()
 
 1. **原子性**：`kvm_get_walltime_and_clockread()` 同时读 `CLOCK_REALTIME` 和 TSC，
    避免两次读取之间的时间差
-2. **无网络延迟**：hypercall 是同步的，延迟只有 ~1μs
+2. **无网络延迟**：hypercall 是同步的，延迟量级 ~μs（待实测）
 3. **交叉时间戳**：返回的 `(墙上时间, TSC)` 对精确对应，PTP 可计算精确时钟偏移
 
 #### 使用方式
@@ -845,7 +862,7 @@ ls /dev/ptp*    # → /dev/ptp0
 refclock PHC /dev/ptp0 poll 3 dpoll -2 offset 0
 
 # 验证精度
-chronyc sources   # 偏移 < 1μs
+chronyc sources   # 期望亚微秒级（待实测）
 ```
 
 #### 关键内核代码
@@ -903,7 +920,9 @@ Guest 内时间
 VM 冷启动时, Guest 的墙钟 (CLOCK_REALTIME) 从何而来?
 
 ┌─ 步骤 1: Guest 内核早期启动 ─────────────────────────────────┐
-│  检测 CPUID 0x40000001 (KVM 签名)                            │
+│  检测 KVM hypervisor 签名 (CPUID leaf 0x40000000,             │
+│  KVM_CPUID_SIGNATURE, kvm_para.h:10;                          │
+│  feature 位在 0x40000001 = KVM_CPUID_FEATURES)                │
 │  kvmclock_init():                                             │
 │    ├─ 写 MSR_KVM_SYSTEM_TIME_NEW 注册 pvclock 页             │
 │    ├─ 注册 kvm-clock clocksource                             │
@@ -921,8 +940,11 @@ VM 冷启动时, Guest 的墙钟 (CLOCK_REALTIME) 从何而来?
 │    → read_persistent_clock64()                               │
 │    → kvm_get_wallclock():                                    │
 │                                                                │
-│      写 MSR_KVM_WALL_CLOCK_NEW, host 侧填页:                │
-│        wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);│
+│      写 MSR_KVM_WALL_CLOCK_NEW, host 侧 kvm_write_wall_clock  │
+│      (x86.c:2313) → kvm_get_wall_clock_epoch (x86.c:3346):    │
+│        主路径: 原子配对墙钟+TSC, 同一读数下相减 (:3387-3396)   │
+│        回退 (:3400):                                          │
+│          wall_nsec = ktime_get_real_ns()-get_kvmclock_ns(kvm);│
 │                                                                │
 │      即 "host 真实墙钟 − 当前 kvmclock" = guest 墙钟原点    │
 └────────────────────────────────────────────────────────────────┘
@@ -990,8 +1012,11 @@ VM 从无到有时，guest 的 TSC、kvmclock、masterclock 这三个基准分�
 kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
 ```
 
-`get_kvmclock_base_ns()`（x86.c:2300-2310）是 host 的单调时间
-（TSC 时钟下 = `ktime_get_raw() + offs_boot`，否则 `ktime_get_boottime_ns()`）。
+`get_kvmclock_base_ns()`（x86.c:2300-2310）是 host 的单调时间。
+它有两个版本，按**编译期** `#ifdef CONFIG_X86_64`（x86.c:2247）选择，
+**不是**"宿主用不用 TSC 时钟"的运行时分支：x86_64 下
+= `ktime_get_raw() + pvclock_gtod_data.offs_boot`（:2302-2303），
+32 位下 = `ktime_get_boottime_ns()`（#else @ :2305-2310）。
 offset 取它的负值 → **新 VM 的 kvmclock 从 0 开始**。之后
 `get_kvmclock_ns(kvm) = base + kvmclock_offset`（x86.c:3136）就是 guest 时间。
 
@@ -1032,9 +1057,11 @@ host TSC 不稳定:
 ```
 
 offset 最终经 `__kvm_synchronize_tsc()` → `kvm_vcpu_write_tsc_offset()`
-（x86.c:2613）写进 VMCS 的 `TSC_OFFSET`。同一条路径也被两个"手动"场景复用：
+（x86.c:2612）写进 VMCS 的 `TSC_OFFSET`。同一条路径也被两个"手动"场景复用：
 迁移恢复写 `MSR_IA32_TSC`（host_initiated，x86.c:3939-3940）和
-`KVM_SET_TSC_OFFSET` ioctl（x86.c:5770-5785）。
+`KVM_VCPU_TSC_OFFSET` vCPU device attribute（`kvm_arch_tsc_set_attr`，
+x86.c:5757，case @ :5765；uapi 定义 `arch/x86/include/uapi/asm/kvm.h:920`。
+注意：**没有** `KVM_SET_TSC_OFFSET` 这个 ioctl，见勘误 30）。
 
 **③ masterclock 建立 — 首次 KVM_RUN 时 (x86.c:10809 / :3082 / :3015)**
 
@@ -1435,8 +1462,13 @@ VM 快照/迁移时, 必须一起处理的四件套:
   · TSC 频率不同 → 必须有 TSC scaling 硬件支持
   · host 之间 realtime 有偏差 → 残差需要 guest 侧校
   · backwards_tsc_observed → 永久关掉 masterclock, guest 掉进慢路径
-  · flags 兼容性 → 5.16+ 主机打的快照带 flags=0xC
-                   灌到 5.10 KVM 上会直接 -EINVAL
+  · flags 兼容性 → 5.16+ 主机（masterclock 生效）打的 GET_CLOCK 结果
+                   带 flags=0xE（KVM_CLOCK_TSC_STABLE|REALTIME|HOST_TSC
+                   = 2|4|8，x86.c:3123/:3128；v5.16 同值，git 树核实；
+                   旧文档写 0xC 漏了 TSC_STABLE 位，见勘误 30）
+                   灌到 5.10 KVM 上会直接 -EINVAL——5.10 的
+                   KVM_SET_CLOCK 拒绝一切非零 flags
+                   （git v5.10 arch/x86/kvm/x86.c:5619-5621）
 ```
 
 ### 墙上时间的完整生态：RTC、hwclock、QGA 与 ptp_kvm

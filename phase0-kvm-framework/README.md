@@ -92,7 +92,12 @@ guest 要执行硬件虚拟化指令（VMXON/VMLAUNCH 需 ring0），但 VMM 本
 - **split（KVM）**：内核模块（kvm.ko + kvm-intel.ko）做 CPU/内存虚拟化（需 ring0 + 性能关键），
   QEMU 用户态做设备模拟（灵活）。边界是 `/dev/kvm` ioctl。
 - **取舍本质**：硬件访问需求 + 性能关键 → 内核；设备模型灵活性 → 用户态。
-  简单 VM-Exit（HLT/外部中断）内核快速路径闭环，复杂的（MMIO/CPUID 设备相关）才回 QEMU。
+  简单 VM-Exit（HLT/外部中断/EPT violation/CPUID/MSR）内核闭环，
+  只有设备相关的（IO、未映射 GPA 上的 MMIO、TRIPLE_FAULT）才回 QEMU。
+  ★ 别把 CPUID 算进"回 QEMU"那一类：`[EXIT_REASON_CPUID] = kvm_emulate_cpuid`
+  （`arch/x86/kvm/vmx/vmx.c:6103`）永远在内核查表返回，QEMU 只在启动时经
+  `KVM_SET_CPUID2` 把值灌进 `vcpu->arch.cpuid_entries`。详见
+  [annotations.md §10](annotations.md) 与 `../phase1-cpu-virt/cpu-virtualization.md` §1。
 
 ### 机制全景：三层架构
 

@@ -49,7 +49,7 @@ VM 性能差
 ### 2.1 perf kvm stat
 
 ```bash
-# ★ 必须 -a system-wide（见 corrections.md C5）
+# ★ 用 -a system-wide（见 corrections.md C5；成因见 C19）
 sudo perf kvm stat record -a -- sleep 10
 sudo perf kvm stat report
 ```
@@ -178,10 +178,13 @@ interval:s:10 {
 
 ```bash
 # 记录调用栈
-sudo perf kvm stat record -g -a -- sleep 30
+# ★ perf kvm stat record 显式禁用了 -g/--call-graph
+#   （tools/perf/builtin-kvm.c:1766-1767 把它们标成 PARSE_OPT_DISABLED，
+#    parse-options 会报 "is not usable"），要调用栈只能用普通 perf record：
+sudo perf record -g -a -e kvm:kvm_exit -- sleep 30
 
-# 生成火焰图（需要 FlameGraph 工具）
-sudo perf kvm stat report --stdio | head -50
+# 上一步用的是普通 perf record，所以读数据也用普通 perf 子命令
+sudo perf report --stdio | head -50
 
 # 或用 perf script + FlameGraph
 sudo perf script | ./stackcollapse-perf.pl | ./flamegraph.pl > kvm-exit.svg
@@ -216,28 +219,40 @@ interval:s:10 {
 - 热点集中在少数 2MB 区域 → 大页可显著减少缺页
 - 热点分散在多个 2MB 区域 → 大页效果有限，考虑数据布局优化
 
-### 4.2 缺页级别统计
+### 4.2 缺页"级别"：不能用 fault_address 对齐推
+
+`kvm_page_fault` **没有 `level` 字段**（`trace.h:406-411` 只有
+`vcpu_id / guest_rip / fault_address / error_code`，宿主 format 同）。
+用 GPA 是否 2MB/1GB 对齐去"猜级别"是错的：一个 2MB 对齐的 GPA
+完全可能因为脏页追踪、NX 拆分、`nx_huge_pages`、rmap 冲突而按 4K 建映射；
+反过来非对齐地址的缺页也可能落在已存在的 2MB 大页里。
+所以下面这段只能算**"访问是否落在大页边界上"的分布统计**，不是映射级别：
 
 ```bash
-# 统计 4K / 2M / 1G 缺页的比例
 sudo bpftrace -e '
 tracepoint:kvm:kvm_page_fault {
     $addr = args->fault_address;
-    if ($addr & 0x1fffff)       // 非 2MB 对齐
-        @level["4K"] = count();
-    else if ($addr & 0x3fffffff) // 非 1GB 对齐
-        @level["2M"] = count();
-    else
-        @level["1G"] = count();
+    if ($addr & 0x1fffff)        @align["非 2MB 对齐"] = count();
+    else if ($addr & 0x3fffffff) @align["2MB 对齐、非 1GB 对齐"] = count();
+    else                         @align["1GB 对齐"] = count();
 }
-interval:s:10 {
-    print(@level);
-    clear(@level);
-}
+interval:s:10 { print(@align); clear(@align); }
 '
 ```
 
-理想情况：大部分缺页应为 2M 或 1G 级别。
+要**真实映射级别**，走 MMU trace 系统 `kvmmmu:`（不是 `kvm:`）：
+
+```bash
+# kvmmmu:kvm_mmu_set_spte 带 u8 level 字段（arch/x86/kvm/mmu/mmutrace.h:334）
+sudo bpftrace -e '
+tracepoint:kvmmmu:kvm_mmu_set_spte { @level[args->level] = count(); }
+interval:s:10 { print(@level); clear(@level); }
+'
+```
+
+宿主实测 `events/kvmmmu/kvm_mmu_set_spte/format` 字段为
+`gfn / spte / sptep / level / r / x / u`，其中 `level` 才是映射级别。
+另可看 `/proc/<qemu-pid>/smaps` 的 `AnonHugePages` 判断后端是否真拿到了大页。
 
 ### 4.3 大页配置检查
 
@@ -314,24 +329,35 @@ interval:s:5 {
 
 ### 5.2 中断注入延迟
 
+> ★ 这两个事件**都没有 `vcpu_id` 字段**（`kvm_apic_accept_irq` =
+> `apicid/dm/tm/vec`，`trace.h:546-551`；`kvm_inj_virq` =
+> `vector/soft/reinjected`，`trace.h:345-349`），旧脚本里的
+> `args->vcpu_id` / `args->irq` / `args->vector`（对 accept 而言）都会让
+> bpftrace 直接报字段不存在。能用来配对的只有向量 + 事件公共字段
+> `common_pid`（= 发事件的线程 TID）。
+
 ```bash
-# 测量从中断接受到注入的延迟
+# 测量从中断接受到注入的延迟（按 TID + 向量配对）
 sudo bpftrace -e '
 tracepoint:kvm:kvm_apic_accept_irq {
-    @accept_time[args->vcpu_id, args->vector] = nsecs;
+    @accept[pid, args->vec] = nsecs;      // 字段是 vec，不是 vector
 }
-tracepoint:kvm:kvm_inj_virq /@accept_time[args->vcpu_id, args->irq]/ {
-    $delta = nsecs - @accept_time[args->vcpu_id, args->irq];
-    @inject_delay = hist($delta / 1000);  // μs
-    delete(@accept_time[args->vcpu_id, args->irq]);
+tracepoint:kvm:kvm_inj_virq /@accept[pid, args->vector]/ {   // 字段是 vector，不是 irq
+    $delta = nsecs - @accept[pid, args->vector];
+    @inject_delay_us = hist($delta / 1000);
+    delete(@accept[pid, args->vector]);
 }
 interval:s:10 {
     printf("=== 中断注入延迟（μs）===\n");
-    print(@inject_delay);
-    clear(@inject_delay);
+    print(@inject_delay_us);
+    clear(@inject_delay_us);
 }
 '
 ```
+
+> 局限：`kvm_apic_accept_irq` 可能由别的线程（例如 ioapic 路由发起方）触发，
+> 此时与 `kvm_inj_virq` 的 TID 不同，配对会漏；要精确归因 vCPU，
+> 只能结合 `kvm_exit`/`kvm_entry` 的 `vcpu_id` 间接对齐。
 
 ### 5.3 vCPU 调度抖动
 
@@ -382,28 +408,43 @@ sleep 10
 echo 0 > $TRACEFS/tracing_on
 
 # 分析 GROW vs SHRINK 比例
-cat $TRACEFS/trace | grep halt_poll | \
-    grep -oP 'grow=\d+' | sort | uniq -c
-# grow=1 是 GROW，grow=0 是 SHRINK
+# trace 文本形如：kvm_halt_poll_ns: vcpu 0: halt_poll_ns 20000 (grow 10000)
+#   ↑ TP_printk 是 "vcpu %u: halt_poll_ns %u (%s %u)"，%s 直接印 "grow"/"shrink"
+#     （include/trace/events/kvm.h:359-366）——**没有 grow=1 / grow=0 这种键**。
+#     旧版 `grep -oP 'grow=\d+'` 永远抓不到东西。
+cat $TRACEFS/trace | grep 'kvm_halt_poll_ns' | \
+    grep -oP '\((grow|shrink) \d+\)' | awk '{print $1}' | sort | uniq -c
 ```
 
 **判读**：
 - GROW 远多于 SHRINK → halt-polling 效果好
 - SHRINK 频繁 → vCPU 唤醒延迟高，考虑调整参数
+- ★ 窗口内轮询**命中**时这个 tracepoint 不触发（`kvm_main.c:3865-3866` 是空分支），
+  所以"事件数为 0"不等于"没在 poll"，要看 `halt_attempted_poll` /
+  `halt_successful_poll` 两个 debugfs 计数（`kvm_main.c:3771-3774`）
 
 ### 6.2 halt-polling 参数
 
-```bash
-# 运行时可调（0644）
-cat /sys/module/kvm/parameters/halt_poll_ns          # 默认 400000 (400μs)
-cat /sys/module/kvm/parameters/halt_poll_ns_grow      # 默认 2
-cat /sys/module/kvm/parameters/halt_poll_ns_grow_start # 默认 10000 (10μs)
-cat /sys/module/kvm/parameters/halt_poll_ns_shrink    # 默认 0（一次失手就归零）
+参数默认值与权限的唯一来源是 `../phase10-performance/parameters.md` §1，本节只给指针，
+不复制数字（历史上这里抄错过一份默认值，见该文件 §1 的勘误）。
 
-# 调优建议
-echo 800000 > /sys/module/kvm/parameters/halt_poll_ns  # 增大窗口
-echo 2 > /sys/module/kvm/parameters/halt_poll_ns_shrink # 收缩而非归零
+本章只需要知道两件事：
+
+| 问题 | 答案 | 证据 |
+|---|---|---|
+| 这组参数存在吗？ | `halt_poll_ns` / `_grow` / `_grow_start` / `_shrink` 四个都在 `/sys/module/kvm/parameters/` | `virt/kvm/kvm_main.c:78-94` |
+| 运行时可改吗？ | 可，四个都是 `0644` | 同上各行 `module_param(..., 0644)` |
+
+```bash
+# 读当前值（当前值 ≠ 6.12.93 的默认值，宿主可能是别的内核）
+cat /sys/module/kvm/parameters/halt_poll_ns
+# 改值（示例；改前先按 phase10 的规矩记录基线）
+echo 0 > /sys/module/kvm/parameters/halt_poll_ns        # 关掉 halt-polling
 ```
+
+> 语义提示（与默认值无关，来自 `kvm_main.c:3689-3706`）：
+> `halt_poll_ns_shrink == 0` 时窗口直接被清零；非 0 时按除法收缩，
+> 且结果低于 `halt_poll_ns_grow_start` 也归零。
 
 ### 6.3 halt-polling 开销测量
 
@@ -415,7 +456,7 @@ echo 0 > /sys/module/kvm/parameters/halt_poll_ns
 sudo perf kvm stat record -a -- sleep 10
 # 记录禁用时的退出数
 
-echo 400000 > /sys/module/kvm/parameters/halt_poll_ns
+echo 200000 > /sys/module/kvm/parameters/halt_poll_ns   # 用一个非 0 窗口重新启用
 sudo perf kvm stat record -a -- sleep 10
 # 记录启用时的退出数
 
@@ -440,12 +481,16 @@ echo 1 > $TRACEFS/tracing_on
 sleep 10
 echo 0 > $TRACEFS/tracing_on
 
-# 检查 masterclock 状态
+# 检查 masterclock 状态：trace 文本里没有 "use_master_clock=1" 这种键！
 cat $TRACEFS/trace | grep 'update_master_clock'
-# use_master_clock=1 表示 masterclock 启用
-# use_master_clock=0 表示 masterclock 禁用（可能有 TSC 问题）
+#   kvm_update_master_clock: masterclock 1 hostclock tsc offsetmatched 1
+#   ↑ TP_printk = "masterclock %d hostclock %s offsetmatched %u"（trace.h:922-925）
+#     masterclock 1 = 本次重算后启用；0 = 禁用（可能有 TSC 问题）
+#     hostclock 是**符号**（none/tsc），不是数字
 
-# ★ kvm_track_tsc 的 masterclock 字段是旧值（见 corrections.md C8）
+# ★ kvm_track_tsc 的 masterclock 字段是旧值（见 corrections.md C8），其文本是
+#   "vcpu_id %u masterclock %u offsetmatched %u nr_online %u hostclock %s"
+#   （trace.h:951-955）——注意 offsetmatched 才是 nr_vcpus_matched_tsc 那一列
 # 要看新值，用 kvm_update_master_clock
 ```
 
@@ -466,10 +511,16 @@ done
 ```bash
 # 宿主侧
 grep -o 'constant_tsc\|nonstop_tsc\|tsc_reliable' /proc/cpuinfo | sort -u
-# 三个都有 → invariant TSC，KVM 可以启用 masterclock
+# ★ 判据别写成"三个都有"。tsc_reliable 是内核 quirk 位
+#   （X86_FEATURE_TSC_RELIABLE，arch/x86/include/asm/cpufeatures.h:103），
+#   只对少数机器置位——本机 6.8.0-51 实测只有 constant_tsc 与 nonstop_tsc，
+#   没有 tsc_reliable，但这台机器确实是 invariant TSC。
+#   工程上的 invariant TSC 判据是 constant_tsc + nonstop_tsc
+#   （真正的架构位在 CPUID 0x80000007 EDX[8]，/proc/cpuinfo 不单独打印它）。
+#   按"三个都有"判会把正常机器误判成时钟不可信。
 
-# Guest 侧
-grep -o 'constant_tsc\|nonstop_tsc\|tsc_reliable' /proc/cpuinfo | sort -u
+# Guest 侧（同样只看这两个位）
+grep -o 'constant_tsc\|nonstop_tsc' /proc/cpuinfo | sort -u
 ```
 
 ### 7.4 时钟跳变检测
@@ -529,7 +580,8 @@ echo kvm:kvm_halt_poll_ns >> $TRACEFS/set_event
 echo 1 > $TRACEFS/tracing_on
 sleep $DURATION
 echo 0 > $TRACEFS/tracing_on
-grep halt_poll $TRACEFS/trace | grep -oP 'grow=\d+' | sort | uniq -c
+grep 'kvm_halt_poll_ns' $TRACEFS/trace | \
+    grep -oP '\((grow|shrink) \d+\)' | awk '{print $1}' | sort | uniq -c
 
 # 5. 清理
 : > $TRACEFS/set_event

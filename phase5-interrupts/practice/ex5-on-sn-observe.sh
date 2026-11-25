@@ -94,7 +94,7 @@ EXIT_COUNT=$(echo "$TRACE_OUTPUT" | grep -c "kvm_exit" 2>/dev/null || true)
 #   "vcpu %u reason %s%s%s rip 0x%lx ..."（arch/x86/kvm/trace.h:325-330），reason 打的是
 #   符号名，外部中断那一行是 `reason EXTERNAL_INTERRUPT`（名字 arch/x86/include/uapi/asm/vmx.h:98，
 #   码 1 见 :33）。按 `exit_reason=1` 抓恒为 0，下面那个比值也就恒为 N/A。
-#   数字只在 BPF 侧成立（args->exit_reason）。详见 ../../phase9-performance/corrections.md D11。
+#   数字只在 BPF 侧成立（args->exit_reason）。详见 ../../phase10-performance/corrections.md D11。
 EXT_INTR_COUNT=$(echo "$TRACE_OUTPUT" | grep "kvm_exit" | grep -c "reason EXTERNAL_INTERRUPT" 2>/dev/null || true)
 
 echo "  追踪结果:"

@@ -606,7 +606,7 @@ ARM SoC 的 PCIe host bridge），同一个 BAR 在 CPU 看来是 `0x1800_0000`�
 三种结果对应三条完全不同的硬件路径，而**判据就是 ACS**。判定逻辑在 `calc_map_type_and_dist()` 中：
 
 ```c
-/* 来源: drivers/pci/p2pdma.c:705-794（简化） */
+/* 来源: drivers/pci/p2pdma.c:575-668（简化；真实定义行 575-577，函数体到 :668 结束） */
 static enum pci_p2pdma_map_type
 calc_map_type_and_dist(struct pci_dev *provider, struct pci_dev *client,
                        int *dist, bool verbose)
@@ -672,36 +672,90 @@ done:
 **ACS redirect 检查的实现**：
 
 ```c
-/* 来源: drivers/pci/p2pdma.c:497-512 */
+/* 来源: drivers/pci/p2pdma.c:383-403（含注释，逐行摘自源码） */
+/*
+ * Check if a PCI bridge has its ACS redirection bits set to redirect P2P
+ * TLPs upstream via ACS. Returns 1 if the packets will be redirected
+ * upstream, 0 otherwise.
+ */
 static int pci_bridge_has_acs_redir(struct pci_dev *pdev)
 {
-    int pos;
-    u16 ctrl;
+	int pos;
+	u16 ctrl;
 
-    pos = pdev->acs_cap;
-    if (!pos)
-        return 0;  /* 没有 ACS capability → 无 redirect */
+	pos = pdev->acs_cap;
+	if (!pos)
+		return 0;
 
-    pci_read_config_word(pdev, pos + PCI_ACS_CTRL, &ctrl);
+	pci_read_config_word(pdev, pos + PCI_ACS_CTRL, &ctrl);
 
-    /* 检查三个关键位：RR (Request Redirect), CR (Completion Redirect), EC (ECRC) */
-    if (ctrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_EC))
-        return 1;  /* 有 redirect */
+	if (ctrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_EC))
+		return 1;
 
-    return 0;
+	return 0;
 }
 ```
+
+三个被检查的位在 `include/uapi/linux/pci_regs.h:991-997`，名字**照内核注释读**：
+
+| 宏 | 值 | 规范名 |
+|---|---|---|
+| `PCI_ACS_RR` | `0x0004` | **P2P Request Redirect** |
+| `PCI_ACS_CR` | `0x0008` | **P2P Completion Redirect** |
+| `PCI_ACS_EC` | `0x0020` | **P2P Egress Control** |
+
+> **旧稿勘误**：这里原来把 `PCI_ACS_EC` 解释成 "EC (ECRC)"。**EC 是 Egress Control，
+> 与 ECRC（TLP Digest 里的 End-to-End CRC）毫无关系** —— 后者是 AER/TLP prefix 的概念，
+> 根本不在 ACS Control 寄存器里。这一类"照缩写猜全称"正是 AGENTS.md 术语条款要防的。
+> 另：`TB`(0x0002 Translation Blocking)、`SV`(0x0001 Source Validation)、
+> `UF`(0x0010)、`DT`(0x0040) 都**不是**这条判据检查的位。
 
 **BUS_ADDR 的地址转换**：
 
 ```c
-/* 来源: include/linux/pci-p2pdma.h:210-213 */
-static inline dma_addr_t
-pci_p2pdma_bus_addr_map(struct p2pdma_provider *provider, phys_addr_t paddr)
+/* 来源: drivers/pci/p2pdma.c:1016-1033（pci_p2pdma_map_segment()） */
+enum pci_p2pdma_map_type
+pci_p2pdma_map_segment(struct pci_p2pdma_map_state *state, struct device *dev,
+		       struct scatterlist *sg)
 {
-    return paddr + provider->bus_offset;  /* 物理地址 + 偏移 = 总线地址 */
+	if (state->pgmap != sg_page(sg)->pgmap) {
+		state->pgmap = sg_page(sg)->pgmap;
+		state->map = pci_p2pdma_map_type(state->pgmap, dev);
+		state->bus_off = to_p2p_pgmap(state->pgmap)->bus_offset;   /* :1023 */
+	}
+
+	if (state->map == PCI_P2PDMA_MAP_BUS_ADDR) {
+		sg->dma_address = sg_phys(sg) + state->bus_off;            /* :1026 */
+		sg_dma_len(sg) = sg->length;
+		sg_dma_mark_bus_address(sg);
+	}
+
+	return state->map;
 }
 ```
+
+**BUS_ADDR 的换算就是这一行**：`dma_address = sg_phys(sg) + bus_off`
+（HPA 加偏移 = 总线地址）。偏移在注册 p2pmem 时算好：
+
+```c
+/* 来源: drivers/pci/p2pdma.c:324-325（pci_p2pdma_add_resource() 内） */
+	p2p_pgmap->bus_offset = pci_bus_address(pdev, bar) -
+		pci_resource_start(pdev, bar);
+```
+
+即 `bus_offset = 该 BAR 的总线地址 - 该 BAR 的 CPU 物理地址`，字段定义在
+`struct pci_p2pdma_pagemap`（`drivers/pci/p2pdma.c:30-34`）。
+
+> **旧稿勘误**：这里原来引用了一个**不存在的函数** `pci_p2pdma_bus_addr_map()`，
+> 还把它标成 `include/linux/pci-p2pdma.h:210-213`。两处都是假的：
+> ① 全内核搜不到该符号；② `include/linux/pci-p2pdma.h` 在 6.12.93 里**只有 107 行**，
+> 210-213 越界。真实的换算就是上面 `pci_p2pdma_map_segment()` 里的那两行。
+> 头文件里唯一与总线地址有关的公开 API 是 `pci_p2pmem_virt_to_bus()`：声明在
+> `include/linux/pci-p2pdma.h:28`，定义在 `drivers/pci/p2pdma.c:871-889`
+> （`:65` 那个是 `CONFIG_PCI_P2PDMA` 关闭时的 `return 0` 桩，别拿它当实现）。
+> 它走 `gen_pool_virt_to_phys(p2pdma->pool, addr)`——因为入池时就是以总线地址充当
+> 物理地址登记的，源码注释自己说这名字 "misleading"；与本文 `HPA + bus_offset`
+> 这条 p2pmem 映射路径**不是一回事**。
 
 **判定流程图**：
 

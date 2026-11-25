@@ -129,22 +129,22 @@ typedef struct x86_msi_addr_lo {
 │   Entry 0: Address = IR 基址 + IRTE 索引 10                     │
 │            Data = subhandle                                       │
 │                                                                  │
-│ IRTE[10] 包含:                                                  │
-│   NV = 0xf7 (notification vector, 预留的)                       │
-│   Dest_ID = CPU-0                                               │
+│ IRTE[10] 包含 (Posted 格式, VT-d Spec 9.10 Fig 9-10):            │
+│   IM = 1 (内核字段 pst)                                         │
+│   VV = guest 向量 (记入 PIR 的位; 不是通知向量!)                 │
 │   PDA = pi_desc 物理地址                                        │
+│   ★ 没有 destination 字段, 也没有 NV —— NV 在 PI Descriptor 里  │
 │                                                                  │
-│ 迁移到CPU-1:                                                    │
-│   ① 更新IRTE[10]:                                               │
-│      Dest_ID = CPU-1                                            │
-│      NV = 0xf7 (不用改!)                                        │
-│   ② 更新pi_desc.NDST = CPU-1                                    │
-│   ③ 刷新IOMMU缓存                                               │
+│ vCPU 迁移到 CPU-1:                                              │
+│   ① 更新 pi_desc.NDST = CPU-1 的 APIC ID                        │
+│      (vmx_vcpu_pi_load 的 try_cmpxchg64)                        │
+│   ② IRTE 不动、不刷新 IOMMU 缓存 —— 迁移对 IOMMU 是零操作        │
+│   ③ 通知向量 NV(0xf2) 在 PI Descriptor 里, 系统预留, 不会冲突    │
 │                                                                  │
 │ 特点:                                                           │
 │   ✓ 不需要动设备的MSI表                                         │
-│   ✓ 只需更新IOMMU的IRTE                                         │
-│   ✓ NV是预留的, 不会冲突, 不用改                                │
+│   ✓ 迁移不需要动 IRTE (AGENTS.md 陷阱 #18)                      │
+│   ✓ NV 是预留向量, 不用改                                       │
 │   ✓ 最简单, 最快速                                              │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -170,18 +170,18 @@ PI模式之所以在亲和性迁移时更简单，关键在于Notification Vecto
 ┌─ PI模式 (所有设备共享notification vector) ──────────────────┐
 │  设备 A (网卡):                                              │
 │    → IOMMU写PI descriptor A的PIR[guest_vector_A]             │
-│    → 发通知中断vector = 0xf7                                 │
+│    → 发通知中断vector = 0xf2                                 │
 │                                                              │
 │  设备 B (NVMe):                                              │
 │    → IOMMU写PI descriptor B的PIR[guest_vector_B]             │
-│    → 发通知中断vector = 0xf7 (同一个!)                       │
+│    → 发通知中断vector = 0xf2 (同一个!)                       │
 │                                                              │
 │  设备 C (GPU):                                               │
 │    → IOMMU写PI descriptor C的PIR[guest_vector_C]             │
-│    → 发通知中断vector = 0xf7 (还是同一个!)                   │
+│    → 发通知中断vector = 0xf2 (还是同一个!)                   │
 │                                                              │
 │  关键:                                                       │
-│    · 所有PI通知都用vector 0xf7                               │
+│    · 所有PI通知都用vector 0xf2                               │
 │    · 不同设备通过PI descriptor区分 (每个vCPU一个)            │
 │    · 不同guest vector通过PIR位图区分 (256个bit)              │
 │    · 不会冲突!                                               │
@@ -189,8 +189,8 @@ PI模式之所以在亲和性迁移时更简单，关键在于Notification Vecto
 
 源码定义:
   /* arch/x86/include/asm/irq_vectors.h */
-  #define POSTED_INTR_VECTOR            0xf7
-  #define POSTED_INTR_WAKEUP_VECTOR     0xf6
+  #define POSTED_INTR_VECTOR            0xf2
+  #define POSTED_INTR_WAKEUP_VECTOR     0xf1
   
   这些向量在系统启动时预留:
     · 不分配给普通设备
@@ -213,7 +213,7 @@ PI模式通过三层机制区分不同的中断：
   · IOMMU设置PIR[guest_vector] = 1
   
 第3层: 通知中断
-  · 所有PI通知都用vector 0xf7
+  · 所有PI通知都用vector 0xf2
   · 通过PI descriptor地址区分不同vCPU
   · 通过PIR位图区分不同guest vector
 ```
@@ -229,15 +229,15 @@ vCPU迁移时的vector问题:
   · 需要修改IRTE.Vector字段
 
 PI模式的答案:
-  · Notification vector (0xf7) 是系统预留的
+  · Notification vector (0xf2) 是系统预留的
     - 不占用普通vector池 (32-255)
     - 每个CPU都有, 不会冲突
-  · 所有vCPU共享0xf7
+  · 所有vCPU共享0xf2
     - 不同设备通过PI descriptor区分
     - 不同guest vector通过PIR位图区分
   · vCPU迁移时:
-    - 只改Dest_ID和NDST
-    - NV不用改 (永远是0xf7)
+    - 只改 PI Descriptor 的 NDST (Posted IRTE 无 destination, 不改 IRTE)
+    - NV (在 PI Descriptor 里, 永远是0xf2) 不用改
     - 不会有vector冲突问题
 
 这是PI模式的巧妙设计:
@@ -252,14 +252,14 @@ PI模式的答案:
 ┌─────────────────────────────────────────────────────────────────┐
 │                     非IR模式        IR模式(无PI)    IR+PI模式   │
 ├─────────────────────────────────────────────────────────────────┤
-│ 改哪里?              设备MSI表       IRTE            IRTE+PI desc│
+│ 改哪里?              设备MSI表       IRTE            仅PI desc   │
 │                      (硬件层面)      (IOMMU软件)     (IOMMU软件) │
 │                                                                 │
 │ 需要改vector?        是(Data字段)    是(可能)        否(NV预留)  │
 │                      可能冲突        可能冲突         不会冲突    │
 │                                                                 │
 │ 设备感知?            是              否               否         │
-│                      要重编程设备    只改IOMMU       只改IOMMU   │
+│                      要重编程设备    只改IOMMU       只改PI desc │
 │                                                                 │
 │ 锁设备?              是              否               否         │
 │ 可能丢中断?          是              否               否         │
@@ -272,7 +272,7 @@ PI模式的答案:
 关键洞察:
   非IR → 改设备 (硬件层面, 复杂)
   IR   → 改IOMMU (软件层面, 简单)
-  PI   → 改IOMMU + vector不用管 (最简单)
+  PI   → 迁移只改 PI Descriptor（IRTE 不动）+ vector 不用管 (最简单)
   
 PI模式的核心价值:
   不仅是"零VM-Exit"

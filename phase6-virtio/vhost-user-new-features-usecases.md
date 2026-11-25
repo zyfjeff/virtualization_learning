@@ -2,7 +2,12 @@
 
 > 基于 QEMU 11.1.0 和 DPDK 源码的实际使用场景分析
 > 
-> 日期: 2026-08-16
+> 日期: 2026-08-16｜2026-11-25 事实核查修订（内存插槽默认值、F_SHMEM vs F_SHARED_OBJECT，
+> 见 [corrections.md](corrections.md) 勘误 6）
+>
+> ⚠️ 版本口径：本文 13-22 中只有 **20/21/22 相对本仓基线 QEMU 10.1.0-rc2 是新增**
+> （基线枚举止于 `VHOST_USER_PROTOCOL_F_DEVICE_STATE = 19`，
+> `qemu-10.1.0-rc2/include/hw/virtio/vhost-user.h:34`）。
 
 ---
 
@@ -118,9 +123,15 @@ if (vu_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS)) {
 
 **场景描述**:
 ```
-创建大内存虚拟机（如 1TB 内存），需要超过默认的 509 个内存区域。
-默认情况下，vhost-user 支持最多 509 个内存区域，
-但对于大内存 VM，需要更多内存区域来映射内存。
+创建大内存虚拟机（如 1TB 内存），内存区域数超过 vhost-user 的**基线 8**。
+默认情况下 QEMU 只用 8 个插槽：未协商 CONFIGURE_MEM_SLOTS 时
+`u->user->memory_slots = VHOST_MEMORY_BASELINE_NREGIONS`
+（`hw/virtio/vhost-user.c:2618`，`#define VHOST_MEMORY_BASELINE_NREGIONS 8` 见 `:44`）。
+协商后上限由 QEMU 的 `VHOST_USER_MAX_RAM_SLOTS 512`（`:49`）与后端回报值取 min
+（`u->user->memory_slots = MIN(ram_slots, vhost_user_max_ram_slots)`，`:2636`）。
+> ⚠️ 初版此处写的"默认最多 509 个"有误：**509 是后端库 libvhost-user 自己的上限**
+> （`subprojects/libvhost-user/libvhost-user.h:39`），不是协议默认值，也不是 QEMU 侧的 512。
+但对于大内存 VM，确实需要更多内存区域来映射内存。
 ```
 
 **代码示例**:
@@ -450,19 +461,44 @@ if (vhost_user_has_protocol_feature(
 以支持动态的共享内存需求。
 ```
 
-**代码示例**:
-```c
-// subprojects/libvhost-user/libvhost-user.c
-/* 映射共享内存 */
-if (vu_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_SHARED_OBJECT)) {
-    vu_send_message(dev, VHOST_USER_BACKEND_SHMEM_MAP, ...);
-}
+**代码示例**（真实源码；★ 门控是 **F_SHMEM(22)**，不是 F_SHARED_OBJECT(18)——初版写混了）:
 
-/* 取消映射共享内存 */
-if (vu_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_SHARED_OBJECT)) {
-    vu_send_message(dev, VHOST_USER_BACKEND_SHMEM_UNMAP, ...);
-}
+```c
+/* 来源: subprojects/libvhost-user/libvhost-user.c:1643-1662 —— vu_shmem_map()（节选） */
+bool
+vu_shmem_map(VuDev *dev, uint8_t shmid, uint64_t fd_offset,
+             uint64_t shm_offset, uint64_t len, uint64_t flags, int fd)
+{
+    VhostUserMsg vmsg = {
+        .request = VHOST_USER_BACKEND_SHMEM_MAP,
+        ...
+    };
+
+    if (!vu_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_SHMEM)) {
+        return false;
+    }
 ```
+
+```c
+/* 来源: subprojects/libvhost-user/libvhost-user.c:1680-1697 —— vu_shmem_unmap()（节选） */
+bool
+vu_shmem_unmap(VuDev *dev, uint8_t shmid, uint64_t shm_offset, uint64_t len)
+{
+    VhostUserMsg vmsg = {
+        .request = VHOST_USER_BACKEND_SHMEM_UNMAP,
+        ...
+    };
+
+    if (!vu_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_SHMEM)) {
+        return false;
+    }
+```
+
+> `VHOST_USER_PROTOCOL_F_SHARED_OBJECT`（18）管的是**另一件事**：按 UUID 增删共享对象，
+> 调用点是 `vu_add_shared_object()`（`libvhost-user.c:1608`，门控 `:1618`）与
+> `vu_rm_shared_object()`（`:1626`，门控 `:1636`）。两者别混。
+> 另注：真实函数名是 `vu_shmem_map()/vu_shmem_unmap()`，
+> libvhost-user 里没有 `vu_send_message()` 这个符号。
 
 **使用流程**:
 1. 后端请求映射共享内存区域
@@ -496,7 +532,7 @@ if (vu_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_SHARED_OBJECT)) {
 | 19 | DEVICE_STATE | 设备状态传输、迁移 | 支持实时迁移 |
 | 20 | GET_VRING_BASE_INFLIGHT | Inflight I/O 追踪 | 保证 I/O 完整性 |
 | 21 | GPA_ADDRESSES | 内存热插拔、GPA 管理 | 支持内存热插拔 |
-| 22 | SHMEM_MAP | 动态共享内存映射 | 提高灵活性 |
+| 22 | **SHMEM**（消息名才是 SHMEM_MAP/SHMEM_UNMAP） | 动态共享内存映射 | 提高灵活性 |
 
 ---
 
@@ -507,7 +543,7 @@ if (vu_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_SHARED_OBJECT)) {
 **场景**: 迁移一个 1TB 内存的虚拟机
 
 **使用的特性**:
-- **CONFIGURE_MEM_SLOTS (15)**: 支持超过 509 个内存区域
+- **CONFIGURE_MEM_SLOTS (15)**: 把内存区域上限从基线 8 提到 QEMU 侧 512（后端 libvhost-user 侧 509）
 - **DEVICE_STATE (19)**: 传输设备状态
 - **GET_VRING_BASE_INFLIGHT (20)**: 追踪 inflight I/O
 

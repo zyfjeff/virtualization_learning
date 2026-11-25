@@ -140,9 +140,45 @@ case KVM_GET_REGS: ...
 }
 ```
 
-**异步 ioctl 是什么？** 不需要持有 vcpu->mutex 的操作，典型的是 `KVM_SET_SIGNAL_MASK`。
-这些操作可以在 vCPU 运行时并发执行（比如 QEMU 的一个线程在 `KVM_RUN` 里跑着，另一个线程
-改信号掩码）。
+**异步 ioctl 是什么？** 由 `CONFIG_HAVE_KVM_VCPU_ASYNC_IOCTL` 决定存不存在：
+
+```c
+/* 来源: include/linux/kvm_host.h:2377-2387 */
+#ifdef CONFIG_HAVE_KVM_VCPU_ASYNC_IOCTL
+long kvm_arch_vcpu_async_ioctl(struct file *filp,
+			       unsigned int ioctl, unsigned long arg);
+#else
+static inline long kvm_arch_vcpu_async_ioctl(struct file *filp,
+					     unsigned int ioctl,
+					     unsigned long arg)
+{
+	return -ENOIOCTLCMD;
+}
+#endif /* CONFIG_HAVE_KVM_VCPU_ASYNC_IOCTL */
+```
+
+**纠正旧表述（2026-11-25 核查；本章 corrections.md 勘误 4）**：原文说
+"典型的是 `KVM_SET_SIGNAL_MASK`……可以在 vCPU 运行时并发执行"，这对 **x86 不成立**：
+
+- 全树检索 `select HAVE_KVM_VCPU_ASYNC_IOCTL` 只命中
+  `arch/s390/kvm/Kconfig:23`、`arch/riscv/kvm/Kconfig:26`、
+  `arch/mips/kvm/Kconfig:25`、`arch/loongarch/kvm/Kconfig:24`、
+  `arch/powerpc/kvm/Kconfig:23` —— **`arch/x86/kvm/Kconfig` 不选它**。
+- 所以在 x86 上 `kvm_arch_vcpu_async_ioctl()` 恒返回 `-ENOIOCTLCMD`，上面那段
+  `if (r != -ENOIOCTLCMD) return r;` **永远走不到 return**，
+  **所有 vCPU ioctl（含 `KVM_RUN`、`KVM_SET_SIGNAL_MASK`）都要拿 `vcpu->mutex`**。
+- `KVM_SET_SIGNAL_MASK` 就在同一个 switch 里：`virt/kvm/kvm_main.c:4597`。
+  它能在"另一个线程正在 KVM_RUN"时被调用，靠的不是异步通道，而是
+  `mutex_lock_killable()` 会等这个 vCPU 的 ioctl 结束；而且信号掩码真正的生效点在
+  `kvm_sigset_activate()/kvm_sigset_deactivate()`（`x86.c:11591` 附近，
+  `kvm_arch_vcpu_ioctl_run()` 开头），跟异步无关。
+- 真正的异步例子在 s390：`arch/s390/kvm/kvm-s390.c:5445` 的
+  `kvm_arch_vcpu_async_ioctl()` 处理 `KVM_S390_IRQ` / `KVM_S390_INTERRUPT`
+  ——因为 s390 的 vCPU 线程必须能在**不持锁**的情况下被别的线程注入中断。
+  x86 侧等价需求走的是 `KVM_INTERRUPT`（内核里直接进 vIRR/VMCS，仍受 vcpu->mutex
+  串行化）与 `KVM_SIGNAL_MSI`/irq routing，而不是异步 ioctl。
+
+一句话：本节"有例外"的例外，在 x86 上不存在；这条分支是给别的架构用的通用层接口。
 
 ### Q: `KVM_RUN` 里为什么要检查 `vcpu->kvm->mm != current->mm`？
 
@@ -285,29 +321,152 @@ PI 不通过 `kvm_vcpu_has_events()` 唤醒 vCPU。当 vCPU 在 Guest 模式时�
 
 ### Q: halt-polling 为什么要分三阶段？
 
-**文件**: `virt/kvm/kvm_main.c` — `kvm_vcpu_halt()`
+**文件**: `virt/kvm/kvm_main.c:3811` — `kvm_vcpu_halt()`
 
 ```c
-/* Phase 1: 忙等（不释放 CPU） */
-if (do_halt_poll) {
-    do {
-        if (kvm_vcpu_check_block(vcpu) < 0)
-            goto out;           /* 有事件 → 立即恢复 */
-        cpu_relax();
-    } while (kvm_vcpu_can_poll(cur, stop));
+/* Phase 1: 忙等（不释放 CPU）*/
+	start = cur = poll_end = ktime_get();
+	if (do_halt_poll) {
+		ktime_t stop = ktime_add_ns(start, vcpu->halt_poll_ns);
+
+		do {
+			if (kvm_vcpu_check_block(vcpu) < 0)
+				goto out;           /* 有事件 → 立即恢复 */
+			cpu_relax();
+			poll_end = cur = ktime_get();
+		} while (kvm_vcpu_can_poll(cur, stop));
+	}
+
+/* Phase 2: 真正阻塞（释放 CPU）*/
+	waited = kvm_vcpu_block(vcpu);            /* kvm_main.c:3733 */
+
+/* Phase 3: 自适应调整窗口 —— 6.12.93 实际有四条分支（kvm_main.c:3858-3878）*/
+	if (halt_poll_allowed) {
+		/* Recompute the max halt poll time in case it changed. */
+		max_halt_poll_ns = kvm_vcpu_max_halt_poll_ns(vcpu);
+
+		if (!vcpu_valid_wakeup(vcpu)) {
+			shrink_halt_poll_ns(vcpu);
+		} else if (max_halt_poll_ns) {
+			if (halt_ns <= vcpu->halt_poll_ns)
+				;
+			/* we had a long block, shrink polling */
+			else if (vcpu->halt_poll_ns &&
+				 halt_ns > max_halt_poll_ns)
+				shrink_halt_poll_ns(vcpu);
+			/* we had a short halt and our poll time is too small */
+			else if (vcpu->halt_poll_ns < max_halt_poll_ns &&
+				 halt_ns < max_halt_poll_ns)
+				grow_halt_poll_ns(vcpu);
+		} else {
+			vcpu->halt_poll_ns = 0;
+		}
+	}
+```
+
+**纠正旧表述（2026-11-25 核查；本章 corrections.md 勘误 5）**：上面这段在旧版里被写成
+三条分支，漏掉了真实的第一条 `if (!vcpu_valid_wakeup(vcpu)) shrink_halt_poll_ns(vcpu);`
+（`kvm_main.c:3862-3863`），也漏掉了最后的 `else vcpu->halt_poll_ns = 0;`
+（上限被设为 0 时彻底关掉轮询），还省掉了两个条件：shrink 要求
+`vcpu->halt_poll_ns` 非 0，grow 要求 `vcpu->halt_poll_ns < max_halt_poll_ns &&
+halt_ns < max_halt_poll_ns`。
+
+但**补这条分支时要小心，它在 x86 上是死支**：
+
+```c
+/* 来源: include/linux/kvm_host.h:2353-2365 */
+#ifdef CONFIG_HAVE_KVM_INVALID_WAKEUPS
+/* If we wakeup during the poll time, was it a sucessful poll? */
+static inline bool vcpu_valid_wakeup(struct kvm_vcpu *vcpu)
+{
+	return vcpu->valid_wakeup;
 }
 
-/* Phase 2: 真正阻塞（释放 CPU） */
-waited = kvm_vcpu_block(vcpu);
-
-/* Phase 3: 自适应调整窗口 */
-if (halt_ns <= vcpu->halt_poll_ns)
-    ;                           /* 在窗口内唤醒 → poll 有效，保持 */
-else if (halt_ns > max_halt_poll_ns)
-    shrink_halt_poll_ns(vcpu);  /* 远超窗口 → poll 浪费，缩小 */
-else
-    grow_halt_poll_ns(vcpu);    /* 稍超窗口 → 窗口太小，增大 */
+#else
+static inline bool vcpu_valid_wakeup(struct kvm_vcpu *vcpu)
+{
+	return true;
+}
+#endif /* CONFIG_HAVE_KVM_INVALID_WAKEUPS */
 ```
+
+`CONFIG_HAVE_KVM_INVALID_WAKEUPS` 全树**只有 s390 选**
+（`arch/s390/kvm/Kconfig:29`），`vcpu->valid_wakeup` 的**唯一写者也在 s390**
+（`arch/s390/kvm/interrupt.c:1335` 置 false、`:1345` 置 true；字段声明
+`kvm_host.h:356`）。所以在 **x86 上 `vcpu_valid_wakeup()` 恒为 true**，
+"伪唤醒砍窗口"这一条永远不触发——x86 的自适应只有
+"窗口内醒 → 保持 / 醒得太晚 → 缩 / 窗口不够大 → 放"这三条。
+写文档时若把它当成 x86 行为，会误导调参（比如以为乱序唤醒会自动收窗口）。
+
+真正判断"该不该醒"的地方是 `kvm_vcpu_check_block()`（`kvm_main.c:3708-3726`）：
+`kvm_arch_vcpu_runnable()` / `kvm_cpu_has_pending_timer()` / `signal_pending()` /
+`KVM_REQ_UNBLOCK` 四个条件，返回 `<0` 表示"有事件，别睡"。
+
+**`max_halt_poll_ns` 不是模块参数**（旧表述容易让人去 `/sys/module/kvm/parameters/` 找它，
+那里只有 `halt_poll_ns` / `halt_poll_ns_grow` / `halt_poll_ns_grow_start` /
+`halt_poll_ns_shrink` 四个）。它是这个函数里的**局部变量**，取值来自
+`kvm_vcpu_max_halt_poll_ns()`（`kvm_main.c:3787-3802`）：
+
+```c
+/* 来源: virt/kvm/kvm_main.c:3787-3802 */
+static unsigned int kvm_vcpu_max_halt_poll_ns(struct kvm_vcpu *vcpu)
+{
+	struct kvm *kvm = vcpu->kvm;
+
+	if (kvm->override_halt_poll_ns) {
+		/*
+		 * Ensure kvm->max_halt_poll_ns is not read before
+		 * kvm->override_halt_poll_ns.
+		 *
+		 * Pairs with the smp_wmb() when enabling KVM_CAP_HALT_POLL.
+		 */
+		smp_rmb();
+		return READ_ONCE(kvm->max_halt_poll_ns);
+	}
+
+	return READ_ONCE(halt_poll_ns);
+}
+```
+
+也就是说：默认上限就是全局 `halt_poll_ns`；VMM 想给某个 VM 单独设上限，要经
+`KVM_CAP_HALT_POLL`（写入点 `kvm_main.c:5056`，`kvm->max_halt_poll_ns = cap->args[0]`），
+字段定义在 `include/linux/kvm_host.h:858`。
+
+**grow/shrink 的乘法因子**（三个都是 0644，可运行时改）：
+
+```c
+/* 来源: virt/kvm/kvm_main.c:3670-3706（节选）*/
+static void grow_halt_poll_ns(struct kvm_vcpu *vcpu)
+{
+	old = val = vcpu->halt_poll_ns;
+	grow_start = READ_ONCE(halt_poll_ns_grow_start);   /* 默认 10000 */
+	grow = READ_ONCE(halt_poll_ns_grow);               /* 默认 2 */
+	if (!grow)
+		goto out;
+	val *= grow;
+	if (val < grow_start)
+		val = grow_start;                          /* 0 → 10us 起步 */
+	vcpu->halt_poll_ns = val;
+}
+
+static void shrink_halt_poll_ns(struct kvm_vcpu *vcpu)
+{
+	old = val = vcpu->halt_poll_ns;
+	shrink = READ_ONCE(halt_poll_ns_shrink);           /* 源码默认 2 */
+	grow_start = READ_ONCE(halt_poll_ns_grow_start);
+	if (shrink == 0)
+		val = 0;                                   /* 0 = 直接关掉 */
+	else
+		val /= shrink;
+	if (val < grow_start)
+		val = 0;
+	vcpu->halt_poll_ns = val;
+}
+```
+
+> 默认值/权限与宿主实测值以 `../phase10-performance/parameters.md` 为唯一来源
+> （那里记录了 `halt_poll_ns_shrink` 源码默认 2、本机实读 0 的差异及原因）。
+> 本文不复制实测数字。
 
 **为什么不只用 Phase 2？** halt-polling 的核心权衡：
 
@@ -431,20 +590,67 @@ finish_rcuwait(wait);
 ### Q: 哪些 VM-Exit 在内核态处理，哪些返回用户空间？
 
 ```
-快速路径（内核处理，不返回用户空间）:
-  EPT_VIOLATION        → kvm_mmu_page_fault()     → 建页表，重入
-  EXTERNAL_INTERRUPT   → handle_external_interrupt → 处理宿主中断，重入
-  HLT                  → handle_halt()             → mp_state=HALTED，循环
-  PREEMPTION_TIMER     → handle_preemption_timer   → 更新定时器，重入
-  APIC_WRITE           → handle_apic_write()       → 同步虚拟 LAPIC，重入
+内核态闭环（handler 返回 1，vcpu_run() 直接重入，不回用户空间）:
+  EPT_VIOLATION        → handle_ept_violation() → kvm_mmu_page_fault()
+  EXTERNAL_INTERRUPT   → handle_external_interrupt()
+  HLT                  → kvm_emulate_halt()      → mp_state=HALTED，循环里再 block
+  PREEMPTION_TIMER     → handle_preemption_timer()
+  APIC_WRITE           → handle_apic_write()
+  CPUID                → kvm_emulate_cpuid()      ★ 见下方纠正
+  MSR_READ / MSR_WRITE → kvm_emulate_rdmsr() / kvm_emulate_wrmsr()  ★ 见下方纠正
+  CR_ACCESS / DR_ACCESS / PAUSE / VMCALL / INVD / WBINVD / XSETBV …
+                          绝大多数都在内核完成
+                          （注：KVM 不启用 "RDTSC exiting"，exit 表里也没有
+                           EXIT_REASON_RDTSC 这一行 —— RDTSC 走 TSC offsetting/
+                           scaling 在硬件里做，不是 VM-Exit 后软件模拟）
 
-慢速路径（返回用户空间，QEMU 处理）:
-  IO_INSTRUCTION       → KVM_EXIT_IO               → QEMU 模拟设备 IO
-  MSR_READ/WRITE       → KVM_EXIT_INTERNAL_ERROR   → QEMU 处理未识别 MSR
-  CPUID                → KVM_EXIT_INTERNAL_ERROR   → QEMU 处理 CPUID
-  TRIPLE_FAULT         → KVM_EXIT_SHUTDOWN          → QEMU 决定重启/关机
-  MMIO                 → KVM_EXIT_MMIO              → QEMU 模拟 MMIO 设备
+返回用户空间（handler 填 run->exit_reason 后返回 0）:
+  IO_INSTRUCTION       → KVM_EXIT_IO             → QEMU 模拟设备 IO
+                          （命中内核态设备/PIO 直连时仍走内核，见 handle_io）
+  未映射 GPA 上的 EPT violation → KVM_EXIT_MMIO  → QEMU 模拟 MMIO 设备
+                          （注意：没有叫 "MMIO" 的 VM-Exit reason，它是
+                           KVM_EXIT_MMIO 这个 *exit_reason*，由
+                           EPT_VIOLATION/kvm_mmu_page_fault 走不通时产生）
+  TRIPLE_FAULT         → KVM_EXIT_SHUTDOWN       → QEMU 决定重启/关机
+  未建模 MSR 且启用用户态 MSR 过滤
+                       → KVM_EXIT_X86_RDMSR / KVM_EXIT_X86_WRMSR
+  FAIL_ENTRY / 模拟失败 → KVM_EXIT_FAIL_ENTRY / KVM_EXIT_INTERNAL_ERROR
 ```
+
+**纠正旧表述（2026-11-25 核查；本章 corrections.md 勘误 3）**：这一节旧版把
+**CPUID 和 MSR_READ/WRITE 放在"慢速路径（返回用户空间）"**，并把它们的退出码写成
+`KVM_EXIT_INTERNAL_ERROR`。两条都不对：
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:6103-6107 —— VMX 的 exit handler 表 */
+	[EXIT_REASON_CPUID]                   = kvm_emulate_cpuid,
+	[EXIT_REASON_MSR_READ]                = kvm_emulate_rdmsr,
+	[EXIT_REASON_MSR_WRITE]               = kvm_emulate_wrmsr,
+	[EXIT_REASON_INTERRUPT_WINDOW]        = handle_interrupt_window,
+	[EXIT_REASON_HLT]                     = kvm_emulate_halt,
+```
+
+- **CPUID 永远在内核完成**：`kvm_emulate_cpuid()`（`arch/x86/kvm/cpuid.c:1681`）
+  直接查 `vcpu->arch.cpuid_entries`（由 `KVM_SET_CPUID2` 灌进去）写回 EAX..EDX，
+  `return kvm_skip_emulated_instruction(vcpu)` → 恒为 1（重入）。QEMU 从不"处理 CPUID"。
+- **MSR 也默认在内核完成**：`kvm_emulate_rdmsr()`（`x86.c:2054`）/
+  `kvm_emulate_wrmsr()`（`x86.c:2079`）先 `kvm_get/set_msr_with_filter()`；只有失败**且**
+  用户开了 `KVM_CAP_X86_USER_SPACE_MSR` 时，才由 `kvm_msr_user_space()`
+  （`x86.c:2032`，调用点 `:2069` / `:2091`）填
+  **`KVM_EXIT_X86_RDMSR`/`KVM_EXIT_X86_WRMSR`**；否则经 `kvm_x86_call(complete_emulated_msr)()`（VMX 绑到
+  `kvm_complete_insn_gp`，`arch/x86/kvm/vmx/main.c:157`）就地注入 #GP。
+- `KVM_EXIT_INTERNAL_ERROR` 是"模拟失败/无法继续"这一类，与 CPUID/MSR 无关：
+  `x86.c:8812`（`prepare_emulation_failure_exit()`，`:8796`）、
+  `x86.c:11969`（`kvm_task_switch()` 中途要 MMIO）、
+  `x86.c:13833`（`kvm_handle_memory_failure()`，`:13817`）。
+- 顺带两处命名/字段修正：`handle_halt()` 在 6.12.93 里叫 `kvm_emulate_halt()`
+  （`vmx.c:6107`，内部走 `__kvm_emulate_halt()`，`x86.c:11393-11413`）；
+  `EPT_VIOLATION` 的 handler 是 `handle_ept_violation()`，`kvm_mmu_page_fault()`
+  是它调下去的下一层。
+
+判断"要不要回用户空间"的机制其实是**返回值约定**，不是 exit reason 的类别：
+handler 返回 `>0` 继续内核循环、`0` 返回用户空间（`r <= 0` 时 `vcpu_run()` break，
+见 §5 的表）、`<0` 报错。
 
 ### Q: `handle_exit_irqoff()` 和普通 `handle_exit()` 什么区别？
 

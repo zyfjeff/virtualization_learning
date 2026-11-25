@@ -682,3 +682,25 @@ static bool vmx_can_use_vtd_pi(struct kvm *kvm)
 README >1000 行强制拆分：§1.4 group 划分 → [group-division.md](group-division.md)，
 §1.5 ACS/ATS → [acs-ats.md](acs-ats.md)，内容未改。README 保留同标题锚点 stub
 （`#15-acs-与-ats直通依赖的两个-pcie-能力` 等跨章引用不变）。
+
+## 勘误 12：本轮抽查出的 4 处行号/符号偏差（2026-11-25 已修）
+
+本章整体经多轮核查，本轮只抓到 4 处，全部是"引文行号指到函数内部"或"沿用旧 API 名"：
+
+| 位置（旧） | 问题 | 正确 | 证据 |
+|---|---|---|---|
+| `README.md` 陷阱2 引文标 `iommu.c:1543` | 引文首行是 `if (pci_acs_path_enabled(...))` | 该行在 **:1547**（1543 是 `for (bus = ...)` 循环头） | `drivers/iommu/iommu.c:1543-1550` |
+| `annotations.md` §10 标 `iommu.c:1543` + `static struct iommu_group *pci_device_group()` | 函数头不在 1543；且**不是 static** | 函数头 **:1515**，`EXPORT_SYMBOL_GPL` 在 **:1577**；Step 1 真实写法是 `if (pci_for_each_dma_alias(...)) return data.group;`（**:1532-1533**） | 同上；README §关键函数索引原本写的 1515 才是对的 |
+| `README.md` §2.2 流程图 `vfio_find_dma_valid()` | **无此函数**（`drivers/vfio/` 0 命中） | `vfio_find_dma(iommu, iova, size)` @ `:1589` + `vfio_iommu_iova_dma_valid()` @ `:1615` | `drivers/vfio/vfio_iommu_type1.c` |
+| `README.md` §2.2 `get_user_pages_fast()` | 本文件 `get_user_pages` **0 命中** | `vaddr_get_pfns()`(`:551`) → `pin_user_pages_remote(mm, vaddr, npages, flags \| FOLL_LONGTERM, …)`(`:563`)，由 `vfio_pin_pages_remote()`(`:597`) 在 `:632` 调用 | 同上 |
+
+补充：`group-division.md` §1.4.4 把 group 105–114/168–177 统称"8 个 function 一组"，
+实测 `114`（`17:1e.0-.6`）与 `177`（`85:1e.0-.6`）只有 7 个 —— 归并数量取决于 function
+是否真实存在，已改为"多功能一组"并列出实测值。
+
+**为什么 `pin_user_pages_remote` 不是 `get_user_pages_fast` 的等价替换**（值得记一笔）：
+VFIO 要的是**长期 pin**，`FOLL_LONGTERM` 会把页移出 movable zone 以保证可被长期持有，
+配套的是 `FOLL_PIN` 语义（`pin_user_pages*`/`unpin_user_pages*` 成对，`vfio_iommu_type1.c:467`
+用 `unpin_user_pages_dirty_lock()`）；`get_user_pages_fast()` 只给 `FOLL_GET` 引用计数，
+既挡不住页迁移也挡不住 balloon 膨胀。所以这不只是改名，是**防换出/防迁移这条结论的依据**
+（旧图注"防止页面被换出"本身没错，但依据写错了 API）。

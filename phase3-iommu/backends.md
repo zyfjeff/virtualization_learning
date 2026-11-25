@@ -93,8 +93,14 @@ const struct iommu_ops amd_iommu_ops = {
    指向一个**静态单例域对象**——`__iommu_domain_alloc()` 遇到 IDENTITY 时直接
    返回它、不分配内存；**AMD 的表里没有这个字段**，identity 对它来说是一种
    "分配出来的、类型为 IDENTITY 的普通域"（B.4 看后果）。
-3. **`.release_domain` 只有 Intel 填了**（`:4646`，复用 `blocking_domain`）——
+3. **`.release_domain` 三家只有 Intel 填了**（`:4646`，复用 `blocking_domain`）——
    设备解绑时挂到哪个域，三家语义因此不完全一致。
+   机制在 `iommu_release_device()`：`if (!dev->iommu->attach_deferred && ops->release_domain)
+   ops->release_domain->ops->attach_dev(...)`（`drivers/iommu/iommu.c:480-481`）；
+   没填的驱动**必须在 `release_device()` 里自己把设备置成 identity 或 blocking**
+   （`:468-475` 的注释把这层契约写死了）。
+   ⚠️ "只有 Intel 填了"的范围是**本文比较的三家**；全内核还有 `s390-iommu.c:799` 也填了
+   （同样指向 `blocking_domain`）。
 
 ---
 
@@ -322,13 +328,22 @@ Intel/ARM 的 identity 是**静态单例**（`.identity_domain` 指向文件内�
 三家的分歧到"设备进场"这一步**反而消失**了：
 
 ```c
-/* 来源: drivers/iommu/iommu.c:600 → :513 → :416（调用链） */
-iommu_probe_device(dev)
-  → __iommu_probe_device(dev, ...)
-      → ops->probe_device(dev)      /* 三家各自实现 */
-      ...
-      → iommu_setup_dma_ops(dev)    /* drivers/iommu/iommu.c:583 */
+/* 调用链（drivers/iommu/iommu.c）：行号均为 6.12.93 实测 */
+iommu_probe_device(dev)                    :600
+  → __iommu_probe_device(dev, group_list)  :513
+      → iommu_init_device(dev, ops)        :544（定义 :402）
+          → ops->probe_device(dev)         :416   ← 三家各自实现
+          → group = ops->device_group(dev) :427   ← 分组判定也在这一帧
+      → iommu_group_alloc_device(group, dev) :549（只记账，不再判分组）
+      → list_add_tail(&gdev->list, …)      :560
+      → iommu_setup_default_domain(group, 0) :569
+      → iommu_setup_dma_ops(dev)           :583（定义 drivers/iommu/dma-iommu.c:1747）
 ```
+
+> **勘误**：旧稿这条链写成 `:600 → :513 → :416`，跳过了 `iommu_init_device()` 这一帧，
+> 容易让人以为 `ops->probe_device()` 是 `__iommu_probe_device()` 直接调的
+> （`:416` 其实落在 `:402` 起的 `iommu_init_device()` 里）。分组判定
+> `ops->device_group()`（`:427`）也在同一帧，[Q2 G.2](group.md) 有展开。
 
 `ops->probe_device` 是三家唯一要交的功课（建 `dev_iommu` 档案、登记进组）；
 其后的默认域选择（[Q3](domains.md)）、`iommu_setup_dma_ops()`

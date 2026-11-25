@@ -304,19 +304,42 @@ cat /proc/mtrr
 
 ### 5.1 什么是 IPAT？
 
-**IPAT (Ignore PAT)** 是 EPT 页表项中的第 6 位，用于控制是否忽略 Guest OS 的内存类型设置。
+**IPAT (Ignore PAT)** 是 EPT 页表项中的第 6 位，控制是否忽略 Guest 的 **PAT**。
+注意位名里只有 PAT、没有 MTRR —— 这不是缩写偷懒：**EPT 下 guest MTRR 根本不参与
+内存类型决策**，与 IPAT 取值无关。
 
 ```
 EPT PTE 格式：
 [PFN:51-12] [MT:5-3] [IPAT:6] [其他标志]
 
-IPAT = 0: 考虑 Guest 的 PAT/MTRR 设置
-IPAT = 1: 忽略 Guest 的 PAT/MTRR 设置，使用 EPT 中设置的内存类型
+IPAT = 0: 有效类型 = EPT MT 与 PAT MT 的组合（SDM Table 12-7 的规则，
+          把 EPT MT 放在原本 MTRR MT 的位置上）
+IPAT = 1: 有效类型 = EPT MT，PAT MT 被忽略
 ```
+
+**规范引用**: `intel-vmx.pdf`（Vol 3C）Section 29.3.7.2 "Memory Type Used for
+Translated Guest-Physical Addresses"，原文三条：
+
+> If the value is 0, the effective memory type is the combination of the EPT memory
+> type and the PAT memory type specified in Table 12-7 in Section 12.5.2.2, **using the
+> EPT memory type in place of the MTRR memory type**.
+> If the value is 1, the memory type used for the access is the EPT memory type.
+> **The PAT memory type is ignored**.
+> …
+> **The MTRRs have no effect on the memory type used for an access to a guest-physical
+> address.**
+
+另两条同样在 §29.3.7.2/§29.3.7.1 里：`CR0.CD = 1` ⇒ 有效类型一律 UC；`CR0.PG = 0`
+⇒ PAT memory type 固定为 WB（分页关闭时没有 guest 页表 PAT 位可查）。§29.3.7.1 还明确
+MTRR 对"取 EPT 分页结构本身"的访问也无影响，那次访问的类型由 EPTP bits 2:0 决定。
+
+所以正确的一句话是：**guest 侧能影响自己内存类型的只有 PAT 位（以及 CR0.CD/CR0.PG），
+MTRR 在 EPT 下彻底出局**。
 
 **定义位置**（`arch/x86/include/asm/vmx.h:537`）：
 ```c
-#define VMX_EPT_IPAT_BIT    (1ull << 6)
+/* 来源: arch/x86/include/asm/vmx.h:537 */
+#define VMX_EPT_IPAT_BIT    			(1ull << 6)
 ```
 
 ### 5.2 IPAT 默认行为
@@ -346,39 +369,54 @@ static inline bool vmx_ignore_guest_pat(struct kvm *kvm)
 - **true**：设置 `VMX_EPT_IPAT_BIT`，忽略 Guest PAT，强制 WB
 - **false**：不设置 IPAT，使用 Guest PAT 决定最终内存类型
 
+> **观测方法更正**：`noncoherent_dma_count` **不是 debugfs 文件**，旧稿写的
+> `cat /sys/kernel/debug/kvm/*/noncoherent_dma_count` 读不到东西（实测
+> `/sys/kernel/debug/kvm/<pid>-<n>/` 下只有 `exits`、`pf_*`、`pages_*k`、
+> `pf_mmio_spte_created` 这类统计项）。它只是 `struct kvm_arch` 里的一个
+> `atomic_t`（`arch/x86/include/asm/kvm_host.h:1341`）。可落地的观测方式有三条：
+>
+> 1. **查 quirk 位**：`KVM_X86_QUIRK_IGNORE_GUEST_PAT = (1 << 9)`
+>    （`arch/x86/include/uapi/asm/kvm.h:444`）。VMM 用
+>    `KVM_CHECK_EXTENSION(KVM_CAP_DISABLE_QUIRKS2)` 读支持集（`x86.c:4800-4802`），
+>    用 `KVM_ENABLE_CAP(KVM_CAP_DISABLE_QUIRKS2, bit)` 关掉（`x86.c:6549-6556`；
+>    落到 `kvm->arch.disabled_quirks`，判定见 `kvm_check_has_quirk()`，`x86.h:358-361`）。
+> 2. **看副作用**：第一个非一致性设备注册（或最后一个注销）时，KVM 会
+>    `kvm_zap_gfn_range(0, ~0ULL)` 把所有 SPTE 拆掉以便按新 PAT 策略重建
+>    （`kvm_noncoherent_dma_assignment_start_or_stop()`，`x86.c:13627-13639`）。
+>    现象是 debugfs 里 `mmu_shadow_zapped` / `pages_4k` 突变 + 一轮 EPT violation 风暴。
+> 3. **查宿主 CPU 是否有 self-snoop**：`grep -c '\bss\b' /proc/cpuinfo`
+>    （`X86_FEATURE_SELFSNOOP`，`arch/x86/include/asm/cpufeatures.h:54`）。没有的话
+>    KVM 直接把该 quirk 从支持集里摘掉（`vmx.c:8606-8608`），IPAT 永远为 0。
+
 #### 普通 VM（无 VFIO 设备）
 
 ```bash
-# 检查是否有 VFIO 设备
-cat /sys/kernel/debug/kvm/*/noncoherent_dma_count
-# 输出: 0
-
-# 结果
+# 结果（判据见上面的"观测方法更正"）
 # IPAT = 1（开启）
-# Guest 的 PAT/MTRR 设置被忽略
+# Guest 的 PAT 被忽略（MTRR 本来就不参与）
 # 所有 RAM 区域使用 WB
 ```
 
 **实际影响**：
-- Guest OS 设置 `mtrr_add(..., "uncachable")` **不会生效**
-- Guest OS 设置 `ioremap_wc(...)` **不会生效**
-- 所有内存访问都使用 WB（可缓存）
+- Guest OS 设置 `ioremap_wc(...)` **不会生效**（PAT 被 IPAT 忽略）
+- Guest OS 的 MTRR 设置**同样不生效，但与 IPAT 无关** —— EPT 下 MTRR 本来就不参与
+  guest-physical 访问的内存类型决策（§29.3.7.2）
+- 所有 RAM 区域使用 WB（可缓存）
 
 #### VFIO VM（有 VFIO 非一致性 DMA 设备）
 
 ```bash
-# 检查是否有 VFIO 设备
-cat /sys/kernel/debug/kvm/*/noncoherent_dma_count
-# 输出: 1（或更大）
+# 判据：kvm->arch.noncoherent_dma_count > 0（观测方法见上面方框）
 
 # 结果
 # IPAT = 0（关闭）
-# Guest 的 PAT/MTRR 设置被考虑
-# 可以设置 WC、UC 等内存类型
+# Guest 的 PAT 参与决策（EPT MT 顶替 MTRR MT 的位置，与 PAT MT 组合）
+# MTRR 依然不参与 —— 它在 EPT 下从来不参与
+# 于是可以设置 WC、UC 等内存类型
 ```
 
 **实际影响**：
-- GPU 直通时，`ioremap_wc(...)` **会生效**
+- GPU 直通时，`ioremap_wc(...)` **会生效**（生效路径是 **PAT**，不是 MTRR）
 - 可以正确设置 GPU 显存为 WC
 - 内存类型由 Guest OS 控制
 
@@ -418,7 +456,7 @@ static void kvm_vfio_update_coherency(struct kvm_device *dev)
 
 **结果**：
 ```c
-// arch/x86/kvm/x86.c:13543
+// arch/x86/kvm/x86.c:13654
 bool kvm_arch_has_noncoherent_dma(struct kvm *kvm)
 {
     return atomic_read(&kvm->arch.noncoherent_dma_count);
@@ -449,16 +487,22 @@ bool kvm_arch_has_noncoherent_dma(struct kvm *kvm)
 #### 场景 1：普通 VM 尝试设置 UC
 
 ```bash
-# Guest OS 尝试将 RAM 设置为 UC
-mtrr_add(0x100000, 4096, "uncachable", 1);
+# Guest OS 尝试把 RAM 设为 UC —— 只有走 PAT 的那条路才与 IPAT 有关：
+ioremap_nocache / set_memory_uc(...)   → 改的是 guest PAT（IA32_PAT / 页表 PCD/PAT 位）
 
 # 实际效果：
-# Guest PAT/MTRR: UC
-# EPT: WB + IPAT（IPAT 位 = 忽略 Guest 设置）
-# 最终: WB（Guest 设置被忽略）
+# Guest PAT MT: UC
+# EPT: MT = WB 且 IPAT = 1（PAT MT 被忽略）
+# 最终: WB（Guest 的 PAT 设置被忽略）
 ```
 
-**结果**：Guest 的设置**不起作用**。
+**结果**：Guest 通过 PAT 做的设置**不起作用**。
+
+> 如果 Guest 改的是 **MTRR**（`mtrr_add()` 这条内核 API 确实存在，
+> `arch/x86/kernel/cpu/mtrr/mtrr.c:383`），那么**无论 IPAT 是 0 还是 1 都不起作用** ——
+> SDM Vol 3C §29.3.7.2 原文 "The MTRRs have no effect on the memory type used for an
+> access to a guest-physical address."。这是本小节最容易讲反的地方：IPAT 只管 PAT，
+> MTRR 是另一回事。
 
 #### 场景 2：GPU 直通设置 WC
 
@@ -496,14 +540,16 @@ void *mmio = ioremap(0xfexxxxxx, size);
 #### 在 Host 上检查
 
 ```bash
-# 检查是否有 VFIO 设备
-cat /sys/kernel/debug/kvm/*/noncoherent_dma_count
+# 有没有 VFIO 设备直通（这条是真实存在的 sysfs 视图）
+ls /sys/bus/pci/drivers/vfio-pci/          # 例：0000:4b:00.0
 
-# 0 = 普通 VM（IPAT = 1）
-# >0 = VFIO VM（IPAT = 0）
-
-# 检查 VFIO 设备列表
-ls /sys/bus/pci/drivers/vfio-pci/
+# 但"设备是否非一致"不等于"挂了 VFIO"：判据是
+# iommu_capable(dev, IOMMU_CAP_ENFORCE_CACHE_COHERENCY) 的取反，
+# 只能按上面的"观测方法更正"三条来做。
+#
+# 注意：/sys/kernel/debug/kvm/<pid>-<n>/ 下【没有】noncoherent_dma_count 这个文件
+# （实测只有 exits / pf_* / pages_*k / mmu_* / pf_mmio_spte_created 等统计项），
+# 旧稿的 `cat /sys/kernel/debug/kvm/*/noncoherent_dma_count` 会直接报 No such file。
 ```
 
 #### 在 Guest 中测试
@@ -798,7 +844,9 @@ VFIO 设备附加
 │  • Guest 页表中的 PAT 位（bit 3, 4, 7）                     │
 │  • Guest MSR_IA32_PAT 定义 8 种内存类型                     │
 │  • 仅在 IPAT=0 时生效（VFIO 场景）                          │
-│  • Guest OS 可以通过 mtrr_add() 或 ioremap() 设置           │
+│  • Guest OS 只能通过 **PAT**（页表 PCD/PAT 位 + MSR_IA32_PAT）│
+│    影响，即 ioremap()/ioremap_wc()/set_memory_*() 这条路；   │
+│    Guest 的 **MTRR 永远不参与**（SDM §29.3.7.2）            │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐

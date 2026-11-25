@@ -1,6 +1,12 @@
 # KVM_CLOCK_REALTIME 深入分析
 
 > 基于 Linux 6.12 源码，分析 KVM_CLOCK_REALTIME 标志的作用、使用场景和陷阱
+>
+> ⚠️ 本文所有 `KVM_GET_CLOCK`/`KVM_SET_CLOCK` 示例均须在 **VM fd** 上调用
+> （api.rst §4.29/§4.30 "Type: vm ioctl"；实测 vCPU fd 与 /dev/kvm fd 均返回
+> EINVAL）。实测补充（2026-11-25，宿主 6.8.0-51-generic）：
+> `KVM_CHECK_EXTENSION(KVM_CAP_ADJUST_CLOCK)` 返回 **0xe**
+> （= KVM_CLOCK_TSC_STABLE|KVM_CLOCK_REALTIME|KVM_CLOCK_HOST_TSC = 2|4|8）。
 
 ---
 
@@ -18,16 +24,22 @@
 
 ### 1.1 问题的本质
 
-VM 热迁移时，需要将 guest 的时间状态从源主机迁移到目标主机。kvmclock 的核心公式是：
+VM 热迁移时，需要将 guest 的时间状态从源主机迁移到目标主机。kvmclock 的核心公式是（pvclock 协议，guest 侧实现见 `arch/x86/include/asm/pvclock.h:44-89` `pvclock_scale_delta()`/`__pvclock_read_cycles()`）：
 
 ```
-guest_time = host_tsc * tsc_to_system_mul + system_time
+guest_time = pvclock_scale_delta(guest_tsc - tsc_timestamp) + system_time
+           = ((guest_tsc - tsc_timestamp) << tsc_shift) × tsc_to_system_mul >> 32
+             + system_time
 ```
 
-其中：
-- `host_tsc`：宿主机的 TSC 值
-- `tsc_to_system_mul`：TSC 到系统时间的缩放因子
-- `system_time`：宿主机的系统时间（CLOCK_MONOTONIC）
+其中（注意都是 **guest 视角**，不是裸 host 值）：
+- `guest_tsc`：guest 执行 RDTSC 读到的值（= host TSC × multiplier + offset）
+- `tsc_timestamp`：host 上次更新共享页时的 **guest(L1) TSC** 锚点
+  （`kvm_read_l1_tsc()`，`arch/x86/kvm/x86.c:3265`）
+- `tsc_to_system_mul`/`tsc_shift`：TSC→纳秒的缩放因子与移位
+- `system_time`：**guest kvmclock** 在锚点时刻的值
+  （= `kernel_ns + kvmclock_offset`，`x86.c:3302`；VM 创建时 offset 为负，
+  所以它不等于 host 的 CLOCK_MONOTONIC）
 
 **问题**：迁移时，我们需要确保 guest 看到的时间是连续的，不能跳变。
 
@@ -37,14 +49,14 @@ guest_time = host_tsc * tsc_to_system_mul + system_time
 
 ```c
 // 源主机：保存时钟状态
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 // data.clock 包含当前的 kvmclock 值
 // data.flags = KVM_CLOCK_TSC_STABLE
 
 // 迁移到目标主机
 
 // 目标主机：恢复时钟状态
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 // 直接恢复 data.clock 的值
 ```
 
@@ -60,7 +72,7 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 ```c
 // 错误做法：手动补偿迁移耗时
 data.clock += migration_duration_ns;
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 ```
 
 **后果**：
@@ -96,7 +108,7 @@ struct kvm_clock_data {
 #### KVM_GET_CLOCK 的行为
 
 ```c
-// arch/x86/kvm/x86.c:1661-1694 (简化)
+// arch/x86/kvm/x86.c:3107-3139 (简化)
 static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
 {
     data->flags = 0;
@@ -132,7 +144,7 @@ static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
 #### KVM_SET_CLOCK 的行为
 
 ```c
-// arch/x86/kvm/x86.c:4321-4358 (简化)
+// arch/x86/kvm/x86.c:7006-7048 (简化)
 static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
 {
     if (copy_from_user(&data, argp, sizeof(data)))
@@ -233,7 +245,7 @@ if (now_real_ns > data.realtime)
 
 ```c
 // 保存快照
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 assert(data.flags & KVM_CLOCK_REALTIME);  // 确保标志有效
 save_to_snapshot(&data);
 
@@ -244,7 +256,7 @@ load_from_snapshot(&data);
 
 // 关键：恢复时必须保留 KVM_CLOCK_REALTIME 标志
 assert(data.flags & KVM_CLOCK_REALTIME);
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 // KVM 会自动补偿快照到恢复之间的时间流逝
 ```
 
@@ -257,12 +269,12 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 
 ```c
 // 源主机
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 send_to_destination(&data);
 
 // 目标主机
 recv_from_source(&data);
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 // KVM 会自动补偿迁移过程中的时间流逝
 ```
 
@@ -279,7 +291,7 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 struct kvm_clock_data data = {0};
 data.flags = 0;  // 不设置 KVM_CLOCK_REALTIME
 data.clock = 0;  // 从 0 开始
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 ```
 
 ### 3.4 场景四：TSC 不稳定（自动降级）
@@ -287,7 +299,7 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 如果宿主机的 TSC 不稳定，KVM 不会设置 `KVM_CLOCK_REALTIME` 标志：
 
 ```c
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 
 if (!(data.flags & KVM_CLOCK_REALTIME)) {
     // TSC 不稳定，无法使用 realtime 补偿
@@ -312,7 +324,7 @@ Firecracker 在快照恢复时，直接将保存的 `kvm_clock_data` 原样传�
 // Firecracker 错误做法
 let saved_data = load_from_snapshot();
 // saved_data.flags 包含 KVM_CLOCK_REALTIME
-ioctl(vcpu_fd, KVM_SET_CLOCK, &saved_data);
+ioctl(vm_fd, KVM_SET_CLOCK, &saved_data);
 ```
 
 **后果**：
@@ -343,7 +355,7 @@ KVM 的行为：
 // Firecracker 修复后的做法
 let saved_data = load_from_snapshot();
 saved_data.flags = 0;  // 清除所有标志，包括 KVM_CLOCK_REALTIME
-ioctl(vcpu_fd, KVM_SET_CLOCK, &saved_data);
+ioctl(vm_fd, KVM_SET_CLOCK, &saved_data);
 // 现在 KVM 不会自动补偿，VMM 需要自己处理时间连续性
 ```
 
@@ -359,14 +371,14 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &saved_data);
 ```c
 // 错误：在不需要补偿的场景使用 KVM_CLOCK_REALTIME
 struct kvm_clock_data data;
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 
 // 做一些与时间无关的操作（比如暂停 VM 进行调试）
 sleep(10);  // 暂停了 10 秒
 
 // 恢复时错误地使用了 KVM_CLOCK_REALTIME
 data.flags |= KVM_CLOCK_REALTIME;  // 错误！
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 // 结果：guest 时间向前跳了 10 秒！
 ```
 
@@ -375,7 +387,7 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 ```c
 // 如果只是暂停/恢复，不需要补偿时间
 data.flags = 0;  // 不使用 KVM_CLOCK_REALTIME
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 ```
 
 ### 4.3 陷阱三：忽略 KVM_CLOCK_TSC_STABLE 标志
@@ -383,7 +395,7 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 **问题**：
 
 ```c
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 
 // 错误：没有检查 TSC 稳定性
 if (data.flags & KVM_CLOCK_REALTIME) {
@@ -395,7 +407,7 @@ if (data.flags & KVM_CLOCK_REALTIME) {
 **正确做法**：
 
 ```c
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 
 // 正确：先检查 TSC 稳定性
 if (data.flags & KVM_CLOCK_TSC_STABLE) {
@@ -414,14 +426,14 @@ if (data.flags & KVM_CLOCK_TSC_STABLE) {
 **错误场景**：
 
 ```c
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 
 // 手动调整 clock 值
 data.clock += 100;  // 手动增加 100ns
 
 // 错误：仍然使用 KVM_CLOCK_REALTIME
 data.flags |= KVM_CLOCK_REALTIME;
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 
 // 结果：KVM 会在手动调整的基础上再自动补偿
 // 最终时间 = 手动调整 + 自动补偿
@@ -434,11 +446,11 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 // 方案 1：手动调整，不使用 KVM_CLOCK_REALTIME
 data.clock += 100;
 data.flags = 0;  // 清除 KVM_CLOCK_REALTIME
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 
 // 方案 2：不手动调整，让 KVM 自动补偿
 // 不做任何修改，直接恢复
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 ```
 
 ---
@@ -450,7 +462,7 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 ```c
 // 保存快照
 struct kvm_clock_data data;
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 
 // 验证标志
 if (!(data.flags & KVM_CLOCK_TSC_STABLE)) {
@@ -483,7 +495,7 @@ if (want_monotonic_clock) {
     data.flags = 0;
 }
 
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 ```
 
 ### 5.2 热迁移的标准流程
@@ -491,7 +503,7 @@ ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
 ```c
 // 源主机
 struct kvm_clock_data data;
-ioctl(vcpu_fd, KVM_GET_CLOCK, &data);
+ioctl(vm_fd, KVM_GET_CLOCK, &data);
 send_to_destination(&data);
 
 // 目标主机
@@ -504,7 +516,7 @@ if (!(data.flags & KVM_CLOCK_REALTIME)) {
     log_warning("Source doesn't support realtime, migration may have time jump");
 }
 
-ioctl(vcpu_fd, KVM_SET_CLOCK, &data);
+ioctl(vm_fd, KVM_SET_CLOCK, &data);
 ```
 
 ### 5.3 检查 KVM 支持
@@ -530,7 +542,7 @@ if (caps & KVM_CLOCK_REALTIME) {
 
 | 特性 | KVM_CLOCK_REALTIME | VMClock |
 |------|-------------------|---------|
-| 引入时间 | Linux 5.16 (2021) | Linux 7.0 (2026) |
+| 引入时间 | Linux 5.16 (2021, commit `c68dc1b577ea`) | Linux **v6.13**（guest 驱动 commit `205032724226`，git 树核实；旧文档误写 7.0，见勘误 30） |
 | 主要用途 | 快照/迁移时间补偿 | 精确时间同步 + 误差界 |
 | 精度 | 毫秒级（依赖墙钟） | 纳秒级（依赖 TSC） |
 | 跨架构 | 仅 x86 | x86 + ARM |
@@ -565,7 +577,8 @@ if (caps & KVM_CLOCK_REALTIME) {
 ### 7.1 关键数据结构
 
 ```c
-// include/uapi/linux/kvm.h:1085-1099
+// include/uapi/linux/kvm.h:1025-1038（KVM_CLOCK_VALID_FLAGS 不在 uapi，
+// 在 arch/x86/include/asm/kvm_host.h:2377-2378，仅内核内部使用）
 
 /* For KVM_CAP_ADJUST_CLOCK */
 #define KVM_CLOCK_TSC_STABLE    (1 << 1)  // bit 1
@@ -655,8 +668,8 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
 ## 📚 参考资料
 
 - Linux 内核提交：`c68dc1b577ea` ("KVM: x86: Report host tsc and realtime values in KVM_GET_CLOCK")
-- Linux 源码：`arch/x86/kvm/x86.c:1661-1694` (`__get_kvmclock`)
-- Linux 源码：`arch/x86/kvm/x86.c:4321-4358` (`kvm_vm_ioctl_set_clock`)
-- Linux 源码：`include/uapi/linux/kvm.h:1085-1099` (数据结构定义)
+- Linux 源码：`arch/x86/kvm/x86.c:3107-3139` (`__get_kvmclock`，x86.c 内 @ v6.12.93)
+- Linux 源码：`arch/x86/kvm/x86.c:7006-7048` (`kvm_vm_ioctl_set_clock`)
+- Linux 源码：`include/uapi/linux/kvm.h:1025-1038` (flags 与数据结构；`KVM_CLOCK_VALID_FLAGS` 在 `arch/x86/include/asm/kvm_host.h:2377-2378`)
 - Firecracker PR #5809：修复快照恢复时的时间跳变问题
 - KVM API 文档：`Documentation/virt/kvm/api.rst`

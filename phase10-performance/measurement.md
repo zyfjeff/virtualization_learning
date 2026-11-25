@@ -7,16 +7,16 @@
 
 ---
 
-## 0. 与 phase10 的分工
+## 0. 与 phase11 的分工
 
-| | phase10（调试与测试） | 本文（phase9） |
+| | phase11-debugging（调试与诊断） | 本文（phase10-performance） |
 |---|---|---|
 | 回答 | "为什么慢？去哪找？" | "这个改动带来多少？这个数可信吗？" |
 | 内容 | trace events 目录、`perf kvm` 用法、症状→命令排查树 | 对照组、统计量、扰动预算、噪声控制、归因纪律 |
-| 命令语法 | ✅ 权威 | ❌ 只指向 phase10 |
+| 命令语法 | ✅ 权威 | ❌ 只指向 phase11 |
 
 本文里出现的命令**只用于说明测量纪律**（例如"必须先清残留再采样"），
-不作为命令手册；要抄命令去 phase10。
+不作为命令手册；要抄命令去 `../phase11-debugging/`。
 
 ---
 
@@ -231,8 +231,16 @@ boot 窗口 q35 的 `IO_INSTRUCTION` 单项 72247 次。这还只是最小负载
      本仓的现成事故：6.12.93 里 `lapic_timer_advance_ns` **不是**模块参数
      （只有 `lapic_timer_advance` bool），而宿主 6.8 恰好相反
      （`parameters.md` §3、`../phase8-timer-virt/annotations.md:581`）。
-     另一处同类：`kvm_mmu_set_spte` 在 6.12 已不存在，
-     `../scripts/trace/trace-page-fault.sh` 的注释里已写明。
+     另一处同类，**方向相反**：`kvm_mmu_set_spte` 作为**函数**在 6.12.93 里确实没有
+     （全树无该符号定义，只有 `trace_kvm_mmu_set_spte()` 调用点），但**同名 tracepoint
+     仍然存在**，只是不挂在 `kvm` 组下 —— `TRACE_SYSTEM kvmmmu`
+     （`arch/x86/kvm/mmu/mmutrace.h:9`），事件定义 `:334-335`，触发点
+     `mmu/tdp_mmu.c:1059`（TDP MMU）与 `mmu/mmu.c:2949`（shadow）。
+     宿主实测 `/sys/kernel/debug/tracing/events/kvmmmu/kvm_mmu_set_spte/` 存在。
+     ★ 所以**不能写"它在 6.12 不存在"**（那是只在 `events/kvm/` 下找过得出的结论），
+     要写 `kvmmmu:kvm_mmu_set_spte`；页级别过滤也只能挂它（`kvm:kvm_page_fault`
+     没有 `level` 字段，见 `../corrections.md` D2）。同一脚本注释已按此纠正
+     （`../scripts/trace/trace-page-fault.sh:126-133`）。
 3. **清残留**：`echo > trace`、`echo nop > current_tracer`、
    `echo > set_ftrace_filter`、`echo > set_event`，并清 `kprobe_events`。
    **`kprobe_events` 与 `current_tracer`/`set_ftrace_filter` 是独立的**，只清前者会被
@@ -315,7 +323,7 @@ boot 窗口 q35 的 `IO_INSTRUCTION` 单项 72247 次。这还只是最小负载
 | ring buffer 溢出静默丢事件 | 计数偏低而不自知 | §4(c) |
 | kprobe 打 `.isra` 符号取参错 | 抓到"看似合理"的错参数 | `AGENTS.md` 陷阱 9 |
 | 文档命令跨内核版本照抄 | 参数/函数根本不存在 | §5 第 2 条，`parameters.md` §0(b) |
-| **统计量的名字不像它量的是那条路** | `directed_yield_attempted/successful` 看着就是 PLE 的定向让出计数，实际只由 guest hypercall 路径 `kvm_sched_yield()` 递增（`arch/x86/kvm/x86.c:10031,10057`），`kvm_vcpu_on_spin()`（`virt/kvm/kvm_main.c:4037`）一次都不加 → 用**成功**的实验得出"机制没跑通" | `annotations.md` §1.8 |
+| **统计量的名字不像它量的是那条路** | `directed_yield_attempted/successful` 看着就是 PLE 的定向让出计数，实际只由 guest hypercall 路径 `kvm_sched_yield()` 递增（`arch/x86/kvm/x86.c:10031,10057`），`kvm_vcpu_on_spin()`（`virt/kvm/kvm_main.c:4037`）一次都不加 → 用**成功**的实验得出"机制没跑通" | `annotations.md` §1「`directed_yield_attempted` 为什么不能当 PLE 的判据」 |
 | guest busybox ash 行缓冲 ≈1024 字节 | flood 类负载中途**静默停摆**，后续全部超时 | `../phase9-capstone/practice/README.md` 测量陷阱备忘（`bench-halt.sh` 限 800 字符） |
 | QEMU pipe chardev 只打开已存在的 `<path>.in/.out` | 必须先 `mkfifo`，否则卡住 | 同上 |
 | 直通设备寄存器布局动态变化 | 按静态布局做换算 → 读出全 1 / 设备收不到映射 | `AGENTS.md` 陷阱 16 |

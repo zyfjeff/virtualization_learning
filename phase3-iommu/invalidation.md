@@ -1045,7 +1045,8 @@ AGENTS.md 已知陷阱 14(d) 记录：规范 Section 4.5.2 用词是 "Recommende
 （`drivers/iommu/intel/pasid.c:885`）——**顺序被调换了**。本文不重复展开，只补一句
 与失效相关的结论：Linux 这么做的前提是"清 `E` 之后设备不会再产生新的
 翻译请求"，所以延后刷 Device-TLB 只影响**残留条目的存活时间**，不影响正确性。
-这个前提成立与否是 phase6 的话题。
+这个前提成立与否是 ATS 语义的话题，见 [phase4 `ats.md`](../phase4-pcie/ats.md)
+（以及直通侧的用法 [phase7 §1.5](../phase7-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力)）。
 
 ---
 
@@ -1154,7 +1155,7 @@ Error）——ITE 的软件处置见 I.6.2。三件事必须记准：
    并回收 ITag"这回事。软件侧的同步手段只有 wait descriptor 的状态写（I.5）。
 2. **软件侧唯一的旋钮是 `ats_qdep`**——`qi_batch_add_dev_iotlb()` 的 `qdep` 实参
    （`drivers/iommu/intel/cache.c:310`），它来自 `pci_ats_queue_depth()`，也就是
-   [phase6 §1.5](../phase7-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力) 里
+   [phase7 §1.5](../phase7-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力) 里
    那个"PF 返回 32、VF 返回 0"的字段。
 3. **Device-TLB 失效的代价不在队列记账里。** 它不占 IOTLB 那条队列的 `free_cnt`
    等待（I.4.2），占的是链路对端的完成时间。于是"缓存副本跑到了异步链路的另一端"

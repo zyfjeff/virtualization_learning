@@ -23,7 +23,7 @@
  *
  * 规范引用:
  *   Intel SDM Vol 2, CPUID instruction
- *   Intel SDM Vol 3, Section 25.1.2 (VM-Exits caused by instructions)
+ *   Intel SDM Vol 3C, Section 26.1.2 "Instructions That Cause VM Exits Unconditionally"
  */
 
 #include <stdio.h>

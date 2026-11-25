@@ -107,11 +107,17 @@
 
 ## 待修复错误
 
-### ⚠️ 7. basics.md 剩余行号错误
+### ✅ 7. basics.md 剩余行号错误（2026-11-25 已修）
 
-basics.md 中仍有部分行号引用错误，需要逐一定位正确行号。
+复核并修正三处：
+- `pci_create_root_bus`：probe.c:3058 → **3113**（3058 实为
+  `pci_scan_child_bus_extend` 内部 `max = start + used_buses;`）
+- `PCI_BASE_ADDRESS_*`：pci_regs.h:88 → **102-108**（88 实为 PCI_BIST 区）
+- `PCI_EXP_FLAGS*`：pci_regs.h:586 → **474 起**（586 实为 PCI_EXP_SLTCAP）
 
-**状态**: ❌ 待修正
+字段值本身（0x01/0x04/0x06、0x00f0、0x3e00 等）与 pci_regs.h 逐项核对无误。
+
+**状态**: ✅ 已修复 (2026-11-25)
 
 ---
 
@@ -144,6 +150,94 @@ PCI-to-PCI Bridge）class=0x0604（bridge），但 config[0x0e] bit7=0（setpci 
 查清后回写 basics.md §3 的简化说法。
 
 **状态**: ⚠️ 待核查（概念边界 + 待办，符合勘误瘦身策略）
+
+---
+
+### ✅ 13. annotations.md §3 ACS 代码块为伪代码（2026-11-25，严重）
+
+**位置**: `annotations.md` §3（`pci_acs_flags_enabled()` / `pci_acs_enabled()`）
+
+**错误**（行号对、代码体错）：
+1. `pci_acs_flags_enabled`：写 `acs_flags &= PCI_ACS_FLAGS_MASK` —— 内核**不存在**
+   `PCI_ACS_FLAGS_MASK`；真实判据是先读 `PCI_ACS_CAP` 再
+   `acs_flags &= (cap | PCI_ACS_EC)`（pci.c:3583-3602，形参 `u16`）——
+   "未声明的能力视为硬连线已启用"（AGENTS.md #11）恰恰被伪代码抹掉了，
+   与同节问题链 #3 的正文自相矛盾。
+2. `pci_acs_enabled`：① 顺序错——旧块先 `!pci_is_pcie` 再查 quirk，真实是
+   **quirk 最先**（pci.c:3624）；② `PCI_BRIDGE`/`PCIE_BRIDGE`/`RC_EC` 真实
+   **return false**（:3647-3649，PCIe 6.12.1 排除其 ACS），旧块归入"查寄存器"；
+   ③ 旧块写"RC_END 总是隔离 return true"，真实：RCiEP 判隔离来自 **quirk**
+   （quirks.c:5122 `pci_quirk_rciep_acs`，AGENTS #11）+ 单功能 fall-through，
+   `pci_acs_enabled` 里没有 RC_END→true 分支；④ 旧块写"Endpoint 不提供隔离
+   return false"，真实是**单功能端点返回 true**（effective ACS，函数头注释）。
+
+**修复**：两段代码块替换为 `drivers/pci/pci.c:3583-3602 / 3620-3681` 真实节选，
+"关键逻辑"列表同步重写。
+
+**状态**: ✅ 已修复 (2026-11-25)
+
+---
+
+### ✅ 14. annotations.md §1 枚举代码块的 bridge 循环与真实调用结构不符（2026-11-25）
+
+**位置**: `annotations.md` §1（`pci_scan_child_bus_extend()` 代码块）
+
+**错误**: bridge 循环写成直接递归
+`pci_scan_child_bus_extend(dev->subordinate, available_buses - used_buses)`。
+
+**核实**: 真实代码两遍循环调用的是 `pci_scan_bridge_extend(bus, dev, max, 0, 0)`
+（第一遍，不动固件配置，probe.c:3006-3018）与
+`pci_scan_bridge_extend(bus, dev, cmax, buses, 1)`（第二遍重配+分配余量，:3020-3046）；
+`pci_scan_child_bus_extend()` 的递归只发生在 `pci_scan_bridge_extend()` 内部
+（probe.c:1444）。正文"bridge 扫两遍"的说法本身正确。
+
+**修复**: 代码块改为两遍循环的真实节选并注明递归位置。
+
+**状态**: ✅ 已修复 (2026-11-25)
+
+---
+
+### ✅ 15. ats.md 寄存器位图错误 + 虚构文件/函数 + 不存在的 trace 事件（2026-11-25）
+
+**位置**: `ats.md`「ATS 的配置和启用」「ATS 的性能测量」
+
+**错误与核实**：
+1. ATS 控制寄存器旧写"bit15 Enable / **bit14 Invalidate Queue Depth** /
+   bits13-0 保留"——真实（pci_regs.h:912-921，PCIe 6.0 §7.8.11）：
+   Control：bit15=Enable、**bits14:10=STU**（旧图整个遗漏，正是 AGENTS #14a 的坑）；
+   Capability：bits4:0=Invalidate Queue Depth、bit5=Page Aligned Request（#14b/#14c）。
+2. `drivers/iommu/intel/ats.c` 在 6.12.93 **不存在**；
+   `intel_enable_ats(dev, queue_depth)` 不存在。真实路径：
+   `iommu.c:1295-1297 → pci_enable_ats(pdev, VTD_PAGE_SHIFT)`
+   （`drivers/pci/ats.c:90`，形参是页位移 `ps`，写 Enable+STU）。
+3. `events/amd_iommu/ats/enable`：6.12.93 无 `amd_iommu` trace 事件类
+   （drivers/iommu/amd 下无 TRACE_EVENT）；`iommu:map/unmap` 存在
+   （include/trace/events/iommu.h:79/103）。已改为 `qi_flush_dev_iotlb`
+   （dmar.c:1534）kprobe 思路并按 AGENTS #9 标注取参验证要求。
+
+**修复**: 三处均已按真实源码改写，附 file:line。
+
+**状态**: ✅ 已修复 (2026-11-25)
+
+---
+
+### ✅ 16. acs-upstream-forwarding.md 把 UF 控制位画在 Switch Upstream Port（2026-11-25）
+
+**错误**: 拓扑图/分工表写"UF 工作位置：Switch Upstream Ports + Root Ports"。
+
+**核实**（PCIe Base r6.0 §6.12.1, p.753）：
+"ACS Upstream Forwarding: must be implemented by **Root Ports** if the RC
+supports Redirected Request Validation; must be implemented by **Switch
+Downstream Ports**"；行为定义也在 DSP（"When ACS Upstream Forwarding is
+enabled in a Switch Downstream Port, and its Ingress Port receives an Upstream
+Request or Completion TLP targeting the Port's own Egress Port, the Port must
+instead forward the TLP Upstream"）。§6.12.2 的"中间 Switch 必须支持 UF"指这些
+Switch 的下游端口；多功能设备/RCiEP 侧 UF "must not be implemented"（§6.12.1.2）。
+"不使能 UF 时重定向 TLP 处理 undefined"的结论本身有 §6.12.2 支撑，保留。
+
+**修复**: 拓扑图、分工表、场景 1/3、性能节路径全部改到 DSP/Root Port，附勘误注记。
+
+**状态**: ✅ 已修复 (2026-11-25)
 
 ---
 
@@ -186,11 +280,14 @@ PCI-to-PCI Bridge）class=0x0604（bridge），但 config[0x0e] bit7=0（setpci 
 - ✅ 13 个行号引用
 - ✅ 多个命名错误
 - ✅ annotations.md 全面重写
+- ✅（2026-11-25 二轮）basics.md 剩余行号（条目 7）；annotations §3 ACS 伪代码、
+  §1 扫描调用结构（条目 13、14）；ats.md 位图/虚构文件/trace 事件（条目 15）；
+  acs-upstream-forwarding.md UF 位置（条目 16）
 
 **待修复**：
-- ⚠️ basics.md 剩余行号错误
+- ⚠️ 条目 11（ats.md 性能数字审计）、条目 12（header type 边界待核查）
 
-**事实核查完成度**：90%
+**事实核查完成度**：~95%（第二轮已对照 6.12.93 逐行核过 ACS/ATS/枚举代码体）
 
 **实际情况**: 根据 git log，phase 编号经历过重组（commit `4c19f41`），PCIe 现在是 Phase 4。README 中的前置知识引用需要更新为正确的 phase 编号。
 
@@ -218,6 +315,8 @@ PCI-to-PCI Bridge）class=0x0604（bridge），但 config[0x0e] bit7=0（setpci 
 
 ### 待修正文件清单
 
-- [ ] `annotations.md` — 修正所有函数名、行号、代码体、struct 字段
-- [ ] `basics.md` — 修正行号、函数名、BAR 枚举流程、宏名
-- [ ] `README.md` — 修正前置知识 phase 编号引用
+- [x] `annotations.md` — 修正所有函数名、行号、代码体、struct 字段
+      （2026-11-25 二轮补修 §1/§3 代码体，见条目 13、14）
+- [x] `basics.md` — 修正行号、函数名、BAR 枚举流程、宏名
+      （2026-11-25 修 probe.c:3113 / pci_regs.h:102-108 / 474，见条目 7）
+- [x] `README.md` — 修正前置知识 phase 编号引用（条目 10 复核无需再改）

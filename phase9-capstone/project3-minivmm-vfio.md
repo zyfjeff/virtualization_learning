@@ -52,8 +52,12 @@ group 加入 container 后才能拿到 device fd。
 1. VMM 模拟一个最小 PCI 根复合体：实现配置空间访问通道
    （传统 `0xcf8`/`0xcfc` PIO，或 ECAM MMIO），在某个 BDF 上
    暴露直通设备。
-2. 配置空间读写转发：`VFIO_DEVICE_READ/WRITE` 作用于
-   `VFIO_PCI_CONFIG_REGION`（region 0）；写命令寄存器
+2. 配置空间读写转发：6.12.93 **没有** `VFIO_DEVICE_READ/WRITE` 这样的
+   ioctl——配置空间访问是对 device fd 直接 `pread/pwrite`，落在
+   `VFIO_PCI_CONFIG_REGION_INDEX` = **索引 7** 的 region 上（BAR0-5 占
+   索引 0-5、ROM 是 6、config 是 7，`include/uapi/linux/vfio.h:620-627`；
+   region 的偏移由 `VFIO_DEVICE_GET_REGION_INFO` 返回，用法见
+   `practice/minivmm.c:2060-2068`）。写命令寄存器
    （Bus Master / Memory Space Enable）必须真正落到设备。
 3. BAR：`VFIO_DEVICE_GET_REGION_INFO` 枚举各 BAR region；
    `mmap()` region fd 后可把 BAR 直接作为

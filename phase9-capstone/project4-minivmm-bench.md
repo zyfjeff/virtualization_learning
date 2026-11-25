@@ -6,9 +6,12 @@
 
 **前置**：项目 1-3；阅读 `../phase10-performance/measurement.md`（测量纪律，**先读**）、
 `../phase10-performance/parameters.md` §1（halt-polling 参数默认值与权限）、
-`../phase0-kvm-framework/annotations.md` §9（halt-polling 机制）、
+`../phase0-kvm-framework/annotations.md` §7（halt-polling 机制，
+见该文件 `## 7. halt-polling`；§9 是"底层阻塞原语"）、
 `../phase1-cpu-virt/README.md` §1（VPID 机制）、`../phase11-debugging/README.md`
-（trace 工具）、`../phase11-microvm/README.md`（MicroVM 启动路径）。
+（trace 工具）。MicroVM 启动路径看 QEMU 源码 `hw/i386/microvm.c` 与
+`practice/README.md` 项目 4 M1 实测（原引用的 `../phase11-microvm/README.md`
+不存在，见 corrections.md L6）。
 
 ---
 
@@ -21,16 +24,19 @@
 - 各跑 ≥10 次取中位数；按阶段拆分耗时：KVM 初始化 / 内核解压 /
   驱动探测 / initramfs。拆分手段：宿主侧
   `kvm:kvm_exit` tracepoint + guest `dmesg` 时间戳。
-- 对照 `../phase11-microvm/README.md`：MicroVM 砍掉哪些设备、
-  为什么能缩短启动路径；你的 VMM 天然精简，对比能说明
-  "设备模型大小"与"启动延迟"的关系。
+- 对照 QEMU microvm（`-machine microvm`，源码 `hw/i386/microvm.c`）：
+  MicroVM 砍掉哪些设备、为什么能缩短启动路径；你的 VMM 天然精简，对比能说明
+  "设备模型大小"与"启动延迟"的关系（实测结论见 `practice/README.md` 项目 4 M1）。
 
 ## M2：VM-Exit 分布
 
 同一负载（如启动到 shell、guest 内 `stress-ng --cpu 1`）下：
 
 ```bash
-perf kvm stat record -- sleep 30 && perf kvm stat report
+perf kvm stat record -a -- sleep 30 && perf kvm stat report
+# -a 必须: 不带 -a 时 record 只跟踪被包裹进程（sleep 自身无任何 kvm 事件），
+# vCPU 线程的退出全丢（builtin-kvm.c:1959-1960 仅 target 为空才置 system-wide）。
+# 见下文"测量陷阱备忘"与 practice/README.md 项目 4 M2。
 # 或逐事件:
 perf record -e kvm:kvm_exit -a -- sleep 10
 ```
@@ -64,7 +70,7 @@ KVM 在 vCPU halt 时先忙等再真正睡眠，窗口由四个模块参数控�
   只有当用户态用 `KVM_CAP_HALT_POLL` 设过 cap 才轮到它 —— 这条路径在
   `kvm_vm_ioctl_enable_cap_generic()`（`virt/kvm/kvm_main.c:5035`）的
   `case KVM_CAP_HALT_POLL`（`virt/kvm/kvm_main.c:5052`）：`:5056` 写
-  `kvm->max_halt_poll_ns`，`:5064` 置 `kvm->override_halt_poll_ns`。
+  `kvm->max_halt_poll_ns`，`:5065` 置 `kvm->override_halt_poll_ns`（`:5064` 是配套的 `smp_wmb()`）。
   只有 `override_halt_poll_ns` 置了，`kvm_vcpu_max_halt_poll_ns()` 才返回 per-VM 值
   （`virt/kvm/kvm_main.c:3791`），否则读模块参数 `halt_poll_ns`
   （`virt/kvm/kvm_main.c:3802`）。所以测出"改了模块参数却没反应"时，
@@ -119,7 +125,7 @@ KVM 在 vCPU halt 时先忙等再真正睡眠，窗口由四个模块参数控�
 - `../phase10-performance/measurement.md`（测量纪律与扰动预算）、
   `../phase10-performance/parameters.md`（参数默认值/权限唯一来源）、
   `../phase10-performance/index.md`（本仓已实测结论索引，含 halt-polling 收益曲线）、
-  `../phase11-debugging/README.md`、`../phase11-microvm/README.md`
+  `../phase11-debugging/README.md`
 - `perf kvm` 用法：`man perf-kvm`；tracepoint 目录
   `/sys/kernel/tracing/events/kvm/`
 - QEMU microvm：`/root/code/qemu-10.1.0-rc2/hw/i386/microvm.c`

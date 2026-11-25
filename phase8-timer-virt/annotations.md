@@ -350,8 +350,12 @@ static enum hrtimer_restart apic_timer_fn(struct hrtimer *data)
 }
 ```
 
-**`apic_timer_expired()`**（`lapic.c:1915`）是到期的核心处理：标记 `pending=1`、
-通过 `kvm_queue_pending_eoi` 或直接 `kvm_vcpu_kick()` 唤醒 vCPU。
+**`apic_timer_expired()`**（`lapic.c:1915-1950`）是到期的核心处理：
+`atomic_inc(&lapic_timer.pending)` + `kvm_make_request(KVM_REQ_UNBLOCK)`，
+且仅 `from_timer_fn`（host hrtimer 上下文）时 `kvm_vcpu_kick()` 唤醒 vCPU；
+APICv/posted-timer 路径则直接 `kvm_apic_inject_pending_timer_irqs()` 注入
+（`lapic.c:1925-1943`）。6.12.93 树中**不存在** `kvm_queue_pending_eoi()` <!-- check-refs:ignore -->
+（全树 grep 零命中，旧文档误写，见勘误 30）。
 
 ---
 
@@ -383,7 +387,11 @@ void vmx_write_tsc_multiplier(struct kvm_vcpu *vcpu)
 有 TSC scaling:   Guest TSC = (Host TSC × TSC_MULTIPLIER) + TSC_OFFSET
 ```
 
-`TSC_MULTIPLIER` 格式：48 位小数 + 整数位。`1.0 = 0x0000000100000000`。
+`TSC_MULTIPLIER` 格式：VMX 为 **16.48 定点**（整数位 63:48 + 小数 47:0，
+SDM Vol.3 "TSC Scaling"；`kvm_caps.tsc_scaling_ratio_frac_bits = 48`，
+`vmx.c:8502`），**1.0 = 2^48 = `0x0001000000000000`**。
+注意别写成 SVM 的值：AMD SVM 是 32 位小数（`svm.c:5478`），
+1.0 = 2^32 = `0x0000000100000000`。
 
 | 用途 | 场景 |
 |------|------|
@@ -514,11 +522,14 @@ do {
     version = pvti->version;              /* 1. 读版本号 */
 } while (version & 1);                    /*    奇数=更新中，重试 */
 
-current_tsc = RDTSC;                      /* 2. 读当前 TSC */
+current_tsc = RDTSC;                      /* 2. 读当前 (guest) TSC */
 delta_tsc = current_tsc - pvti->tsc_timestamp;
 
-delta_ns = (delta_tsc * pvti->tsc_to_system_mul) >> (22 + tsc_shift);
-                                              /* 3. TSC → ns */
+/* 3. TSC → ns：真实实现 pvclock_scale_delta()（arch/x86/include/asm/pvclock.h:44-77）
+ *    shift>=0 时 delta <<= shift（shift<0 时 >>= -shift），
+ *    再 (delta × mul) >> 32，合并闭式 = (delta_tsc × mul) >> (32 - tsc_shift)。
+ *    注意不是 ">> (22 + shift)"（旧版本文档常数与移位方向均错，见勘误 30）。 */
+delta_ns = pvclock_scale_delta(delta_tsc, mul, tsc_shift);
 current_ns = pvti->system_time + delta_ns;  /* 4. 加上基准 */
 
 if (version != pvti->version) goto retry;   /* 5. 版本号变了 → 重试 */
@@ -616,8 +627,12 @@ if (lapic_timer_advance)
 (arch/x86/kvm/debugfs.c:67, 权限 0444)
 ```
 
-**⚠️**：不存在 `lapic_timer_advance_ns` 模块参数，不能用 `/sys/module/kvm/parameters/`
-调它。只有 `lapic_timer_advance` (bool) 是模块参数。
+**⚠️**：在 **6.12.93 基线**里不存在 `lapic_timer_advance_ns` 模块参数，不能用
+`/sys/module/kvm/parameters/` 调它，只有 `lapic_timer_advance` (bool) 是模块参数。
+但**当前实验宿主是 Ubuntu 6.8.0-51-generic，接口相反**：没有 bool
+`lapic_timer_advance` 参数，只有 int `lapic_timer_advance_ns`（0644，实测运行时可写、
+当前值 -1）——"不存在 lapic_timer_advance_ns 模块参数"在本机不成立。
+做参数实验前先 `ls /sys/module/kvm/parameters/ | grep timer` 确认接口形态。
 
 ---
 
@@ -693,8 +708,9 @@ echo 500 > /sys/module/kvm/parameters/tsc_tolerance_ppm
   (debugfs.c:67, 0444)
 
 Guest TSC offset:
-  /sys/kernel/debug/kvm/<pid>-<fd>/vcpu*/tsc_offset
-  (如果有对应的 debugfs 入口)
+  /sys/kernel/debug/kvm/<pid>-<fd>/vcpu*/tsc-offset
+  (debugfs.c:63，文件名是 tsc-offset（连字符）；同目录另有
+   lapic_timer_advance_ns:67、tsc-scaling-ratio:72、tsc-scaling-ratio-frac-bits:75)
 ```
 
 ---
@@ -754,8 +770,9 @@ Guest TSC offset:
     │   └→ apic_timer_expired() (:1915)
     └── SW timer: apic_timer_fn() (:2883)
         └→ apic_timer_expired() (:1915)
-            ├→ lapic_timer.pending = 1
-            └→ kvm_vcpu_kick() / kvm_queue_pending_eoi()
+            ├→ atomic_inc(&lapic_timer.pending) + KVM_REQ_UNBLOCK
+            ├→ kvm_vcpu_kick()（仅 from_timer_fn）
+            └→ 或 kvm_apic_inject_pending_timer_irqs()（APICv/posted）
 
 
 ═══════════════════ TSC 虚拟化 ═══════════════════
@@ -798,7 +815,8 @@ Guest TSC offset:
 
   Guest 读时间:
     do { version = pvti->version; } while (version & 1);
-    delta_ns = (RDTSC - tsc_timestamp) × mul >> (22 + shift);
+    delta_ns = ((RDTSC - tsc_timestamp) << shift) × mul >> 32
+               （即 × mul >> (32 - shift)，pvclock.h:44-77）
     current_ns = system_time + delta_ns;
     if (version != pvti->version) retry;
 ```

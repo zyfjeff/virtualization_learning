@@ -29,11 +29,11 @@ preflight() {
     echo "✓ KVM 模块"
 
     # 检查 QEMU 日志
-    if [ -f /tmp/qemu.log ]; then
-        echo "✓ QEMU 日志: /tmp/qemu.log ($(wc -l < /tmp/qemu.log) 行)"
+    if [ -f /tmp/qemu.err ]; then
+        echo "✓ QEMU stderr 日志: /tmp/qemu.err ($(wc -l < /tmp/qemu.err) 行)"
     else
-        echo "⚠ /tmp/qemu.log 不存在"
-        echo "  启动 VM 时加: -D /tmp/qemu.log -d kvm"
+        echo "⚠ /tmp/qemu.err 不存在"
+        echo "  启动 VM 时加: ... 2> /tmp/qemu.err   （★ -d kvm 不是合法日志项，QEMU 会 exit 1）"
     fi
 
     pgrep -f '^qemu-system-x86_64' >/dev/null || {
@@ -49,7 +49,7 @@ dry_run() {
 
 将执行以下步骤：
 
-1. 检查 QEMU 日志（/tmp/qemu.log）
+1. 检查 QEMU stderr 日志（/tmp/qemu.err）
    → 查找 KVM_EXIT_* 原因
 
 2. ftrace 跟踪退出事件（10 秒）
@@ -91,14 +91,14 @@ main() {
 
     # Step 1: QEMU 日志
     echo "Step 1: 检查 QEMU 日志"
-    if [ -f /tmp/qemu.log ]; then
+    if [ -f /tmp/qemu.err ]; then
         echo "--- KVM_EXIT 原因 ---"
-        grep -E 'KVM_EXIT_|kvm_exit' /tmp/qemu.log | tail -10 || echo "(无)"
+        grep -E 'KVM internal error|entry failed|kvm run failed' /tmp/qemu.err | tail -10 || echo "(无)"
         echo ""
         echo "--- 内部错误 ---"
-        grep -i 'internal error\|kvm internal' /tmp/qemu.log || echo "(无)"
+        grep -i 'internal error' /tmp/qemu.err || echo "(无)"
     else
-        echo "⚠ /tmp/qemu.log 不存在，跳过"
+        echo "⚠ /tmp/qemu.err 不存在，跳过"
     fi
 
     # Step 2: ftrace
@@ -132,7 +132,7 @@ main() {
     if [ "$inj_count" -gt 0 ]; then
         echo "异常分布:"
         grep 'kvm_inj_exception' "$TRACEFS/trace" | \
-            grep -oP 'exception=\w+' | sort | uniq -c | sort -rn
+            grep -oP '#[A-Z]{2}' | sort | uniq -c | sort -rn
     fi
 
     # Step 4: bpftrace

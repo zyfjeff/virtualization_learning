@@ -763,10 +763,21 @@ static void setup_cpuid(void)
              * MSR 会在 lapic.c:3312 的 !apic_x2apic_mode() 检查处 return 1，
              * 经 x86.c:3889 回到 kvm_set_msr_common —— 后果是给 guest 注入
              * #GP，不是静默丢弃。
-             * TSC_DEADLINE_TIMER (leaf1 ECX bit24, cpufeatures.h:137) 必须
-             * 保留：缺它 cpuid.c:399-402 会把 timer_mode_mask 从 3<<17 降成
+             * TSC_DEADLINE_TIMER (leaf1 ECX bit24, cpufeatures.h:137) 需
+             * 自行置位：KVM_GET_SUPPORTED_CPUID 本就没有它——cpuid.c:647-660
+             * 的 CPUID_1_ECX 白名单把 bit24 写死为 0（源码注释标 Reserved），
+             * 全树没有 kvm_cpu_cap_set(X86_FEATURE_TSC_DEADLINE_TIMER)，
+             * cpuid.h:61-68 又用 kvm_cpu_caps 整体覆盖 ECX；本机实测 leaf1
+             * ECX=0x76fab223，bit24=0。QEMU 同样自补（target/i386/kvm/kvm.c
+             * 461-467，注释 "tsc-deadline flag is not returned by
+             * GET_SUPPORTED_CPUID"），门槛是 KVM_CAP_TSC_DEADLINE_TIMER=1
+             * （x86.c:4652 无条件 r=1 组；本机实测=1）+ in-kernel irqchip。
+             * 缺它 cpuid.c:399-402 会把 timer_mode_mask 从 3<<17 降成
              * 1<<17，guest 写 LVT Timer 时 bit18 被 lapic.c:2391 掩掉，
-             * TSC Deadline 模式根本设不上。 */
+             * TSC Deadline 模式设不上。现状：本函数未置 bit24 ——
+             * PIC/virtual-wire 阶段不用 LAPIC timer，实测无影响；guest 进
+             * APIC 模式后要 deadline 需补 e->ecx |= (1U << 24)。
+             * 详见 ../corrections.md L1。 */
             e->ecx &= ~(1U << 21);
             /* X86_FEATURE_HYPERVISOR (cpufeatures.h:144, leaf1 ECX bit31)
              * 必须自己补上：KVM_GET_SUPPORTED_CPUID 返回的 ECX 里没有它

@@ -32,7 +32,7 @@
 # ======================== ftrace 等效命令 ========================
 #   # set_event 上加事件用 >>: 带 O_TRUNC 的写会先清掉全部已启用事件
 #   # (kernel/trace/trace_events.c:2411 -> :2422-2423 调 ftrace_clear_events()),
-#   # 详见 ../../phase9-performance/measurement.md §5 第 3 条
+#   # 详见 ../../phase10-performance/measurement.md §5 第 3 条
 #   echo kvm:kvm_exit >> /sys/kernel/debug/tracing/set_event
 #   cat /sys/kernel/debug/tracing/trace_pipe
 
@@ -462,7 +462,7 @@ def main():
             elif basic == 1:
                 desc = "EXTERNAL_INTERRUPT → 宿主处理 IRQ 后重新 VM-Entry"
             elif basic == 12:
-                desc = "HLT → guest 空闲；轮询档位见 phase9-performance/parameters.md §1"
+                desc = "HLT → guest 空闲；轮询档位见 phase10-performance/parameters.md §1"
             elif basic == 10:
                 desc = "CPUID → KVM 模拟 CPU 特性"
             elif basic == 18:

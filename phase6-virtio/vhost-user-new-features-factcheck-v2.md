@@ -8,7 +8,14 @@
 
 ## 📋 核查概述
 
-本文档对 vhost-user 协议的新特性（特性 13-22）进行事实核查，验证其在 QEMU 11.1.0 和 DPDK 中的实际实现和使用场景。
+本文档对 vhost-user 协议的特性 13-22 进行事实核查，验证其在 QEMU 11.1.0 和 DPDK 中的实际实现和使用场景。
+
+> ⚠️ **版本口径（2026-11-25 补充）**：13-22 不等于"11.1.0 新增"。本仓基线 QEMU 10.1.0-rc2 的
+> 枚举已经包含 13-19（`include/hw/virtio/vhost-user.h:28-35`，止于
+> `VHOST_USER_PROTOCOL_F_DEVICE_STATE = 19`）；**相对基线真正新增的只有 20/21/22**
+> （11.1.0 `include/hw/virtio/vhost-user.h:36-38`）。另外 `vhost_user_has_protocol_feature()`
+> 这个 helper 本身是 11.1.0 才有的（10.1.0-rc2 全树 0 命中），所以本文所有 11.1.0 行号
+> **不能**直接套到基线上。
 
 ---
 
@@ -21,11 +28,22 @@
 **QEMU 11.1.0 实现核查**:
 
 ```c
-// hw/virtio/vhost-user.c:1675
-if (vhost_user_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_RESET_DEVICE)) {
-    // 实现重置逻辑
-}
+/* 来源: hw/virtio/vhost-user.c:1670-1679 —— vhost_user_reset_device()（真实代码，注意取反） */
+    /*
+     * Historically, reset was not implemented so only reset devices
+     * that are expecting it.
+     */
+    if (!vhost_user_has_protocol_feature(
+            dev, VHOST_USER_PROTOCOL_F_RESET_DEVICE)) {
+        return -ENOSYS;
+    }
+
+    return vhost_user_write(dev, &msg, NULL, 0);
 ```
+
+> ⚠️ 本处初版写成 `if (vhost_user_has_protocol_feature(...)) { // 实现重置逻辑 }`，
+> **漏掉了 `!`**：未协商该特性时 QEMU 直接返回 `-ENOSYS`，而不是"走重置逻辑"。
+> 与 AGENTS.md 已知陷阱 #12 同类——按字面猜判据方向会得出相反结论。
 
 **DPDK 实现核查**:
 
@@ -119,10 +137,20 @@ VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS)) {
 - ✅ 在 QEMU 11.1.0 中已实现
 - ✅ 在 DPDK 中已实现
 - ✅ 用于动态配置内存插槽数量
-- ✅ 支持超过默认限制的内存区域
+- ✅ 把内存区域上限从**基线 8** 提到 QEMU 侧 **512**
+
+> ⚠️ **数字口径（2026-11-25 修正）**：本节初版及 usecases 文档写的"默认最多 **509** 个内存区域"是错的。
+> QEMU 11.1.0 实际：
+> - 未协商 CONFIGURE_MEM_SLOTS 时 `u->user->memory_slots = VHOST_MEMORY_BASELINE_NREGIONS`
+>   （`hw/virtio/vhost-user.c:2618`），而 `#define VHOST_MEMORY_BASELINE_NREGIONS 8`（`:44`）→ **默认 8**；
+> - QEMU 前端上限 `#define VHOST_USER_MAX_RAM_SLOTS 512`（`:49`），协商后取
+>   `u->user->memory_slots = MIN(ram_slots, vhost_user_max_ram_slots)`（`:2636`）；
+> - **509 是后端库 libvhost-user 自己的上限**
+>   （`subprojects/libvhost-user/libvhost-user.h:39 #define VHOST_USER_MAX_RAM_SLOTS 509`），
+>   不是协议默认值，也不是 QEMU 前端的值。三者不可互换。
 
 **实际使用场景**:
-- 大内存虚拟机（超过默认 509 个内存区域）
+- 大内存虚拟机（内存区域数超过基线 8；上限 QEMU 侧 512 / libvhost-user 侧 509）
 - 内存热插拔场景
 - 动态内存管理
 - 高密度虚拟化环境
@@ -306,7 +334,12 @@ grep -rn "VHOST_USER_PROTOCOL_F_GET_VRING_BASE_INFLIGHT\|20" lib/vhost/
 ```
 
 **✅ 事实核查结果**:
-- ✅ 在 QEMU 11.1.0 中已实现（libvhost-user 和 vhost-user-blk）
+- ✅ 在 QEMU 11.1.0 **前端**已实现（`include/hw/virtio/vhost-user.h:36` 枚举 +
+  `hw/virtio/vhost-user.c:2576` 门控；`hw/block/vhost-user-blk.c:605` 调用点）
+- ❌ **libvhost-user 未实现**（2026-11-25 修正）：`subprojects/libvhost-user/libvhost-user.h:73`
+  只有一行保留注释 `/* Feature 20 is reserved for VHOST_USER_PROTOCOL_F_GET_VRING_BASE_INFLIGHT */`，
+  枚举里没有该值，`libvhost-user.c` 里也搜不到任何处理（grep `GET_VRING_BASE_INFLIGHT`
+  在 `subprojects/libvhost-user/` 下仅命中这一行注释）
 - ⚠️ 在 DPDK 中未找到实现
 - ✅ 用于 inflight I/O 追踪
 - ✅ 支持实时迁移期间的 I/O 恢复
@@ -354,7 +387,11 @@ grep -rn "VHOST_USER_PROTOCOL_F_GPA_ADDRESSES\|21" lib/vhost/
 ```
 
 **✅ 事实核查结果**:
-- ✅ 在 QEMU 11.1.0 中已实现（libvhost-user 和文档）
+- ✅ 在 QEMU 11.1.0 **前端**已实现（`include/hw/virtio/vhost-user.h:37` 枚举 +
+  `hw/virtio/vhost-user.c:597` 使用点）
+- ❌ **libvhost-user 未实现**（2026-11-25 修正）：`libvhost-user.h:74` 同样只是保留注释
+  `/* Feature 21 is reserved for VHOST_USER_PROTOCOL_F_GPA_ADDRESSES */`，
+  枚举无该值、`libvhost-user.c` 无处理
 - ⚠️ 在 DPDK 中未找到实现
 - ✅ 用于 Guest 物理地址管理
 - ✅ 支持内存热插拔
@@ -367,29 +404,68 @@ grep -rn "VHOST_USER_PROTOCOL_F_GPA_ADDRESSES\|21" lib/vhost/
 
 ---
 
-### 特性 22: VHOST_USER_PROTOCOL_F_SHMEM_MAP
+### 特性 22: VHOST_USER_PROTOCOL_F_SHMEM
 
-**协议描述**: 共享内存映射
+**协议描述**: 共享内存映射（后端向前端请求把一段 fd 映射进/移出 guest 地址空间）
 
-**QEMU 11.1.0 实现核查**:
+> ⚠️ **名称更正（2026-11-25）**：特性名是 `VHOST_USER_PROTOCOL_F_SHMEM`，**不是** `..._F_SHMEM_MAP`。
+> `SHMEM_MAP` 是**消息**名（QEMU 侧为 `VHOST_USER_BACKEND_SHMEM_MAP`，
+> `hw/virtio/vhost-user.c:115`）。本节初版全篇用 `VHOST_USER_PROTOCOL_F_SHMEM_MAP`
+> 去 grep，自然什么都搜不到，因而误判为"仅文档定义"。
+
+**QEMU 11.1.0 实现核查**（有真实代码，非仅文档）:
 
 ```c
-// docs/interop/vhost-user.rst:1161
-#define VHOST_USER_PROTOCOL_F_SHMEM_MAP               22
+/* 来源: include/hw/virtio/vhost-user.h:38 —— 协议特性枚举 */
+    VHOST_USER_PROTOCOL_F_SHMEM = 22,
+```
+
+```c
+/* 来源: hw/virtio/vhost-user.c:3390-3399 —— 未协商则直接报 0 个 shmem 区域 */
+    VhostUserMsg msg = {
+        .hdr.request = VHOST_USER_GET_SHMEM_CONFIG,
+        .hdr.flags = VHOST_USER_VERSION,
+    };
+
+    if (!vhost_user_has_protocol_feature(dev,
+                                         VHOST_USER_PROTOCOL_F_SHMEM)) {
+        *nregions = 0;
+        return 0;
+    }
+```
+
+后端库 libvhost-user 也已实现（与 20/21 不同）：
+
+```c
+/* 来源: subprojects/libvhost-user/libvhost-user.c:1643-1662 —— vu_shmem_map()（节选） */
+bool
+vu_shmem_map(VuDev *dev, uint8_t shmid, uint64_t fd_offset,
+             uint64_t shm_offset, uint64_t len, uint64_t flags, int fd)
+{
+    VhostUserMsg vmsg = {
+        .request = VHOST_USER_BACKEND_SHMEM_MAP,
+        .size = sizeof(vmsg.payload.mmap),
+        .flags = VHOST_USER_VERSION,
+        ...
+    };
+
+    if (!vu_has_protocol_feature(dev, VHOST_USER_PROTOCOL_F_SHMEM)) {
 ```
 
 **DPDK 实现核查**:
 
 ```bash
-# 在 DPDK 中搜索
-grep -rn "VHOST_USER_PROTOCOL_F_SHMEM_MAP\|22" lib/vhost/
-# 未找到定义
+# 在 DPDK 中搜索（用正确的特性名）
+grep -rn "VHOST_USER_PROTOCOL_F_SHMEM\b" lib/vhost/
+# 未找到定义（DPDK 侧无 F_SHMEM / SHMEM_MAP）
 ```
 
 **✅ 事实核查结果**:
-- ✅ 在 QEMU 11.1.0 文档中定义
-- ⚠️ 在 DPDK 中未找到实现
-- ⚠️ 需要进一步调查实现细节
+- ✅ 在 QEMU 11.1.0 **前端已实现**（`vhost-user.h:38` + `vhost-user.c:3396`）
+- ✅ 在 QEMU 11.1.0 **后端库 libvhost-user 已实现**（`libvhost-user.c:1644` `vu_shmem_map()`、
+  门控 `:1662`；unmap 路径门控 `:1695`）
+- ⚠️ 在 DPDK 中未找到实现：`lib/vhost/rte_vhost.h` 定义的协议特性最大到
+  `VHOST_USER_PROTOCOL_F_STATUS 16`（`:116-117`），无 22；全 `lib/vhost/` 搜 "SHMEM" 0 命中
 - ✅ 用于共享内存映射
 
 **实际使用场景**:
@@ -410,9 +486,9 @@ grep -rn "VHOST_USER_PROTOCOL_F_SHMEM_MAP\|22" lib/vhost/
 | 17 | XEN_MMAP | ❌ 保留 | ❌ 未定义 | Xen 专用 | ❌ QEMU 不需要 |
 | 18 | SHARED_OBJECT | ✅ 已实现 | ⚠️ 未找到 | 共享资源管理 | ✅ 已验证 |
 | 19 | DEVICE_STATE | ✅ 已实现 | ⚠️ 未找到 | 设备状态传输 | ✅ 已验证 |
-| 20 | GET_VRING_BASE_INFLIGHT | ✅ 已实现 | ⚠️ 未找到 | Inflight 追踪 | ✅ 已验证 |
-| 21 | GPA_ADDRESSES | ✅ 已实现 | ⚠️ 未找到 | GPA 管理 | ✅ 已验证 |
-| 22 | SHMEM_MAP | ⚠️ 文档定义 | ⚠️ 未找到 | 共享内存映射 | ⚠️ 需调查 |
+| 20 | GET_VRING_BASE_INFLIGHT | ✅ QEMU 前端已实现（libvhost-user ❌ 仅保留注释） | ⚠️ 未找到 | Inflight 追踪 | ✅ 已验证 |
+| 21 | GPA_ADDRESSES | ✅ QEMU 前端已实现（libvhost-user ❌ 仅保留注释） | ⚠️ 未找到 | GPA 管理 | ✅ 已验证 |
+| 22 | **SHMEM**（消息名才是 SHMEM_MAP） | ✅ 前端 `vhost-user.h:38`+`vhost-user.c:3395` / ✅ libvhost-user `vu_shmem_map()` `:1644` | ⚠️ 未找到 | 共享内存映射 | ✅ 已验证 |
 
 ---
 

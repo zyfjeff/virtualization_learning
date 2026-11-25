@@ -1,7 +1,8 @@
-# Phase 9 勘误
+# Phase 10 勘误
 
 > 本章旧版（`README.md` / `annotations.md` / `practice/*`）在 2026-09-02 重写时发现的
-> 错误。每条给出：错在哪、正确信息、源码或实机依据。
+> 错误，以及 2026-11-26 全章复查新查出并已修正的一批（A6、C18–C24、G/H 两节）。
+> 每条给出：错在哪、正确信息、源码或实机依据。
 > 核查方法：逐条 grep `/root/code/linux-6.12.93/` + 本机 `/sys/module/*/parameters/`
 > 实读交叉验证；行号由 `../phase9-capstone/practice/mini-kvm/check-refs.py` 复核。
 
@@ -39,7 +40,7 @@
   - 默认 `KVM_DEFAULT_PLE_WINDOW_SHRINK = 0`（`arch/x86/kvm/x86.h:75`），
     本机实读 **0**。
   - `ple_gap` **从不参与** shrink 判断。唯一的 shrink 调用点是
-    `vmx_vcpu_load()`（`arch/x86/kvm/vmx/vmx.c:1519-1523`），
+    `vmx_vcpu_load()`（`arch/x86/kvm/vmx/vmx.c:1520-1522`），
     条件 `vcpu->scheduled_out && !kvm_pause_in_guest(vcpu->kvm)`。
   - 且 `shrink < 1` 时 `__shrink_ple_window()`（`x86.h:96-107`）**直接返回 base**
     而不是做除法 —— 默认值 0 的语义是"被抢占即回到全局 `ple_window`"。
@@ -62,6 +63,33 @@
   `eager_page_split`、`nx_huge_pages*`、`flush_on_reuse`、`tsc_tolerance_ppm`、
   `min_timer_period_us`、`pi_inject_timer`。
   完整对照表见 [parameters.md](parameters.md) §8。
+
+### A6 `pi_inject_timer` 的默认值写成 0（实为 `-1` = auto）
+
+- **错处**：`parameters.md` §3 表里 `pi_inject_timer` 一行写"6.12.93 默认 **0**（`bint`）"。
+- **正确**：`arch/x86/kvm/x86.c:185` `int __read_mostly pi_inject_timer = -1;`
+  （`:186` `module_param(pi_inject_timer, bint, 0644)`），初值是 **-1（auto）**；
+  auto 在模块初始化时被改写：
+
+  ```c
+  /* 来源: arch/x86/kvm/x86.c:9840-9841（Linux 6.12.93，kvm_x86_vendor_init()） */
+  	if (pi_inject_timer == -1)
+  		pi_inject_timer = housekeeping_enabled(HK_TYPE_TIMER);
+  ```
+
+  `housekeeping_enabled()` 在 `kernel/sched/isolation.c:33`，`HK_TYPE_TIMER` 在
+  `include/linux/sched/isolation.h:10`。
+- **本机实读**：`/sys/module/kvm/parameters/pi_inject_timer` = `0`（权限 644）——
+  那是**改写之后**的值（`/proc/cmdline` 无 `nohz_full=`，
+  `/sys/devices/system/cpu/nohz_full` 为空 → auto 判为关）。
+  ★ sysfs **永远读不到 `-1`**，"把实读的 0/1 当默认值"就是这类错的成因，
+  与 D9（抄本过期）同族。
+- **它管什么**：`kvm_can_post_timer_interrupt()`（`arch/x86/kvm/lapic.c:160-164`）
+  = `pi_inject_timer && kvm_vcpu_apicv_active(vcpu) && (mwait_in_guest || hlt_in_guest)`
+  —— vLAPIC 定时器能否走 posted interrupt 注入。它本身就依赖 §7 那几个
+  `KVM_X86_DISABLE_EXITS_*` 位，所以 auto 在不同 VM 配置下的实际效果并不同。
+- **处置**：`parameters.md` §3 该行改为"-1（auto）｜本机 0（解析后的值）"，
+  改写链与依赖关系写进正文。
 
 ## B. 编造的量化数据
 
@@ -107,7 +135,7 @@ phase8 M2 实测单 vCPU busy 15 s 约 3.7 万次退出、boot 窗口 q35 的
 旧 `annotations.md:377-398` 是"（简化）"的伪码，没有真实的 `try = 3`、两轮 `pass`、
 `last_boosted_vcpu` round-robin、`preempted`/`ready`/`dy_eligible` 判据。
 这些细节恰恰决定了实验为什么可能"测不到收益"，已换成真码 + 逐条含义表
-（[annotations.md](annotations.md) §1.4）。
+（[annotations.md](annotations.md) §1「`kvm_vcpu_on_spin()` 到底在挑谁」）。
 
 ### C3 halt-polling 自适应分支的比较对象错
 
@@ -187,7 +215,7 @@ debugfs `directed_yield_attempted` / `directed_yield_successful` —— **错的
 
 在没开 PV spinlock 的 guest 上（本仓实验内核正是这种状态，见 C12），
 PLE 完全正常触发而这两个计数器恒为 0 —— 用它们验收会把**成功**的实验
-判成失败。已改写为 [annotations.md](annotations.md) §1.7/§1.8，
+判成失败。已改写为 [annotations.md](annotations.md) §1「`directed_yield_attempted` 为什么不能当 PLE 的判据」/「PLE 的正确判据是什么」，
 并登记进 [measurement.md](measurement.md) §7 陷阱表。
 
 ### C12 E1 的触发前提：本仓 guest 内核里 `nopvspin` 压根不存在
@@ -198,7 +226,7 @@ PLE 完全正常触发而这两个计数器恒为 0 —— 用它们验收会把
 
 | 初稿说法 | 实际 | 依据 |
 |---|---|---|
-| 需要 `nopvspin` 才不走 PV spinlock | 本仓实验内核 `# CONFIG_PARAVIRT_SPINLOCKS is not set`（`scripts/images/kernel.config:297`），PV spinlock 整块没编译，`nopvspin` 也随 `kvm_spinlock_init()` 一起不存在（两者都在 `#if … defined(CONFIG_PARAVIRT_SPINLOCKS)` 内：`arch/x86/kernel/kvm.c:1049-1139`、`kernel/locking/qspinlock.c:569-592`）。传这个参数只会成为未知 cmdline 项 | 已核 |
+| 需要 `nopvspin` 才不走 PV spinlock | 本仓实验内核 `# CONFIG_PARAVIRT_SPINLOCKS is not set`（`scripts/images/kernel.config:322`；★ 该文件是构建产物、行号会随配置漂移，定位一律 `grep -n PARAVIRT_SPINLOCKS`），PV spinlock 整块没编译，`nopvspin` 也随 `kvm_spinlock_init()` 一起不存在（两者都在 `#if … defined(CONFIG_PARAVIRT_SPINLOCKS)` 内：`arch/x86/kernel/kvm.c:1049-1139`、`kernel/locking/qspinlock.c:569-592`）。传这个参数只会成为未知 cmdline 项 | 已核 |
 | 踢锁走 MSR 写，退出号 32 | PV 踢锁是 **hypercall**：`kvm_kick_cpu()` → `kvm_hypercall2(KVM_HC_KICK_CPU,…)`（`arch/x86/kernel/kvm.c:1052-1058`），`kvm_hypercall*` 展开成 `vmcall`（`arch/x86/include/asm/kvm_para.h:22`），退出号是 `EXIT_REASON_VMCALL` = **18**（`arch/x86/include/uapi/asm/vmx.h:47`），不是 32 | 已核 |
 
 **真实机制链**（配置关掉 PV spinlock 时为什么 PLE 照样能触发）：
@@ -279,10 +307,15 @@ E3 §4.2 条件 4 初稿写"每臂 `kvm:kvm_vcpu_wakeup` 事件数与 `halt_exit
 
 E4 初稿（`bench-clock-master.sh` 第一版）的顺序是 `boot_vm → sleep → open_win → sleep →
 close_win`，判据是"窗内 VM1 的 tid 上有 `masterclock 1`"。**这条窗里天然一条都不会有**：
-`kvm_update_master_clock` 只在六个重算入口上产生（`../annotations.md` §3.1.1 的表：
-直接重算的 `arch/x86/kvm/x86.c:12844`、`:7024`、`:9504`，与只发
-`KVM_REQ_MASTERCLOCK_UPDATE`、等 vCPU 下次进 guest 才消费的 `:2714`、`:2354-2361`、
-`:9643`（请求点在 `:9652`）），VM 跑起来之后就静止，不周期性打点。
+`kvm_update_master_clock` 只在**有重算事件**时才产生（`../annotations.md` §3.1.1 的表
+现为 **9 个入口**，见 C22：直接重算的 `arch/x86/kvm/x86.c:12844`、`:7024`、`:9504`，
+加上只发 `KVM_REQ_MASTERCLOCK_UPDATE`、等 vCPU 下次进 guest 才消费的 `:2714`
+（经 `x86.c:2538`）、`x86.c:2361`、`x86.c:9652`、`x86.c:12761`，
+以及 `arch/x86/kvm/hyperv.c:1439`、`arch/x86/kvm/xen.c:101`），
+VM 跑起来之后就静止，不周期性打点。
+（★ 本条旧版写作"只有六个入口"，那六个是漏了 `x86.c:12761`/`hyperv.c:1439`/`xen.c:101`
+之后的计数 —— 已由 C22 更正，"六个"字样在 `annotations.md` 与
+`practice/bench-clock-master.md` 里同步改掉。）
 
 后果比"读不到数"更糟：A1 会被判成"基线不成立"，而 A3 的判据是**零事件** ——
 一个注定为 0 的窗口里读到 0，P2 既没被证实也没被否证，整条实验自洽地空转。
@@ -358,6 +391,206 @@ E1–E4 每一份数据都要按 `bench-observer-cost.md` §5.4 标注档位，�
 **O1** 臂专门量这笔钱；表头同时把"宿主额外 CPU%"改成 **CPU-秒绝对量**并补
 "每百万次退出的 vCPU 线程 ns"与 overrun 两列（与 E5 §4.1 / §7 的口径一致）。
 E5 的 `apply_arm O1` + §4.2 生效自证按这个定义实现。
+
+### C18 `KVM_CAP_X86_DISABLE_EXITS` 列了两个不存在的位，`-overcommit cpu-pm=on` 的作用域又被讲小
+
+- **错处**：`parameters.md` §7 旧版代码块写
+  `KVM_X86_DISABLE_EXITS_MWAIT / HLT / PAUSE / SHUTDOWN / PLE`，正文写
+  "QEMU 侧对应 `-overcommit cpu-pm=on`（**禁 MWAIT/HLT**）……做对照实验时**优先用它**"。
+- **正确**：
+  - 6.12.93 只有**四个**位：`include/uapi/linux/kvm.h:621-624`
+    （MWAIT/HLT/PAUSE/CSTATE）+ `:625-628` 的 `KVM_X86_DISABLE_VALID_EXITS`。
+    `grep -rn "DISABLE_EXITS_SHUTDOWN\|DISABLE_EXITS_PLE" /root/code/linux-6.12.93/`
+    **零命中** —— `SHUTDOWN` 与 `PLE` 两个名字是编的；关 PLE 用的位真名是
+    **`KVM_X86_DISABLE_EXITS_PAUSE`**（`(1 << 2)`）。
+  - 越界位不是"被忽略"，是**整个 cap 调用失败**：
+    `arch/x86/kvm/x86.c:6590-6593` 先 `r = -EINVAL;`
+    再 `if (cap->args[0] & ~KVM_X86_DISABLE_VALID_EXITS) break;`。
+  - 四个位的落点（同文件）：`PAUSE → pause_in_guest` `:6595-6596`；
+    `MWAIT → mwait_in_guest` `:6606-6608`（还要 `kvm_can_mwait_in_guest()`）；
+    `HLT → hlt_in_guest` `:6609-6610`；`CSTATE → cstate_in_guest` `:6611-6612`。
+    ★ 后三位都在 `if (!mitigate_smt_rsb) {`（`:6601-6613`）里面 ——
+    `mitigate_smt_rsb` 是 `kvm` 的 bool 参数、默认 false、**0444**（`:197-198`；
+    本机实读 `N`）。开了它的宿主上这三档会**静默不生效**而 cap 仍返回 0，
+    唯独 `PAUSE` 不受影响。
+  - `-overcommit cpu-pm=on` 传的**不止 MWAIT/HLT**：`enable_cpu_pm`
+    （qemu-10.1.0-rc2 `system/vl.c:1891` 解析）→ 唯一调用点
+    `target/i386/kvm/kvm.c:3321-3322` → `kvm_vm_enable_disable_exits()`
+    把能力与 **MWAIT|HLT|PAUSE|CSTATE 四位取交集后一次全传**（同文件 `:3124-3127`，
+    下发在 `:3130`）。QEMU 11.1.0 逻辑相同（该函数在 `:3287`，调用点 `:3533`）。
+    ⇒ 它**连 PAUSE/PLE 一起关掉**，同时还关掉 HLT/MWAIT/CSTATE。
+- **为什么要登记**：旧版"对照实验优先用它"会直接毁掉 E1 的归因 ——
+  本章自己的 `practice/bench-ple.md` §2.4 早就把这条归为"省事但**混淆**：
+  只能当'这些退出合计值多少钱'的粗对照，不能单独归因给 PLE"。
+  同一个仓库里两处口径相反，且错的那处出现在"参数唯一来源"文档里，最容易被采信。
+- **处置**：`parameters.md` §7 重写（逐位表 + 编造名字的否定 + `mitigate_smt_rsb`
+  门控 + QEMU 四位的实情），并把"优先用它"改成"判 PLE 用 `ple_gap=0` 或只传
+  PAUSE 位的 per-VM cap；后者 QEMU 没有单一位的开关，本仓 minivmm 也尚未实现
+  `KVM_ENABLE_CAP`"。`annotations.md` §1「关掉 PLE 有哪两条路」同步加警告。
+
+### C19 `__shrink_ple_window()` 的"源码"块其实是 `__grow_ple_window()` 的形态
+
+- **错处**：`annotations.md` §1「`ple_window_shrink = 0` 的语义是什么」的代码块（标注"来源: `arch/x86/kvm/x86.h:96-107`"）写的是
+  `ret /= modifier; … ret -= modifier; … return max(ret, (u64)min);`。
+- **正确**：`x86.h:96-107` 的真实实现里没有 `ret` 这个局部量、也没有 `(u64)` 转换：
+
+  ```c
+  /* 来源: arch/x86/kvm/x86.h:96-107（Linux 6.12.93，逐字） */
+  static inline unsigned int __shrink_ple_window(unsigned int val,
+  		unsigned int base, unsigned int modifier, unsigned int min)
+  {
+  	if (modifier < 1)
+  		return base;
+
+  	if (modifier < base)
+  		val /= modifier;
+  	else
+  		val -= modifier;
+
+  	return max(val, min);
+  }
+  ```
+
+  `u64 ret` + `return min(ret, (u64)max)` 属于**上面那个**
+  `__grow_ple_window()`（`x86.h:80-94`）。
+- **后果**：结论没错（`modifier < 1` → 直接回 `base`），但代码示例是拼接出来的假源码 ——
+  违反本仓"代码示例必须摘自实际源码"的硬规矩，且会让人以为 shrink 有 64 位溢出保护。
+- **处置**：`annotations.md` §1「`ple_window_shrink = 0` 的语义是什么」换成逐字版，并保留一条"旧版抄错形态"的说明。
+
+### C20 PLE 那句规范的章节号：源码注释的 `25.1.3` 不是本仓规范副本的编号
+
+- **错处**：`annotations.md` §1「为什么"PLE 在 CPL > 0 时被忽略"这句规范决定了实验设计」旧标题与引文写作"**SDM 25.1.3**"，把号码当规范依据给出。
+- **正确**：本仓 `spec/intel-vmx.pdf` 里 *"The 'PAUSE-loop exiting' VM-execution control
+  is ignored if CPL > 0"* 在 **Section 26.1.3 "Instructions That Cause VM Exits
+  Conditionally"**（该句所在页页眉 `Vol. 3C 26-3`）；`Section 26.1.3` 作为交叉引用在
+  PDF 里出现 30 次，而 **`25.1.3` 出现 0 次**。
+  号码 25.1.3 的来源是 **KVM 源码注释自己**（`arch/x86/kvm/vmx/vmx.c:5916-5921`
+  "Intel sdm vol3 ch-25.1.3 says:"），是旧版 SDM 的编号。
+- **判据规则**：规范引用以 `spec/` 副本为准；源码注释里的章节号只当"源码为什么这么推理"
+  的证据，不当规范出处（`AGENTS.md`"规范为准，代码为辅"）。
+- **处置**：`annotations.md` 上述小节改为引用 26.1.3 并明写"注释是旧编号"；
+  `handle_pause()` 代码块换成**逐字**源码（旧版把注释改写成中文摘要，属于 C19 同类的
+  "假源码"）；`practice/bench-ple.md` §2.1 同步加注。
+
+### C21 PML 日志被写成"VMCS 缓冲区"，并漏掉两条决定成本的开合条件
+
+- **错处**：`annotations.md` §2.4 旧版："硬件把 GPA 追加进 **512 条目的 VMCS 缓冲区**"。
+- **正确**：日志是**另一块内存**，VMCS 里只有指向它的地址与索引。
+  规范（intel-vmx.pdf, **Section 29.3.6 Page-Modification Logging**）原话：
+  "The page-modification log is a **4-KByte region of memory** located at the physical
+  address in the PML address VM-execution control field. The page-modification log
+  consists of 512 64-bit entries; the PML index VM-execution control field indicates
+  the next entry to use."
+  源码逐条对得上：`vmx.c:4820-4823` 写 `PML_ADDRESS = page_to_phys(vmx->pml_pg)` 与
+  `GUEST_PML_INDEX = PML_ENTITY_NUM - 1`；那块内存在 `vmx.c:7536` 用 `alloc_page()`
+  取得（成员声明 `vmx.h:337`），`PML_ENTITY_NUM 512` 在 `vmx.h:336`，
+  消费端 `vmx_flush_pml_buffer()` 用 `page_address(vmx->pml_pg)` 取回（`vmx.c:6200`）。
+- **同时补两条被漏掉的机制**（都会改变"PML 的成本"归因）：
+  1. **PML 依赖 EPT 与 EPT A/D 位**：`vmx.c:8525-8526`
+     `if (!enable_ept || !enable_ept_ad_bits || !cpu_has_vmx_pml()) enable_pml = 0;`
+     （源码注释原话 *"PML depends on them to work"*，`:8521-8524`），
+     且 `:8528-8529` 随之把 `cpu_dirty_log_size` 归零 →
+     **`eptad=0` 时脏日志退回逐页写保护，PML 根本没在跑**。
+     这条与 C7/A 节里"`eptad` 与大页无关"是两件不同的事，别互相推导。
+  2. **VMCS 里的 PML 位按需开**：`vmx.c:4656-4657`（注释 `:4651-4655`）
+     `if (!enable_pml || !atomic_read(&vcpu->kvm->nr_memslots_dirty_logging)) exec_control &= ~SECONDARY_EXEC_ENABLE_PML;`
+     —— 没有 memslot 在记脏页时硬件根本不写日志，于是"每次退出都 flush"
+     （C4 讲的那个无条件调用）在常态下只剩 `vmcs_read16` + 空早退
+     （`vmx.c:6188-6192`）。
+  3. 规范还有一条常被漏：日志满时**该次访问不执行**、dirty flag 也不置
+     （"the accessed or dirty flag is not set, and the guest-physical access
+     that triggered the event does not occur"），所以 `PML_FULL` 后同一页会被重试。
+- **处置**：`annotations.md` §2.4 重写（规范引文 + 三条源码对应 + 成本条件表）。
+
+### C22 主时钟"开的那条边没有任何自动触发 / 重算入口只有六个"两处都过强
+
+- **错处**：`annotations.md` §3.2 旧版正文 + `practice/bench-clock-master.md`
+  P2/P3/§6.8 继承的绝对表述（"同一台 VM **永远不会**自己翻回 1"、
+  "只在六个重算点发出"、"时钟路径就此**永久**分叉"）。
+- **正确**：
+  - **事件层面**：clocksource **换回 tsc 这个事件本身**确实不触发任何 KVM 代码 ——
+    notifier 只在离边入队（`arch/x86/kvm/x86.c:9687-9689`
+    `if (!gtod_is_based_on_tsc(...) && atomic_read(&kvm_guest_has_master_clock) != 0)`）。
+    这句旧版讲对了，但**它不等于"不会恢复"**。
+  - **入口层面**：重算 `ka->use_master_clock` 的入口是 **9 个**，不是 6 个。
+    直接调用 `pvclock_update_vm_gtod_copy()` 的只有四处
+    （`:3086`/`:7024`/`:9504`/`:12844`），但发 `KVM_REQ_MASTERCLOCK_UPDATE`
+    （由 `kvm_update_masterclock()` `:3082-3086` 消费）的请求点有六处：
+    `x86.c:2361`（`kvm_write_system_time()`，旧 kvmclock MSR）、
+    `:2538`（`kvm_track_tsc_matching()`，由 `__kvm_synchronize_tsc()` `:2714` 调，
+    而它来自 **新建 vCPU** `kvm_arch_vcpu_postcreate()` `:12463`→`:12470`、
+    **宿主写** `MSR_IA32_TSC` `:3938`→`:3940`、
+    `kvm_arch_tsc_set_attr()` `:5757`→`:5784`）、
+    `:9652`（离边）、`:12761`（`kvm_arch_enable_virtualization_cpu()` 的
+    TSC 倒退补偿）、`hyperv.c:1439`（guest 写 `HV_X64_MSR_REFERENCE_TSC`）、
+    `xen.c:101`（`kvm_xen_shared_info_init()`）。
+    旧版漏掉的正是后三个。
+  - ★ 一个容易写反的细节：guest **自己**写 `MSR_IA32_TSC` 走
+    `else` 分支的 `adjust_tsc_offset_guest()`（`arch/x86/kvm/x86.c:3942-3943`），
+    **不**发重算请求 ——
+    发请求的是 `host_initiated` 那条（`KVM_SET_MSRS`/迁移恢复）。
+  - 因此：**关闭态可以被任何一次重算事件点亮**。"永久分叉"只在"之后再没有任何
+    重算事件"这个前提下成立。
+- **为什么要登记**：E4 的 P2 判据就是"零事件"，绝对化的措辞会让人把
+  "这一窗没翻回 1"读成"这台 VM 从此不会翻回 1"，也会让 A3 万一出现
+  `masterclock 1` 时被误判成"P2 被否证"（实际可能只是某个重算事件发生了）。
+- **处置**：`annotations.md` §3.2 的入口表扩成 9 行并改写结论（两句话分开说全）；
+  `bench-clock-master.md` P2/P3 措辞改成"静默窗内不恢复"、§6.8 改"有重算事件时才发"、
+  "六个"字样全部清掉；`corrections.md` C15 里那句"只在六个重算入口上产生"同步更正。
+
+### C23 "`kvm_mmu_set_spte` 在 6.12 已不存在"——消失的是函数，tracepoint 一直存在
+
+- **错处**：`measurement.md` §5 第 2 条旧版："另一处同类：`kvm_mmu_set_spte` 在 6.12
+  已不存在，`../scripts/trace/trace-page-fault.sh` 的注释里已写明。"
+  —— 后半句还**指反了**：那个脚本的注释写的是它**存在**。
+- **正确**：
+  - **tracepoint 存在**：`TRACE_EVENT(kvm_mmu_set_spte, …)`
+    在 `arch/x86/kvm/mmu/mmutrace.h:334-335`，`TRACE_SYSTEM kvmmmu` 在 `:9`
+    ⇒ 事件名是 **`kvmmmu:kvm_mmu_set_spte`**，不在 `kvm` 组下；
+    发出点 `mmu/tdp_mmu.c:1059`（TDP MMU）与 `mmu/mmu.c:2949`（shadow）；
+    `__field(u8, level)` 在 `mmutrace.h:343` —— **页级别只能靠它**
+    （`kvm:kvm_page_fault` 没有 level 字段，见 D2）。
+  - **宿主实测**：`/sys/kernel/debug/tracing/events/kvmmmu/kvm_mmu_set_spte/` 存在。
+  - **函数确实没有**：全树没有名为 `kvm_mmu_set_spte` 的函数定义（只有
+    `trace_kvm_mmu_set_spte()` 调用点），所以它挂不上 function tracer ——
+    这才是 §5 第 2 条想举的例子。
+- **判据规则**：**"事件"与"函数"是两张表**，一条"X 不存在"必须写清是哪一张。
+  与 D14 错误 1、C20 同族（只在 `events/kvm/` 下找过就下"不存在"的结论）。
+- **处置**：`measurement.md` §5 第 2 条改写为"函数没有 / tracepoint 有且属 `kvmmmu`"，
+  并把出处指对（`trace-page-fault.sh:126-133`）。
+
+### C24 E2 的尺子有两处会量错：`kvm_mmu_do_page_fault()` 定位张冠李戴、
+`mark_page_dirty_in_slot` 命中被当成"日志开着"的硬判据
+
+- **错处 1**：`practice/bench-huge-dirty.md` §2.3 表格把
+  `arch/x86/kvm/mmu/mmu.c:4655` 这个 trace 发出点挂在 `kvm_mmu_do_page_fault()` 名下。
+- **正确 1**：`mmu.c:4655` 在 **`kvm_handle_page_fault()`**（函数 `:4628`）里；
+  `kvm_mmu_do_page_fault()` 是 **`static inline`**，定义在
+  `arch/x86/kvm/mmu/mmu_internal.h:293`，它只组装 `struct kvm_page_fault`、
+  **不**发这条 tracepoint（三个发出点是 `vmx.c:5799`、`mmu.c:4655`、`svm.c:2139`）。
+  内联函数同样挂不上 function tracer，与 §4.2 的教训一致。
+- **错处 2**：同一文档 §4 表把"`mark_page_dirty_in_slot` 的命中"写成
+  "脏页日志是否真开着的**唯一硬判据**，命中即证明 `kvm_slot_dirty_track_enabled()` 为真"。
+- **正确 2**：**命中不等于开着**。`kvm_slot_dirty_track_enabled()` 的判断在函数**内部**
+  （`virt/kvm/kvm_main.c:3604` 入口、`:3617` 才是 `if`），而调用方不预筛：
+  steal-time 两条路是**无条件**调用它的 —— `record_steal_time()`
+  （`arch/x86/kvm/x86.c:3668`，末尾 `dirty:` 标签 `:3763`）与
+  `kvm_steal_time_set_preempted()`（`:5044` 起，`:5088` 调用；由
+  `kvm_arch_vcpu_put()` `:5091`→`:5106` 触发）。而 `KVM_REQ_STEAL_UPDATE`
+  在**每次** `kvm_arch_vcpu_load()` 里无条件置位（`:5041`），消费在
+  `vcpu_enter_guest()`（`:10867-10868`）；唯一前置条件是 guest 启用了 steal time
+  （`:3682-3683`，Linux guest 默认开）。⇒ **脏日志全关的臂同样一堆命中**，
+  这是系统性假阳。
+- **替代判据**：脏日志开没开 → 数 `kvm_mmu_slot_remove_write_access`
+  （只在 `kvm_mmu_slot_apply_flags()` 的**开日志分支**里被调：分支 `x86.c:13242` 起，
+  manual-protect 模式在 `:13247-13248` 直接 `return`，两个调用点
+  `:13255`（PML 路径，`PG_LEVEL_2M`）/`:13257`（无 PML，`PG_LEVEL_4K`））；
+  拆没拆大页 → 数 `kvm_mmu_slot_try_split_huge_pages`（`:13251`，
+  前提 `eager_page_split=1`）；"记了多少页"仍可用汇聚点，但要
+  **减去 steal-time 基线**（真记账只在 `:3621-3624` 的两条分支里）。
+- **处置**：§2.3 表格重写（三个发出点 + 函数名 + 内联警告 + AMD 位语义提醒），
+  §4 表的该行换成 `kvm_mmu_slot_remove_write_access` 并附勘误块，
+  §4.1 的"汇聚点"段把"命中即记账"降级为"记账尝试的上界"。
 
 ---
 
@@ -487,8 +720,9 @@ shell helper 一律不带括号）。
 - **错处**：E5 初稿 §4.1 的"宿主总 CPU"一行写成
   `busy = total − idle − iowait`，等价于把第 10/11 列 `guest`/`guest_nice` 也加进 busy。
 - **正确**：guest 时间**已经折进 user/nice**。`account_guest_time()`
-  （`kernel/sched/cputime.c:143-159`）在 `:150` 把这段 cputime 加到 `p->utime`，
-  又同时记两处 cpustat：`:154-158` 走 `task_group_account_field(CPUTIME_USER/NICE)`
+  （`kernel/sched/cputime.c:143-159`）在 `:148` 把这段 cputime 加到 `p->utime`
+  （`:150` 是 `p->gtime`），又同时记两处 cpustat：`:153-158` 走
+  `task_group_account_field(CPUTIME_USER/NICE)`
   **和** `cpustat[CPUTIME_GUEST*/GUEST_NICE]`。tick 路径
   `irqtime_account_process_tick()`（`:406`）与 VTIME 路径 `vtime_account_guest()`
   （`:690`）都调它，两种配置下结论一致。`/proc/stat` 首行的字段顺序是
@@ -878,3 +1112,58 @@ ex6 三处；`trace-page-fault.sh` 抽出 `count_re()` 辅助函数统一兜底�
 | `index.md:151` | "phase9 重写后识别出的真实缺口" | phase10（本章自指） |
 | `index.md:155` | "phase8 已定性说明…并把超卖实验推给 phase9" | phase9（capstone）已定性说明…推给 phase10（本章） |
 | `index.md:156` | "phase8 说'本规模无独立可测收益'" | phase9（capstone） |
+| `measurement.md:10-19` | §0 分工表把两列写成"phase10（调试与测试）／本文（phase9）"，末尾还写"要抄命令去 phase10" | 本文就是 `phase10-performance/measurement.md`；命令语法的权威章是 **phase11-debugging**（与本文页眉一致）。标题同步改成"与 phase11 的分工" |
+| `corrections.md:1` | 本文标题 "Phase 9 勘误" | Phase 10（G 节当年只改了 `README.md`/`annotations.md` 两处标题，漏了这份勘误自己） |
+| `../../scripts/trace/trace-page-fault.sh:123` | 规则唯一来源写成 `../../phase9-performance/measurement.md` | 该目录不存在 → `../../phase10-performance/measurement.md` |
+| `../../examples/bpf-programs/run-trace-vmexit.sh:35`、`:465`、`../phase5-interrupts/practice/ex2-irte-observe.sh:53`、`ex5-on-sn-observe.sh:97`、`ex6-vcpu-migration.sh:36` | 五处 `phase9-performance/...` 陈旧指针 | 全部改成 `phase10-performance/...`（判据分别是本文 `measurement.md` §5 第 3 条、`parameters.md` §1、`corrections.md` D11/D13） |
+
+---
+
+## H. 2026-11-26 全章事实核查：行号与措辞漂移（已改）
+
+本轮按 `AGENTS.md` 对 phase10 全章重做一遍源码/规范/宿主三方核对。
+**绝大多数条目复核一致**（参数表默认值与权限逐条双证、PLE 与定向让出走读、
+PML flush 位置、主时钟四条件、100 ms 限流、`tracefs` 三个 `O_TRUNC` 文件、
+`perf kvm stat` 的 `-a` 判据、宿主环境项与 91 个 `kvm:*` 事件目录、
+`practice/bench-observer-cost.md` 整条 trace 机制链），
+下面是查出并已改的偏差。除 C18–C24 六条机制/判据级错误外，其余是行号与措辞：
+
+| 位置（改前） | 错在 | 判据（改后） |
+|---|---|---|
+| `annotations.md` §6 调用链 | `handle_pause()  vmx.c:5907` | 函数在 `vmx.c:5911`（同文件 §1.1 一直写对，两处自相矛盾） |
+| `annotations.md`、`parameters.md`、`bench-ple.md`、`bench-ple.sh`、本节 A3 | `vmx_vcpu_load()` `vmx.c:1519-1523` | 定义 `:1520`，回落 `if` 在 `:1521-1522` → 一律改 `:1520-1522` |
+| `annotations.md` | `vmx_vm_init()` `vmx.c:7638` / `7638-7641` | 定义 `:7637`，赋值 `:7639-7640` |
+| `bench-clock-master.md` §2.1 | `clocksource_watchdog()`"`:424` 起" | 定义 `kernel/time/clocksource.c:422` |
+| `bench-observer-cost.md` §4.1 与本文 D8 | "`account_guest_time()` 在 `:150` 加进 `p->utime`"、"`:154-158`" | `kernel/sched/cputime.c:148` 才是 `p->utime += cputime`（`kernel/sched/cputime.c:150` 是 `p->gtime`）；双记账在 `kernel/sched/cputime.c:153-158` |
+| `bench-ple.md` §2.1 与本文 C12 | `scripts/images/kernel.config:297` | 该行现在是 `:322`；★ 这是**构建产物**，行号随配置漂移，两处都补成"一律 `grep -n PARAVIRT_SPINLOCKS` 定位" |
+| `bench-ple.md` §2.4 | "KVM 分别置四个 `*_in_guest`（`x86.c:6595-6600,6606-6610`）" | 逐位 `:6595-6596`/`:6606-6608`/`:6609-6610`/`:6611-6612`，后三位同在 `:6601-6613` 的 `mitigate_smt_rsb` 块内（详见 C18） |
+| `bench-huge-dirty.md` §2.3 | `kvm_mmu_do_page_fault() → mmu.c:4655` | 见 C24：行号是 trace 发出点、函数名错 |
+
+### 另：一处**核查方法**上的自我纠正（登记以防重犯）
+
+本轮初稿曾把 `bench-huge-dirty.md` 的 `vmx.c:5799` 报成"`handle_ept_violation()`
+行号漂了 17 行（实为 `:5782`）"。**这是我看错了表格的列名**：那一列写的是
+"**调用点**"，而 `:5799` 正是 `trace_kvm_page_fault()` 的发出行，函数体内
+（函数起 `:5782`）—— 引用完全正确，不该改。同一条表格里的 `mmu.c:4655`
+也是同一性质（发出点没错），错的只是**挂在它名下的函数名**（见 C24）。
+
+教训：核对 `file:line` 时先确认这一行**承担的是哪个断言**（定义行？调用点？
+某条语句？），否则会把正确引用"修坏"。本章现在用
+`../phase9-capstone/practice/mini-kvm/check-refs.py --kernel --quiet --fn-strict`
+对全章 md 跑一遍（本轮结果：**788 条引用，0 条越界、0 条函数名与行号不符**），
+再用人工读原文确认语义 —— 两道都要过。
+
+★ 把 `.sh` 一起扫时会出 6 条 `!!`，全在
+`practice/bench-observer-cost.sh`（`:410`/`:416`/`:422`/`:430`/`:431`/`:776`），
+**不是内核引用错**，而是本仓那条书写约定被踩了：`foo()` 这种带空括号的形式
+**只留给内核函数**，shell helper 必须不带括号写（见 D6 末尾）。
+`cons_rt` / `snap_all` / `tick_loop` / `start_sampler` / `stop_sampler` / `_abspath`
+六个是脚本自己的函数。本轮**没有**替该脚本改名（避免与正在改它的人冲突），
+只登记；下轮谁碰这个脚本顺手去掉括号即可。
+
+### 待核实（本轮没能定论，未写进正文结论）
+
+| 项 | 现状 | 缺什么 |
+|---|---|---|
+| `halt_poll_ns_shrink` 本机实读 0 | 6.8.0-51 宿主的 `/proc/cmdline` 无相关项，脚本 `trap` 恢复也可能曾生效 | 拿不到 6.8 源码树，无法区分"6.8 默认就是 0"与"曾被运行期改写"。`parameters.md` §1 保留原文的"无法区分"表述，未升格为结论 |
+| `pi_inject_timer` auto 在别的宿主上的取值 | 本机 `nohz_full` 为空 → 解析为 0 | 换带 `nohz_full=`/`isolcpus=` 的宿主必须重读，别抄本机的 0 |

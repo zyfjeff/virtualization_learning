@@ -61,7 +61,7 @@ static int iommu_get_def_domain_type(struct iommu_group *group,
 ```
 
 一个 group 里所有设备的域类型**必须一致**，不一致时内核打错误日志并优先取 IDENTITY。
-这条性质把 [Q2](group.md) 里 group 与 phase6 的接缝缝死了：**ACS 配置通过改变 group 的
+这条性质把 [Q2](group.md) 里 group 与 phase7 的接缝缝死了：**ACS 配置通过改变 group 的
 成员，间接改变了域的形状**（D.7 展开）。
 
 `iommu_get_default_domain_type()`（`drivers/iommu/iommu.c:1726`）里还有两个硬覆盖，
@@ -274,7 +274,7 @@ cookie。这就是"域的形状"和"group 的边界"真正耦合的地方。
 | lazy/strict | `dmesg \| grep "TLB invalidation policy"` | 只在非 passthrough 时打印 |
 | 每 group 的域类型 | `cat /sys/kernel/iommu_groups/N/type` | 读的是 `group->default_domain->type`；**0644 可写**，走 `iommu_group_store_type()` |
 | group 成员 | `ls /sys/kernel/iommu_groups/N/devices/` | 见 phase7 §1.4 的实测方法 |
-| 保留区 | `cat /sys/kernel/iommu_groups/N/reserved_regions` | `iommu_group_show_resv_regions`（`drivers/iommu/iommu.c:922`）；与 [Q4](iova.md) 的窗口偏移对得上 |
+| 保留区 | `cat /sys/kernel/iommu_groups/N/reserved_regions` | 函数 `iommu_group_show_resv_regions()` 在 `drivers/iommu/iommu.c:868`（`:922` 是把它挂进 sysfs 的 `IOMMU_GROUP_ATTR(reserved_regions, 0444, …)`，**只读**）；与 [Q4](iova.md) 的窗口偏移对得上 |
 | 是否真的走了 IOMMU | 设备 `dma_map` 后读 `iommu_groups/*/devices` + `type`，或直接看失效计数 | sysfs 不反映 VFIO 接管，见 [phase7 corrections](../phase7-vfio/corrections.md) |
 
 **两套字符串不要混用**：dmesg 走 `iommu_domain_type_str()` 印 `Passthrough` / `Translated`，
@@ -300,10 +300,10 @@ sysfs 的 `type` 走 `iommu_group_show_type()`（`drivers/iommu/iommu.c:890-917`
 ## D.7 推论：ACS 决定了域的形状
 
 把 [Q2](group.md) 的接缝、D.1 的决策链、D.4 的硬件语义串起来，就能把
-[phase6](../phase7-vfio/README.md) 里那套看起来"只是安全配置"的 ACS 讲清楚：
+[phase7](../phase7-vfio/README.md) 里那套看起来"只是安全配置"的 ACS 讲清楚：
 
 ```
-ACS 能力位/拓扑  ──(phase6 §1.4/§1.5)──▶  group 成员集合
+ACS 能力位/拓扑  ──(phase7 §1.4/§1.5)──▶  group 成员集合
                                               │
                           iommu_get_default_domain_type() 遍历成员投票
                                               │
@@ -320,7 +320,7 @@ ACS 能力位/拓扑  ──(phase6 §1.4/§1.5)──▶  group 成员集合
 CX8 的 Data Direct Interface 归进同一个 group，于是它们共享同一个默认域，于是一台设备的
 DMA 可以合法地命中另一台设备的 BAR。中间没有任何"内核为 P2P 开了后门"。
 
-这条推论也是本阶段与第七阶段最好的收口：**phase6 讲的是"边界怎么画"，phase3 讲的是
+这条推论也是本阶段与第七阶段最好的收口：**phase7 讲的是"边界怎么画"，phase3 讲的是
 "边界里面装什么"**。
 
 ---

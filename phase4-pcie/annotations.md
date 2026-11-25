@@ -46,18 +46,37 @@ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
     used_buses = pci_iov_bus_range(bus);
     max += used_buses;
 
-    /* 扫描 Bridge 的下游总线 */
+    /* 第一遍：扫描固件已配置好的 bridge，不动它们（probe.c:3008-3018） */
     for_each_pci_bridge(dev, bus) {
         cmax = max;
-        /* 递归扫描下游总线 */
-        cmax = pci_scan_child_bus_extend(dev->subordinate,
-                                         available_buses - used_buses);
-        max = max(cmax, max);
+        max = pci_scan_bridge_extend(bus, dev, max, 0, 0);
+        used_buses++;                       /* 每个 bridge 先占 1 个 bus 号 */
+    }
+
+    /* 第二遍：重配需要重配的 bridge，把剩余 available_buses 分给
+     * hotplug bridge 留余量（probe.c:3021-3046，节选） */
+    for_each_pci_bridge(dev, bus) {
+        unsigned int buses = 0;
+
+        if (!hotplug_bridges && normal_bridges == 1)
+            buses = available_buses;       /* 唯一 bridge 拿走全部余量 */
+        else if (dev->is_hotplug_bridge) {
+            buses = available_buses / hotplug_bridges;
+            buses = min(buses, available_buses - used_buses + 1);
+        }
+
+        cmax = max;
+        max = pci_scan_bridge_extend(bus, dev, cmax, buses, 1);
     }
 
     return max;
 }
 ```
+
+递归发生在 `pci_scan_bridge_extend()` 内部（它对子总线调用
+`pci_scan_child_bus_extend()`，probe.c:1444），**不是**在 bridge 循环里直接递归；
+旧版代码块写成 `pci_scan_child_bus_extend(dev->subordinate, available_buses -
+used_buses)` 与真实调用结构不符。
 
 **扫描过程**：
 1. 遍历 Device 0-31（每个 Device 最多 8 个 Function）
@@ -173,25 +192,33 @@ Bus 01: Switch Upstream Port
 **文件**: `drivers/pci/pci.c:3583` — `pci_acs_flags_enabled()`
 
 ```c
-/* 来源: drivers/pci/pci.c:3583 */
-static bool pci_acs_flags_enabled(struct pci_dev *pdev, u32 acs_flags)
+/* 来源: drivers/pci/pci.c:3583-3602（实际源码） */
+static bool pci_acs_flags_enabled(struct pci_dev *pdev, u16 acs_flags)
 {
-    int pos;
-    u16 acs_ctrl;
+	int pos;
+	u16 cap, ctrl;
 
-    /* 使用缓存的 ACS Capability 位置 */
-    pos = pdev->acs_cap;
-    if (!pos)
-        return false;  /* 不支持 ACS */
+	pos = pdev->acs_cap;
+	if (!pos)
+		return false;
 
-    /* 读取 ACS Control 寄存器 */
-    pci_read_config_word(pdev, pos + PCI_ACS_CTRL, &acs_ctrl);
+	/*
+	 * Except for egress control, capabilities are either required
+	 * or only required if controllable.  Features missing from the
+	 * capability field can therefore be assumed as hard-wired enabled.
+	 */
+	pci_read_config_word(pdev, pos + PCI_ACS_CAP, &cap);
+	acs_flags &= (cap | PCI_ACS_EC);          /* ★ 没声明的能力被从要求集中
+	                                           *   掩掉 = 视为已启用 */
 
-    /* 检查请求的 ACS 标志是否启用 */
-    acs_flags &= PCI_ACS_FLAGS_MASK;
-    return (acs_ctrl & acs_flags) == acs_flags;
+	pci_read_config_word(pdev, pos + PCI_ACS_CTRL, &ctrl);
+	return (ctrl & acs_flags) == acs_flags;   /* 声明了但没开的才算失败 */
 }
 ```
+
+（此前版本写的 `acs_flags &= PCI_ACS_FLAGS_MASK` 是伪代码——内核中不存在
+`PCI_ACS_FLAGS_MASK` 这个宏；真实判据是 `acs_flags &= (cap | PCI_ACS_EC)`，
+形参是 `u16` 而非 `u32`。见 corrections.md。）
 
 **ACS 标志含义**：
 ```c
@@ -210,48 +237,57 @@ static bool pci_acs_flags_enabled(struct pci_dev *pdev, u32 acs_flags)
 **文件**: `drivers/pci/pci.c:3620` — `pci_acs_enabled()`
 
 ```c
-/* 来源: drivers/pci/pci.c:3620 */
-bool pci_acs_enabled(struct pci_dev *pdev, u32 acs_flags)
+/* 来源: drivers/pci/pci.c:3620-3681（实际源码，注释有删节） */
+bool pci_acs_enabled(struct pci_dev *pdev, u16 acs_flags)
 {
-    int ret;
+	int ret;
 
-    /* 检查 PCIe 设备 */
-    if (!pci_is_pcie(pdev))
-        return false;
+	/* ★ 第一层：quirk 命中即定论，后面的类型判断根本不执行 */
+	ret = pci_dev_specific_acs_enabled(pdev, acs_flags);
+	if (ret >= 0)
+		return ret > 0;
 
-    /* 检查设备特定的 ACS quirk */
-    ret = pci_dev_specific_acs_enabled(pdev, acs_flags);
-    if (ret >= 0)
-        return ret > 0;  /* 有 quirk，直接使用 quirk 结果 */
+	/* 传统 PCI / PCI-X：共享总线，永不隔离 */
+	if (!pci_is_pcie(pdev))
+		return false;
 
-    /* 检查 Root Complex Integrated Endpoint */
-    if (pci_pcie_type(pdev) == PCI_EXP_TYPE_RC_END)
-        return true;  /* RC 集成端点，总是隔离的 */
+	switch (pci_pcie_type(pdev)) {
+	case PCI_EXP_TYPE_PCIE_BRIDGE:
+	case PCI_EXP_TYPE_PCI_BRIDGE:
+	case PCI_EXP_TYPE_RC_EC:
+		return false;          /* ★ 这两类 bridge 与 RCEC 直接判 false
+	                                *   （规范 6.12.1 排除它们的 ACS） */
+	case PCI_EXP_TYPE_DOWNSTREAM:
+	case PCI_EXP_TYPE_ROOT_PORT:
+		return pci_acs_flags_enabled(pdev, acs_flags);
+	case PCI_EXP_TYPE_ENDPOINT:
+	case PCI_EXP_TYPE_UPSTREAM:
+	case PCI_EXP_TYPE_LEG_END:
+	case PCI_EXP_TYPE_RC_END:
+		if (!pdev->multifunction)
+			break;         /* ★ 单功能端点落到末尾 return true：
+	                                *   "effective ACS"——没有 P2P 短路机会，
+	                                *   无需 ACS 能力即视为隔离 */
+		return pci_acs_flags_enabled(pdev, acs_flags); /* 多功能才看寄存器 */
+	}
 
-    /* 检查 PCIe 类型 */
-    switch (pci_pcie_type(pdev)) {
-    case PCI_EXP_TYPE_ENDPOINT:
-    case PCI_EXP_TYPE_UPSTREAM:
-    case PCI_EXP_TYPE_LEG_END:
-        return false;  /* Endpoint 不提供隔离 */
-    
-    case PCI_EXP_TYPE_PCI_BRIDGE:
-    case PCI_EXP_TYPE_PCIE_BRIDGE:
-    case PCI_EXP_TYPE_DOWNSTREAM:
-    case PCI_EXP_TYPE_ROOT_PORT:
-        /* Bridge 需要提供隔离 */
-        return pci_acs_flags_enabled(pdev, acs_flags);
-    }
-
-    return false;
+	return true;
 }
 ```
 
-**关键逻辑**：
-1. 先检查设备特定的 quirk（某些设备有特殊处理）
-2. RC 集成端点（如集成显卡）总是隔离的
-3. Endpoint 不提供隔离（它们是被隔离的对象）
-4. Bridge（Downstream Port / Root Port）需要提供隔离
+**关键逻辑**（按真实源码）：
+1. **quirk 优先**：`pci_dev_specific_acs_enabled()` 先跑，命中直接定论
+   （Intel 平台的 RCiEP 判隔离靠的是 quirks.c 的 `pci_quirk_rciep_acs`，
+   不是本函数里的类型分支；AGENTS.md #11）
+2. 传统 PCI/PCI-X → false
+3. `PCI_BRIDGE`/`PCIE_BRIDGE`/`RC_EC` → **false**（内核注释：按非 PCIe 设备
+   保守处理；注意这两个宏名与含义正好相反，AGENTS.md #10）
+4. Downstream/Root Port → 查寄存器（`pci_acs_flags_enabled`）
+5. Endpoint/Upstream/LegEnd/RCiEP：**单功能 → true**（effective ACS，函数头
+   注释解释这正是调用方可以忽略拓扑细节的原因）；多功能 → 查寄存器
+6. 名字里带 `RC_END` 的分支不再"总是 true"——旧版代码块虚构了该分支，
+   且把 quirk 排在 `pci_is_pcie` 之后、把两个 bridge 类型归入"查寄存器"，
+   均与源码不符（见 corrections.md）
 
 ### Q: IOMMU group 如何由 ACS 决定？
 

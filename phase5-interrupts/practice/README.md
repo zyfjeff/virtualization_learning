@@ -17,7 +17,7 @@
 | ex3 | 零 VM-Exit（SDM 30.6） | Posted 通知向量不产生 kvm_exit | trace 计数对照（向量匹配 vs 不匹配） |
 | ex4 | Posted vs Remapped 开销 | Posted exit 数/延迟低于 Remapped | A/B 对照（数字 → phase10 分级） |
 | ex5 | SN 位抑制（vCPU 抢占） | vCPU 阻塞时 SN=1，通知被抑制 | pi_desc SN 位对照 vCPU 状态 |
-| ex6 | 迁移 IRTE 更新 | vCPU 迁移后 Dest_ID/NDST 更新 | 迁移前后 IRTE/pi_desc 对照 |
+| ex6 | 迁移只改 PI desc | vCPU 迁移后 NDST 更新、**IRTE 不变**（Posted IRTE 无 destination） | 迁移前后 IRTE/pi_desc 对照 |
 
 **链式衔接**：ex1 环境 → ex2 IRTE 格式 → ex3 零 VM-Exit → ex4 开销 → ex5 SN 抑制 → ex6 迁移维护。
 

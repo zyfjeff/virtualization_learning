@@ -147,7 +147,7 @@ if (executable)
 (1ULL << 52) - 1              // 0x000FFFFFFFFFFFFF（低 52 位全 1）
 ~(u64)(PAGE_SIZE-1)           // 0xFFFFFFFFFFFFF000（清除低 12 位）
 // 结果：0x000FFFFFFFFFFFFF & 0xFFFFFFFFFFFFF000
-//     = 0x000FFFFFFFFFFFFF000
+//     = 0x000FFFFFFFFFFFF000
 //     = bits 51:12
 ```
 
@@ -276,19 +276,37 @@ u64 construct_eptp(struct kvm_vcpu *vcpu, hpa_t root_hpa, int root_level)
 }
 ```
 
-**EPTP 格式**（bits 7:3 = Page Walk Length）：
+**EPTP 格式**（SDM Vol 3C §25.6.11 Table 25-9；**PWL 在 bits 5:3，不是 bits 7:3**）：
 
 ```
-63    52 51    12 11 8 7   5 4 3 2 0
-┌──────┬────────┬─────┬───┬─┴─┬─┴─┐
-│ Host │ Root   │ 保留 │PWL│ AD │MT │
-│ GPA  │ HPAddr │     │   │   │   │
-└──────┴────────┴─────┴───┴───┴───┘
+ 63        N-1      12   11   8   7      6       5   3   2   0
+ ┌──────────────────┬─────────┬─────────┬───────┬───────┬───────┐
+ │      Reserved    │ 根表物理 │Reserved │  SSE  │  A/D  │  MT   │
+ │                  │  地址    │         │       │       │       │
+ └──────────────────┴─────────┴─────────┴───────┴───────┴───────┘
 
-PWL (Page Walk Length):
-  0x18 (3) = 4 级页表
-  0x20 (4) = 5 级页表
+MT  (bits 2:0)  EPT paging-structure 内存类型：0 = UC、6 = WB，其余保留
+PWL (bits 5:3)  = 页表级数减 1  → 4 级填 3（0x18）、5 级填 4（0x20）；0/1/2 保留
+AD  (bit 6)     启用 EPT accessed/dirty 标志
+SSE (bit 7)     supervisor shadow-stack 访问权限强制
+根表地址         bits N-1:12，N = 物理地址宽度（CPUID 8000_0008H:EBX[7:0]）
 ```
+
+**源码引用**（`arch/x86/include/asm/vmx.h:526-531`）：
+
+```c
+/* 来源: arch/x86/include/asm/vmx.h:526-531 */
+#define VMX_EPTP_PWL_MASK			0x38ull	/* bits 5:3 */
+#define VMX_EPTP_PWL_4				0x18ull	/* 字段值 3 → 4 级 */
+#define VMX_EPTP_PWL_5				0x20ull	/* 字段值 4 → 5 级 */
+#define VMX_EPTP_AD_ENABLE_BIT			(1ull << 6)
+/* The EPTP memtype is encoded in bits 2:0, i.e. doesn't need to be shifted. */
+#define VMX_EPTP_MT_MASK			0x7ull
+```
+
+`construct_eptp()`（`vmx.c:3411-3423`）里 `eptp |= root_hpa;` 就是把根表物理地址直接
+或进 bits N-1:12。内存类型在**最低三位**（`VMX_EPTP_MT_WB = X86_MEMTYPE_WB = 6`，
+`msr-index.h:50`），不在高位。
 
 **实际影响**：
 
@@ -314,8 +332,8 @@ PWL (Page Walk Length):
 | 9 | `DEFAULT_SPTE_HOST_WRITABLE` = `BIT_ULL(9)` | 宿主认为可写（非 EPT） |
 | 10 | `DEFAULT_SPTE_MMU_WRITABLE` = `BIT_ULL(10)` | KVM MMU 认为可写（非 EPT） |
 | 11 | `SPTE_MMU_PRESENT_MASK` = `BIT_ULL(11)` | KVM 认为"存在"（区分 MMIO SPTE） |
-| 52:53 | `SPTE_TDP_AD_MASK` = `(3ULL << 52)` | EPT A/D 位跟踪类型 |
-| 54:55 | `SHADOW_ACC_TRACK_SAVED_MASK` | 访问跟踪时保存的原始 R/X 位 |
+| 53:52 | `SPTE_TDP_AD_MASK` = `(3ULL << 52)` | EPT A/D 位跟踪类型 |
+| 55:54 | `SHADOW_ACC_TRACK_SAVED_MASK` = `(R\|X) << 54` | 访问跟踪时保存的原始 R/X 位 |
 | 57 | `EPT_SPTE_HOST_WRITABLE` = `BIT_ULL(57)` | 宿主认为可写（EPT 模式） |
 | 58 | `EPT_SPTE_MMU_WRITABLE` = `BIT_ULL(58)` | KVM MMU 认为可写（EPT 模式） |
 
@@ -348,61 +366,84 @@ EPT 也支持 A/D 位（如果硬件支持），但 KVM 有时需要控制是否
 **三种模式**：
 
 ```c
-// arch/x86/kvm/mmu/spte.h:33-36
-#define SPTE_TDP_AD_ENABLED       (0ULL << 52)   // 默认：A/D 启用
-#define SPTE_TDP_AD_DISABLED      (1ULL << 52)   // A/D 禁用
-#define SPTE_TDP_AD_WRPROT_ONLY   (2ULL << 52)   // 仅写保护
+/* 来源: arch/x86/kvm/mmu/spte.h:32-37 */
+#define SPTE_TDP_AD_SHIFT		52
+#define SPTE_TDP_AD_MASK		(3ULL << SPTE_TDP_AD_SHIFT)
+#define SPTE_TDP_AD_ENABLED		(0ULL << SPTE_TDP_AD_SHIFT)
+#define SPTE_TDP_AD_DISABLED		(1ULL << SPTE_TDP_AD_SHIFT)
+#define SPTE_TDP_AD_WRPROT_ONLY		(2ULL << SPTE_TDP_AD_SHIFT)
+static_assert(SPTE_TDP_AD_ENABLED == 0);
 ```
 
-| 模式 | 值 | 含义 | 使用场景 |
+| 模式 | 值（bits 53:52） | 含义 | **真实的**触发条件 |
 |------|----|------|---------|
-| **AD_ENABLED** | 0 | 硬件自动维护 A/D 位 | 默认模式，性能最好 |
-| **AD_DISABLED** | 1 | 硬件不维护 A/D 位 | 老硬件不支持，或嵌套虚拟化 L2 使用 PML |
-| **AD_WRPROT_ONLY** | 2 | 只跟踪脏页（D 位） | 写保护模式，用于内存快照、迁移优化 |
+| **AD_ENABLED** | 0 | 硬件自动维护 A/D 位 | 默认，`!sp->role.ad_disabled && !kvm_mmu_page_ad_need_write_protect(sp)` |
+| **AD_DISABLED** | 1 | 这条 SPTE 所在的影子页不用硬件 A/D | `sp->role.ad_disabled` ← `!kvm_ad_enabled()`（`mmu.c:5494`）← `kvm_ad_enabled()` 即 `shadow_accessed_mask == 0`（`spte.h:294-297`）← CPU 无 EPT A/D 能力或 `kvm_intel.eptad=0` 或 EPT 整体关闭（`vmx.c:105-106` 模块参数、`:8446-8447`） |
+| **AD_WRPROT_ONLY** | 2 | 硬件 A/D 仍在，但**脏页跟踪改用写保护** | `kvm_mmu_page_ad_need_write_protect(sp)` = `kvm_x86_ops.cpu_dirty_log_size && sp->role.guest_mode`（`mmu_internal.h:148-159`），即 **CPU 有 PML（`cpu_dirty_log_size = PML_ENTITY_NUM = 512`，`vmx/main.c:130`、`vmx.h:336`）+ 这张影子页属于 L2（嵌套）**。注意判据里**不看** memslot 是否真的在记录脏页——它是 per-shadow-page 的角色属性 |
 
 **为什么 AD_ENABLED = 0？**
 
-性能优化！默认路径不需要设置额外位：
+`spte.h:26-27` 的注释给了硬性理由（不是"性能优化"那么轻）：PAE 分页（32 位 KVM 的
+NPT/PAE EPT）里 **bits 62:52 是保留位**，所以"启用"这一档必须编码成 0，否则给 PAE
+用的 SPTE 会踩保留位。性能上的附带好处才是默认路径不用额外置位。
 
-```c
-// 创建 SPTE 时
-if (ad_mode == SPTE_TDP_AD_ENABLED) {
-    // 不需要设置 bit 52-53，默认就是 0
-    // 硬件自动维护 A/D 位
-    spte |= PT_ACCESSED_MASK;  // 只设置 A 位
-} else {
-    // 需要设置 bit 52-53 来标记模式
-    spte |= ad_mode;
-}
-```
+真正读回这三档的地方是 `spte.h:304-325`（`spte_ad_enabled()` 304-308、`spte_ad_need_write_protect()` 310-319）：
+`spte_ad_enabled()` 判 `!= AD_DISABLED`，`spte_ad_need_write_protect()` 判 `!= AD_ENABLED`。
 
 **实际使用场景**：
 
 1. **AD_ENABLED（默认）**：
-   - 普通 VM 运行
-   - 硬件自动维护 A/D 位
-   - 性能最好
+   - 普通 VM 运行，硬件自动维护 A/D 位，脏页跟踪直接读 D 位
 
 2. **AD_DISABLED**：
-   - 老 CPU 不支持 EPT A/D 位（2010 年前的 CPU）
-   - 嵌套虚拟化：L1 KVM 的 L2 Guest 使用 PML（Page Modification Logging）
-   - PML 需要手动跟踪脏页，不能依赖硬件 A/D 位
+   - 老 CPU 不支持 EPT A/D（`cpu_has_vmx_ept_ad_bits()` 为假）
+   - `kvm_intel.eptad=0`（0444，只能启动时给，`vmx.c:105-106`）
+   - 不用 EPT 的旧式影子分页（`!enable_ept` 时同样清掉 `enable_ept_ad_bits`）
+   - 此时脏页跟踪靠 KVM 软件写保护 + rmap 逐页清理，代价最高
+   - ⚠️ 与 PML **无关**：PML 依赖 A/D 可用（`vmx.c:8525`：`!enable_ept ||
+     !enable_ept_ad_bits || !cpu_has_vmx_pml()` ⇒ `enable_pml = 0`）
 
-3. **AD_WRPROT_ONLY**：
-   - 内存快照：需要知道哪些页被修改过
-   - 写时复制（COW）优化：只跟踪写操作
-   - 实时迁移优化：只传输脏页
+3. **AD_WRPROT_ONLY**（旧稿把它写成"内存快照 / COW / 迁移优化"，**错**）：
+   - 唯一条件是 `kvm_x86_ops.cpu_dirty_log_size && sp->role.guest_mode`
+     （`mmu_internal.h:148-159`）——即**宿主开了 PML 且这张影子页属于 L2**
+   - 源码注释的理由很具体：PML 记下的 GPA 会来自 **L2** 而不是 L1，
+     而 L1 的脏页日志需要 L1 的 GPA；于是把写全部转成 VM-Exit（写保护）来记录，
+     "which bypasses PML, since writes now result in a vmexit"
+   - 所以对**普通（非嵌套）VM 的迁移/快照/脏页跟踪毫无影响**：那走的是
+     AD_ENABLED + PML，或 AD_DISABLED + 软件写保护
+   - 注意它 ≠ "只跟踪 D 不跟踪 A"：`spte_ad_enabled()` 判的是 `!= AD_DISABLED`
+     （`spte.h:304-308`），WRPROT_ONLY 仍算 A/D enabled
 
 **源码位置**：
 
 ```c
-// arch/x86/kvm/mmu/spte.c:175-178
-if (sp->role.ad_disabled)
-    spte |= SPTE_TDP_AD_DISABLED;
-else if (kvm_mmu_page_ad_need_write_protect(sp))
-    spte |= SPTE_TDP_AD_WRPROT_ONLY;
-// 否则默认是 AD_ENABLED（值为 0，不需要设置）
+/* 来源: arch/x86/kvm/mmu/spte.c:175-179 */
+	if (sp->role.ad_disabled)
+		spte |= SPTE_TDP_AD_DISABLED;
+	else if (kvm_mmu_page_ad_need_write_protect(sp))
+		spte |= SPTE_TDP_AD_WRPROT_ONLY;
+	/* 否则就是 SPTE_TDP_AD_ENABLED，值为 0，不需要显式设置 */
 ```
+
+```c
+/* 来源: arch/x86/kvm/mmu/mmu_internal.h:148-159 */
+static inline bool kvm_mmu_page_ad_need_write_protect(struct kvm_mmu_page *sp)
+{
+	/*
+	 * When using the EPT page-modification log, the GPAs in the CPU dirty
+	 * log would come from L2 rather than L1.  Therefore, we need to rely
+	 * on write protection to record dirty pages, which bypasses PML, since
+	 * writes now result in a vmexit.  Note, the check on CPU dirty logging
+	 * being enabled is mandatory as the bits used to denote WP-only SPTEs
+	 * are reserved for PAE paging (32-bit KVM).
+	 */
+	return kvm_x86_ops.cpu_dirty_log_size && sp->role.guest_mode;
+}
+```
+
+TDP MMU 侧读回这个判据的地方是 `tdp_mmu_need_write_protect()`
+（`tdp_mmu.c:1497-1505`）：`kvm_mmu_page_ad_need_write_protect(sp) || !kvm_ad_enabled()`
+——"该写保护"与"没有硬件 A/D"在清脏页时等价处理。
 
 ### Q: `shadow_present_mask` 是什么？
 
@@ -649,8 +690,8 @@ if (spte & VMX_EPT_IPAT_BIT) {
 
 软件位（KVM 添加）：
   - bit 11: SPTE_MMU_PRESENT_MASK（KVM 认为"存在"）
-  - bit 52:53: SPTE_TDP_AD_MASK（A/D 位跟踪类型）
-  - bit 54:55: SHADOW_ACC_TRACK_SAVED_MASK（访问跟踪保存的 R/X 位）
+  - bit 53:52: SPTE_TDP_AD_MASK（A/D 位跟踪类型）
+  - bit 55:54: SHADOW_ACC_TRACK_SAVED_MASK（访问跟踪保存的 R/X 位）
   - bit 57: EPT_SPTE_HOST_WRITABLE（宿主认为可写）
   - bit 58: EPT_SPTE_MMU_WRITABLE（KVM MMU 认为可写）
 ```
@@ -660,8 +701,8 @@ if (spte & VMX_EPT_IPAT_BIT) {
 | 软件位 | 用途 | 为什么需要 |
 |--------|------|-----------|
 | `SPTE_MMU_PRESENT_MASK` (11) | KVM 内部标记 | 区分有效 SPTE 和 MMIO SPTE |
-| `SPTE_TDP_AD_MASK` (52:53) | A/D 位跟踪 | 当硬件不支持 A/D 时，软件跟踪 |
-| `SHADOW_ACC_TRACK_SAVED_MASK` (54:55) | 访问跟踪 | 保存原始 R/X 位，用于内存回收 |
+| `SPTE_TDP_AD_MASK` (53:52) | A/D 位跟踪 | 当硬件不支持 A/D 时，软件跟踪 |
+| `SHADOW_ACC_TRACK_SAVED_MASK` (55:54) | 访问跟踪 | 保存原始 R/X 位，用于内存回收 |
 | `EPT_SPTE_HOST_WRITABLE` (57) | 宿主写保护 | 跟踪宿主是否允许写 |
 | `EPT_SPTE_MMU_WRITABLE` (58) | MMU 写保护 | 跟踪 KVM MMU 是否允许写 |
 
@@ -1010,9 +1051,9 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 
     /* 1. A/D 跟踪类型 */
     if (sp->role.ad_disabled)
-        spte |= SPTE_TDP_AD_DISABLED;          /* bits 52:53 = 01 */
+        spte |= SPTE_TDP_AD_DISABLED;          /* bits 53:52 = 01 */
     else if (kvm_mmu_page_ad_need_write_protect(sp))
-        spte |= SPTE_TDP_AD_WRPROT_ONLY;       /* bits 52:53 = 10 */
+        spte |= SPTE_TDP_AD_WRPROT_ONLY;       /* bits 53:52 = 10 */
 
     /* 2. 硬件 present 位 */
     spte |= shadow_present_mask;                /* EPT: R 或 0 */
@@ -1063,7 +1104,8 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
             goto out;
 
         /* 尝试 unsync 影子页；失败则写保护 */
-        if (mmu_try_to_unsync_pages(...)) {
+        if (mmu_try_to_unsync_pages(vcpu->kvm, slot, gfn, can_unsync, prefetch)) {
+            wrprot = true;
             pte_access &= ~ACC_WRITE_MASK;
             spte &= ~(PT_WRITABLE_MASK | shadow_mmu_writable_mask);
         }
@@ -1074,10 +1116,28 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
         spte |= spte_shadow_dirty_mask(spte);
 
 out:
+    /* 13. 预取的 SPTE 改造成 access-tracking 形式（A=0 的编码见 §7.2） */
+    if (prefetch)
+        spte = mark_spte_for_access_track(spte);
+
+    WARN_ONCE(is_rsvd_spte(&vcpu->arch.mmu->shadow_zero_check, spte, level), ...);
+
+    /* 14. 可写 + 该 slot 正在记录脏页 → 立刻标脏 */
+    if ((spte & PT_WRITABLE_MASK) && kvm_slot_dirty_track_enabled(slot)) {
+        /* Enforced by kvm_mmu_hugepage_adjust. */
+        WARN_ON_ONCE(level > PG_LEVEL_4K);
+        mark_page_dirty_in_slot(vcpu->kvm, slot, gfn);
+    }
+
     *new_spte = spte;
     return wrprot;     /* true = 需要写保护，调用者需模拟写 */
 }
 ```
+
+**源码引用**: `arch/x86/kvm/mmu/spte.c:157-277` → `make_spte()`；上面第 9 步之后
+的 `shadow_me_value`（SME/TDX 的加密位，`spte.c:220-221`）为省篇幅略去。
+**注意 `out:` 标签的位置**：`is_last_spte(old_spte, level) && is_writable_pte(old_spte)`
+那条快路径 `goto out` 会**跳过第 12 步的 dirty mask**，但**不会**跳过第 13/14 步。
 
 ### Q: 为什么 `make_spte()` 返回 `bool`？
 

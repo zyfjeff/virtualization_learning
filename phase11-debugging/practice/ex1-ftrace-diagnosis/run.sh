@@ -62,7 +62,7 @@ preflight() {
     qemu_pid=$(pgrep -f '^qemu-system-x86_64' | head -1) || true
     if [ -z "$qemu_pid" ]; then
         echo "⚠ 未检测到运行中的 VM（诊断需要 VM 运行）"
-        echo "  启动命令: ../../scripts/vm/boot-vm.sh ubuntu --memory 2G --cpus 2"
+        echo "  启动命令: ../../../scripts/vm/boot-vm.sh ubuntu --memory 2G --cpus 2"
     else
         echo "✓ 检测到 QEMU PID: $qemu_pid"
     fi

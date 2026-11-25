@@ -511,6 +511,8 @@ Intel VT-d 通常是 coherent 的（硬件保证），某些 ARM 平台可能不
 ### Q: `VFIO_IOMMU_MAP_DMA` 的完整路径？
 
 **文件**: `drivers/vfio/vfio_iommu_type1.c:1548`
+（2026-11-25 核查：本节早期把固定页面写成 `get_user_pages_fast()`，真实是
+`pin_user_pages_remote()` + `FOLL_LONGTERM`，见 [corrections.md](corrections.md) 勘误 12）
 
 ```c
 static int vfio_dma_do_map(struct vfio_iommu *iommu,
@@ -535,10 +537,14 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
     if (dma) return -EEXIST;           /* 已存在映射 */
 
     /* ★ 固定物理页 + 创建 IOMMU 映射 */
-    ret = vfio_pin_map_dma(iommu, dma, size);
-    /*   ├→ get_user_pages_fast()        ← 固定用户空间物理页 */
-    /*   ├→ 创建 vfio_pfn 记录           ← 记录映射的物理页 */
-    /*   └→ iommu_map()                  ← IOVA → PFN + 权限 → IOMMU 页表 */
+    ret = vfio_pin_map_dma(iommu, dma, size);      /* :1655，函数定义 :1448 */
+    /*   ├→ vfio_pin_pages_remote()      :1463（定义 :597）
+     *      └→ vaddr_get_pfns()          :551
+     *           └→ pin_user_pages_remote(mm, vaddr, npages,
+     *                                    flags | FOLL_LONGTERM, ...)  :563
+     *      ★ 不是 get_user_pages_fast()：本文件 get_user_pages 0 命中
+     *   ├→ 创建 vfio_pfn 记录           ← 记录映射的物理页
+     *   └→ vfio_iommu_map()             :1473（定义 :1421）→ iommu_map() :1428 */
 
     /* ★ 加入红黑树 */
     vfio_link_dma(iommu, dma);
@@ -553,7 +559,7 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 | 对齐检查 | `size \| iova \| vaddr & (pgsize - 1)` | 防止非对齐映射 |
 | 内存锁定限制 | `RLIMIT_MEMLOCK` | 防止用户空间锁定过多内存 |
 | IOVA 不重叠 | `vfio_find_dma()` | 防止地址冲突 |
-| 页面固定 | `get_user_pages_fast()` | 防止 DMA 目标页被换出 |
+| 页面固定 | `pin_user_pages_remote()` + `FOLL_LONGTERM`（`vfio_iommu_type1.c:563`） | 长期 pin：`FOLL_PIN` 语义挡住换出/回收，`FOLL_LONGTERM` 把页移出 movable zone 挡住迁移 |
 | IOMMU 翻译 | `iommu_map()` | 硬件强制隔离 |
 
 ---
@@ -577,27 +583,59 @@ IOMMU 组 = 必须一起直通的设备集合
 
 ### Q: 组划分的关键代码？
 
-**文件**: `drivers/iommu/iommu.c:1543`（简化）
+**文件**: `drivers/iommu/iommu.c:1515-1576`（函数头 `:1515`，`EXPORT_SYMBOL_GPL` 在 `:1577`；
+**非 `static`**——它是给 `iommu_ops.device_group` 用的导出符号）
 
 ```c
-static struct iommu_group *pci_device_group(struct device *dev)
+/* 来源: drivers/iommu/iommu.c:1515-1533 —— Step 1（真实判据是"迭代器提前返回"） */
+struct iommu_group *pci_device_group(struct device *dev)
 {
-    /* ★ Step 1: DMA 别名查找 */
-    pci_for_each_dma_alias(pdev, get_pci_alias_or_group, &data);
-    if (data.group) return data.group;     /* 找到已有组 */
-
-    /* ★ Step 2: ACS 隔离检查 */
-    for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
-        if (!bus->self) continue;
-        if (pci_acs_path_enabled(bus->self, NULL, REQ_ACS_FLAGS))
-            break;                          /* 上游隔离成立 → 停止 */
-        pdev = bus->self;                   /* 隔离不成立 → 把桥拉进同组 */
-    }
-
-    /* Step 3: 查找或创建组 */
-    ...
-}
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct group_for_pci_data data;
+	...
+	if (pci_for_each_dma_alias(pdev, get_pci_alias_or_group, &data))
+		return data.group;
 ```
+
+```c
+/* 来源: drivers/iommu/iommu.c:1543-1555 —— Step 2：ACS 上溯 */
+	for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
+		if (!bus->self)
+			continue;
+
+		if (pci_acs_path_enabled(bus->self, NULL, REQ_ACS_FLAGS))
+			break;                 /* 上游隔离成立 → 停止 */
+
+		pdev = bus->self;              /* 隔离不成立 → 把桥拉进同组 */
+
+		group = iommu_group_get(&pdev->dev);
+		if (group)
+			return group;
+	}
+```
+
+```c
+/* 来源: drivers/iommu/iommu.c:1561-1575 —— Step 3/4 + 兜底 */
+	group = get_pci_alias_group(pdev, (unsigned long *)devfns);
+	if (group)
+		return group;
+
+	group = get_pci_function_alias_group(pdev, (unsigned long *)devfns);
+	if (group)
+		return group;
+
+	/* No shared group found, allocate new */
+	return iommu_group_alloc();
+```
+
+> ⚠️ 本块初版有三处不准（已按源码改）：
+> ① 行号写成 `:1543`——那是 Step 2 循环头，函数头在 `:1515`（本仓 [README.md](README.md) §关键函数索引
+> 写的 1515 才是对的）；
+> ② 加了 `static`——实际是导出符号（`:1577`）；
+> ③ Step 1 写成"调用后判 `if (data.group)`"，实际是
+> `if (pci_for_each_dma_alias(...)) return data.group;`——**回调返回非 0 才中断遍历**，
+> 这个"中途撞到既有组就早退"的语义在 [group-division.md](group-division.md) §1.4.4 里
+> 是解释 group 101 成因的关键。
 
 ### Q: `REQ_ACS_FLAGS` 包含哪些？
 
@@ -762,9 +800,12 @@ QEMU 设置 VFIO 设备直通的完整流程:
 
   8. DMA 映射
      ioctl(VFIO_IOMMU_MAP_DMA, {iova, vaddr, size}) ──────────────▶
-       └→ vfio_dma_do_map()
-           ├→ get_user_pages_fast()           ← 固定物理页
-           └→ iommu_map()                     ← IOVA → PFN
+       └→ vfio_dma_do_map()                   (vfio_iommu_type1.c:1548)
+           ├→ vfio_pin_map_dma()              (:1448，调用点 :1655)
+           │    └→ vfio_pin_pages_remote() → vaddr_get_pfns()
+           │         └→ pin_user_pages_remote(... | FOLL_LONGTERM)  (:563)
+           │            ★ 不是 get_user_pages_fast()
+           └→ vfio_iommu_map() → iommu_map()  (:1421 / :1428)  ← IOVA → PFN
 
   9. 查询 region 信息
      ioctl(VFIO_DEVICE_GET_REGION_INFO) ──────────────────────────▶

@@ -313,37 +313,65 @@ GPU → NVMe（直接数据传输）
 ### 设备侧
 
 ```c
-// PCIe 配置空间中的 ATS Capability
-struct ats_capability {
-    u16 capability_id;     // ATS Capability ID
-    u16 next_pointer;      // 下一个 capability
-    u16 control;           // ATS 控制寄存器
-    // bit 15: ATS Enable
-    // bit 14: Invalidate Queue Depth
-    // bits 13-0: 保留
-};
-
-// 启用 ATS
-pci_write_config_word(dev, ats_control_offset, ATS_ENABLE);
+/* ATS Extended Capability 寄存器布局
+ * 来源: include/uapi/linux/pci_regs.h:912-921（实际宏定义） */
+#define PCI_ATS_CAP		0x04	/* ATS Capability Register */
+#define  PCI_ATS_CAP_QDEP(x)	((x) & 0x1f)	/* Invalidate Queue Depth: bits 4:0 */
+#define  PCI_ATS_MAX_QDEP	32	/* Max Invalidate Queue Depth */
+#define  PCI_ATS_CAP_PAGE_ALIGNED	0x0020 /* Page Aligned Request: bit 5 */
+#define PCI_ATS_CTRL		0x06	/* ATS Control Register */
+#define  PCI_ATS_CTRL_ENABLE	0x8000	/* ATS Enable: bit 15 */
+#define  PCI_ATS_CTRL_STU(x)	((x) & 0x1f)	/* Smallest Translation Unit: bits 14:10 */
+#define  PCI_ATS_MIN_STU	12	/* shift of minimum STU block */
 ```
+
+**勘误（2026-11-25）**：旧版把 Control 寄存器写成"bit15 Enable / **bit14
+Invalidate Queue Depth** / bits13-0 保留"——两处都错：Invalidate Queue Depth 在
+**Capability 寄存器 bits 4:0**；Control 的 **bits 14:10 是 STU**（Smallest
+Translation Unit，存的是位移量之差 `ps - 12`，字段值 n 表示 2^(12+n) 字节，
+AGENTS.md 陷阱 #14），不是保留位。
 
 ### IOMMU 侧
 
-```c
-// Intel VT-d 中的 ATS 支持
-// DMAR 表中声明 ATS 能力
-// IOMMU 驱动处理 Translation Request
-// IOMMU 驱动发送 Invalidation Request
+**勘误（2026-11-25）**：旧版写的 `drivers/iommu/intel/ats.c` 与
+`intel_enable_ats(dev, queue_depth)` 在 6.12.93 中**不存在**。真实的启用路径：
 
-// Linux 内核中的 ATS 支持
-// drivers/iommu/intel/ats.c
-int intel_enable_ats(struct pci_dev *dev, int queue_depth)
+```c
+/* 调用点: drivers/iommu/intel/iommu.c:1295-1297（iommu_enable_pci_caps 内） */
+if (info->ats_supported && pci_ats_page_aligned(pdev) &&
+    !pci_enable_ats(pdev, VTD_PAGE_SHIFT))
+	info->ats_enabled = 1;
+
+/* 实现: drivers/pci/ats.c:90-122（节选，通用 PCIe 层，非 Intel 专有） */
+int pci_enable_ats(struct pci_dev *dev, int ps)   /* ps = 页大小位移, 不是队列深度 */
 {
-    // 分配 ATS 队列
-    // 启用设备的 ATS 能力
-    // 注册 Invalidation 处理
+	u16 ctrl;
+
+	if (!pci_ats_supported(dev))
+		return -EINVAL;
+	if (WARN_ON(dev->ats_enabled))
+		return -EBUSY;
+	if (ps < PCI_ATS_MIN_STU)
+		return -EINVAL;
+
+	ctrl = PCI_ATS_CTRL_ENABLE;
+	if (dev->is_virtfn) {
+		pdev = pci_physfn(dev);
+		if (pdev->ats_stu != ps)     /* VF 必须与 PF 同 STU */
+			return -EINVAL;
+	} else {
+		dev->ats_stu = ps;
+		ctrl |= PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU);
+	}
+	pci_write_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, ctrl);
+
+	dev->ats_enabled = 1;
+	return 0;
 }
 ```
+
+即：启用只写 Enable+STU 两个字段；Invalidation 由 VT-d 侧（ qi 队列 /
+`drivers/iommu/intel/pasid.c` 的 Device-TLB 失效）处理，见 phase3 invalidation.md。
 
 ---
 
@@ -374,13 +402,14 @@ int intel_enable_ats(struct pci_dev *dev, int queue_depth)
 ### 实际测量方法
 
 ```bash
-# 使用 perf 测量 IOMMU 查询次数
+# 使用 perf 测量 IOMMU 映射/失效频率（iommu:map/unmap 事件存在，
+# include/trace/events/iommu.h:79/103；ATS 失效开销体现在 unmap 延迟上）
 perf stat -e iommu:map,iommu:unmap ./benchmark
 
-# 使用 ftrace 跟踪 ATS 事件
-echo 1 > /sys/kernel/tracing/events/amd_iommu/ats/enable
-./benchmark
-cat /sys/kernel/tracing/trace
+# 6.12.93 没有 "amd_iommu/ats" trace 事件类——drivers/iommu/amd 下无 TRACE_EVENT 定义。
+# Device-TLB 失效可观测内核侧真实符号 qi_flush_dev_iotlb（dmar.c:1534）
+# （kprobe 取参方案须按 AGENTS.md 陷阱 #9 先做对照验证再用）：
+echo 'p:dtlb qi_flush_dev_iotlb' >> /sys/kernel/tracing/kprobe_events
 
 # 测量延迟
 fio --ioengine=libaio --direct=1 --rw=randread \

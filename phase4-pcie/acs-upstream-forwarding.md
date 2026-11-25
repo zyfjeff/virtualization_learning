@@ -20,29 +20,39 @@
 ### 工作层级不同
 
 ```
-PCIe 拓扑层级：
+PCIe 拓扑层级（控制位所在 Port，依据 PCIe Spec r6.0 §6.12.1）：
 
 Device A
     ↓
-Switch Downstream Port 1  ← RR 在这里工作（拦截 P2P）
+Switch Downstream Port 1  ← RR 在这里工作（拦截 P2P 请求改道）
+    ↓                      ← UF 也在这里工作：Ingress 收到指向本端口
+Switch Internal Fabric        Egress 的 Upstream TLP 时，改向 Upstream 转发
     ↓
-Switch Internal Fabric
-    ↓
-Switch Upstream Port      ← UF 在这里工作（确保通过）
-    ↓
-Root Port                 ← UF 也在这里工作（确保到达 RC）
-    ↓
+Switch Upstream Port        ←（UF 控制位不在此——spec 只在
+    ↓                          DSP/Root Port 要求实现 UF）
+Root Port                   ← UF 在这里工作（配合 Redirected Request
+    ↓                          Validation 把重定向流量交给 TA 处理）
 Root Complex (RC)
 ```
+
+> **勘误（2026-11-25）**：旧版把 UF 画在 "Switch Upstream Port + Root Port"。
+> PCIe 6.0 §6.12.1 原文："ACS Upstream Forwarding: must be implemented by **Root
+> Ports** if the RC supports Redirected Request Validation; must be implemented by
+> **Switch Downstream Ports**"，且行为定义在 DSP："When ACS Upstream Forwarding
+> is enabled in a **Switch Downstream Port**, and its Ingress Port receives an
+> Upstream Request or Completion TLP targeting the Port's own Egress Port, the
+> Port must instead forward the TLP Upstream towards the RC."——UF 字段挂在
+> DSP/Root Port 上，不在 Upstream Port；§6.12.2 说的"中间 Switch 必须支持 UF"
+> 指的就是这些 Switch 的下游端口。
 
 ### 各自的职责
 
 | 特性 | RR (Request Redirect) | UF (Upstream Forwarding) |
 |------|----------------------|-------------------------|
-| **工作位置** | Switch Downstream Ports | Switch Upstream Ports + Root Ports |
-| **主要作用** | 主动拦截 P2P 请求，强制改道 | 确保改道后的流量能到达 RC |
-| **工作时机** | 请求刚进入 Switch 时 | 请求向上游传播过程中 |
-| **类比** | 交通警察（改道） | 路标（保通） |
+| **控制位所在** | Root Ports + Switch Downstream Ports（多功能设备/RCiEP 侧另有 RR 要求） | Root Ports（若 RC 支持 Redirected Request Validation）+ Switch Downstream Ports |
+| **主要作用** | 把原本要 P2P 转发的 Request 重定向到上游 | 把 Ingress 收到、指向自身 Egress 的 upstream TLP 强制转发向上游（不使能时处理 undefined） |
+| **工作时机** | 请求进入端口、即将 P2P 短路时 | 任何"本可下游短路"的 TLP（含 RR 重定向产物） |
+| **类比** | 交通警察（改道） | 同一路口的"禁止就地掉头、一律送上主路"规则 |
 
 ---
 
@@ -51,14 +61,17 @@ Root Complex (RC)
 ### 场景 1：只有 RR，没有 UF
 
 ```
-Device A → Port 1 (RR 拦截) → Upstream Port → ???
+Device A → Port 1 (RR 拦截, 改道向 Upstream) → 中间端口 → ???
                                     ↓
-                            可能被丢弃！
-                            因为 Upstream Port 不知道
-                            这个请求是被 RR 重定向的
+                     §6.12.2: 若路径上的 Switch/Root Port 不支持 UF，
+                     "how such Switches handle Upstream redirected
+                      TLPs is undefined" —— 行为未定义（可能丢弃/误投）
 ```
 
-**问题**：请求被 RR 重定向后，可能在 Switch 内部被丢弃或处理不当。
+**问题**：RR 只是把 TLP 推向"Upstream 方向"；从 DSP 到 RC 沿途端口若没有
+UF 语义兜底，规范明确说这些重定向 TLP 的处理是 undefined——隔离链在
+第一个不支持 UF 的端口处断掉（不是"Upstream Port 有 UF 位"，UF 位挂在
+沿途 DSP/Root Port 上）。
 
 ### 场景 2：只有 UF，没有 RR
 
@@ -74,7 +87,7 @@ Device A → Port 1 → Switch 内部 P2P 路由 → Port 2 → Device B
 ### 场景 3：RR + UF（正确配置）
 
 ```
-Device A → Port 1 (RR 拦截) → Upstream Port (UF 确保通过) → Root Port (UF 确保通过) → RC
+Device A → Port 1 (RR 拦截 + 本端口 UF 强制上送) → 沿途端口 UF 保通 → Root Port (UF/RRA 交 TA) → RC
                                                                           ↓
                                                               RC 处理后往下游转发
                                                                           ↓
@@ -135,15 +148,17 @@ UF：确保 RR/CR 重定向的流量不会丢失
                                ✗ 这是循环！
 
 正确理解：
-  Device A → Port 1 (RR 拦截) → Upstream Port (UF 确保通过) → RC
-                                                              ↓
-                                                    RC 处理后往下游转发
-                                                              ↓
-                                                    Port 2 → Device B
+  Device A → Port 1 (RR 拦截；本端口 UF 把"想去自己 Egress"的流量送上游)
+           → 沿途端口 UF 保通 → RC
+                                  ↓
+                       RC 处理后往下游转发（这是正常路由，
+                       不属于任何端口的 UF 语义）
+                                  ↓
+                       Port 2 → Device B
 ```
 
 **关键点**：
-- UF 只在请求**向上游传播**的过程中起作用
+- UF 只在请求**向上游传播**的过程中起作用（控制位在 DSP/Root Port，见上文勘误）
 - 一旦到达 RC，RC 往下游转发时，UF 不再介入
 - **不会造成循环**！
 

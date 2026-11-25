@@ -340,7 +340,7 @@ pub fn do_post_restore(&mut self, mem: &GuestMemoryMmap) -> Result<(), VmClockEr
 | 功能 | 用途 | 与 VMGenID 的关系 |
 |------|------|------------------|
 | `vm_generation_counter++` | 通知**用户态**快照恢复 | **互补**：VMGenID 解决内核态，VMClock 解决用户态 |
-| `disruption_marker++` | 通知迁移事件 | **独特**：VMGenID 不处理迁移 |
+| `disruption_marker++` | 通知时钟域扰动（规范语义：迁移等） | **独特**：VMGenID 不处理迁移；⚠️ 但 Firecracker Phase 1 无热迁移，实际只在**快照恢复**时递增（`do_post_restore()`，`vmclock.rs:122-153`）；迁移递增目前由 QEMU 实现（post_load，`hw/acpi/vmclock.c:64-97`），见勘误 30 |
 | 中断通知 | 触发 guest 处理 | 与 VMGenID 类似，但服务不同层次 |
 
 ### Phase 1 的实际价值
@@ -355,14 +355,21 @@ VMGenID 自动处理内核态 PRNG，但以下用户态组件需要 VMClock mmap
 
 这些组件可以通过 `mmap(/dev/vmclock0)` 监控 `vm_generation_counter` 变化，主动重播种自己的状态。
 
-**2. 迁移通知（独特功能）**
+**2. 扰动通知（VMGenID 没有的通道；Phase 1 实际由快照恢复触发）**
 
-`disruption_marker` 是 VMClock 独有的功能，VMGenID 不提供：
+`disruption_marker` 在 VMClock 规范里用于通知迁移等时钟域扰动，VMGenID 不提供该通道：
 - 热迁移后，TSC 频率和值可能跳变
-- 用户态库需要知道迁移发生，以便：
+- 用户态库需要知道扰动发生，以便：
   - 丢弃旧的 NTP 校准状态
   - 重新建立时间同步
   - 重置对时间敏感的连接
+
+⚠️ 但在 **Firecracker Phase 1 的实现**里，唯一递增 `disruption_marker` 的路径是
+**快照恢复** `do_post_restore()`（`src/vmm/src/devices/acpi/vmclock.rs:122-153`）——
+FC 不支持热迁移（引入 commit `ef215b91b` 原话："we don't support live migration,
+the device won't do anything at the moment"），FC 文档里 "Live migration through the
+disruption_marker" 是设计意图而非当前能力。迁移时真正递增 marker 的现有实现是
+**QEMU**（`hw/acpi/vmclock.c` post_load，marker++ @ :78-80）。见勘误 30。
 
 **3. 当前限制**
 

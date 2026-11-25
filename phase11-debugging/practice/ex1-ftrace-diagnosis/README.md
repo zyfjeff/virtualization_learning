@@ -28,7 +28,7 @@ ls /sys/kernel/debug/tracing/
 # 如果不存在，mount -t debugfs none /sys/kernel/debug/
 
 # 启动测试 VM（在另一个终端）
-cd ../../scripts/vm/
+cd ../../../scripts/vm/
 ./boot-vm.sh ubuntu --memory 2G --cpus 2
 ```
 
@@ -146,20 +146,25 @@ echo "✓ Cleanup done"
 
 ### 正常启动序列
 
-```
-=== KVM ioctl 调用链 ===
-kvm_dev_ioctl: KVM_CREATE_VM
-kvm_vm_ioctl: KVM_CREATE_VCPU
-kvm_vcpu_ioctl: KVM_RUN
-kvm_arch_vcpu_ioctl_run: enter vcpu_run
-vcpu_enter_guest: prepare VM-Entry
-vmx_vcpu_run: VM-Entry → Guest → VM-Exit
+★ function tracer 打的是`comm-PID [CPU] flags 时间戳: 函数名 <-调用者`，
+**不会**打印 `KVM_CREATE_VM` 这类 ioctl 号；想按 ioctl 序列看，
+用 `kvm:kvm_userspace_exit` 等 tracepoint 或 strace。下面是真实形态：
 
-=== VM-Entry / VM-Exit 事件 ===
-kvm_entry: vcpu 0 rip 0xfffffff0
-kvm_exit: reason EXTERNAL_INTERRUPT rip 0xfffffff0
-kvm_entry: vcpu 0 rip 0x1000
-kvm_exit: reason EPT_VIOLATION rip 0x1000
+```
+=== KVM ioctl 调用链（current_tracer=function）===
+ qemu-system-x86- 771290 [002] d..1  1234.500112: kvm_dev_ioctl <-__x64_sys_ioctl
+ qemu-system-x86- 771290 [002] d..1  1234.500398: kvm_vm_ioctl <-__x64_sys_ioctl
+ qemu-system-x86- 771290 [002] d..1  1234.501004: kvm_vcpu_ioctl <-__x64_sys_ioctl
+ qemu-system-x86- 771290 [002] d..1  1234.501021: kvm_arch_vcpu_ioctl_run <-kvm_vcpu_ioctl
+ qemu-system-x86- 771290 [002] d..1  1234.501043: vcpu_enter_guest <-kvm_arch_vcpu_ioctl_run
+ qemu-system-x86- 771290 [002] d..1  1234.501067: vmx_vcpu_run <-vcpu_enter_guest
+
+=== VM-Entry / VM-Exit 事件（照各自 TP_printk）===
+kvm_entry: vcpu 0, rip 0xfffffff0                  ← "vcpu %u, rip 0x%lx%s"（trace.h:33）
+kvm_exit:  vcpu 0 reason EPT_VIOLATION rip 0xfffffff0 info1 0x... info2 0x... intr_info 0x... error_code 0x...
+                                                 ← "vcpu %u reason %s%s%s rip 0x%lx info1 ..."（trace.h:325-330）
+kvm_entry: vcpu 0, rip 0x1000
+kvm_exit:  vcpu 0 reason EXTERNAL_INTERRUPT rip 0x1000 info1 0x0 ...
 ...
 ```
 
@@ -167,18 +172,22 @@ kvm_exit: reason EPT_VIOLATION rip 0x1000
 
 ```
 === 启动失败检查 ===
-kvm_userspace_exit: vcpu 0 exit_reason KVM_EXIT_FAIL_ENTRY
+kvm_userspace_exit: reason KVM_EXIT_FAIL_ENTRY (9)
 
 === dmesg 输出 ===
-[ 1234.567] KVM: VMCS invalid, dumping:
-[ 1234.568] VM_EXIT_CONTROLS: 0x000583e6
-[ 1234.569] VM_ENTRY_CONTROLS: 0x000083e6
-[ 1234.570] GUEST_CR0: 0x00000010  (real mode, PE=0)
-[ 1234.571] GUEST_RIP: 0x0000fff0
+[ 1234.567] VMCS ffff888123456000, last attempted VM-entry on CPU 3
+[ 1234.568] *** Guest State ***
+[ 1234.569] CR0: actual=0x0000000000000010, shadow=0x0000000000000010, gh_mask=fffffffffffffff7
+[ 1234.570] RSP = 0x0000000000007c00  RIP = 0x000000000000fff0
+[ 1234.571] *** Control State ***
+[ 1234.572] CPUBased=000004fb SecondaryExec=00001000 TertiaryExec=0000000000000000
+[ 1234.573] PinBased=00000020 EntryControls=000083ff ExitControls=002083ff
+[ 1234.574] VMExit: intr_info=00000000 errcode=00000000 ilen=00000000
+[ 1234.575]         reason=80000021 qualification=0000000000000000
 ```
 
 **根因分析**：
-- `GUEST_CR0 = 0x10` 表示 real mode（PE=0），但 `VM_EXIT_CONTROLS` 的 `host address-space size` 位可能配置错误
+- `CR0: actual=0x...10` 表示 real mode（PE=0）；`reason=80000021` 的高位 `0x80000000` 是 `failed_vmentry`，低 16 位 `0x21`=33 是 `EXIT_REASON_INVALID_STATE`（`arch/x86/include/uapi/asm/vmx.h:62`）。★ 注意 `dump_vmcs` 只打印数字 `reason=`，**不会**打印 `EXIT_REASON_*` 符号名（`arch/x86/kvm/vmx/vmx.c:6272`/`:6366` 区段），要符号名请用 `kvm:kvm_exit` tracepoint。
 - 检查 VMM 是否正确设置了 `KVM_SET_SREGS` 的 CR0/CR4
 
 ---
@@ -209,4 +218,5 @@ kvm_userspace_exit: vcpu 0 exit_reason KVM_EXIT_FAIL_ENTRY
 - 启动失败诊断: `../../launch-failures.md` §2
 - KVM trace events: `../../annotations.md` §1
 - ftrace 高级用法: `../../annotations.md` §4
-- VMCS 字段含义: intel-vmx.pdf Appendix B
+- VMCS 字段含义: `spec/intel-vmx.pdf` Appendix B（VMCS 字段编码）
+- ★ dump_vmcs 实际打印的标签以 `arch/x86/kvm/vmx/vmx.c` 的 `pr_err` 格式串为准（`gh_mask` 而非 `host_mask`）

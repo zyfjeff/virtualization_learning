@@ -21,7 +21,7 @@
 | Q3 | 让出换来的是收益还是纯开销？ | **只有超卖组** guest 吞吐（`completed/s`）改善；1:1 组关闭 PLE 反而更快或持平 |
 | Q4 | 窗口大小有多敏感？ | 极小 / 默认 / 极大 / 关闭 四档的吞吐差值 > 观测噪声（噪声由 [`../measurement.md`](../measurement.md) §4 的扰动预算给出） |
 
-三条 Q1/Q2/Q3 是**与关系**，缺一都不能说"PLE 有效"（[`../annotations.md`](../annotations.md) §1.7 末尾）。
+三条 Q1/Q2/Q3 是**与关系**，缺一都不能说"PLE 有效"（[`../annotations.md`](../annotations.md) §1「PLE 的正确判据是什么」末尾的与关系）。
 
 ---
 
@@ -34,7 +34,10 @@
 
 **为什么不能用 `stress-ng --mutex/--futex`**：`"PAUSE-loop exiting"` 这个
 VM-execution 控制在 **CPL > 0 时被硬件忽略** ——
-`arch/x86/kvm/vmx/vmx.c:5916-5921` 的注释原文引 Intel SDM vol3 ch-25.1.3，
+`arch/x86/kvm/vmx/vmx.c:5916-5921` 的注释原文引 Intel SDM vol3 ch-25.1.3
+（★ 那是源码里的**旧编号**；本章规范副本 `../../spec/intel-vmx.pdf` 里这句在
+**Section 26.1.3**"Instructions That Cause VM Exits Conditionally"，
+全 PDF 无 "25.1.3"，判据以规范为准，见 `../annotations.md` §1「为什么"PLE 在 CPL > 0 时被忽略"这句规范决定了实验设计」），
 并据此推出"既然 KVM 从不单独置 `PAUSE_EXITING`、只在支持时置 PLE，那么
 拿到 PAUSE 退出时 vCPU 必定在 CPL=0"。用户态自旋锁的 `PAUSE` 循环在 ring 3，
 **根本产生不了退出**，只能当阴性对照。
@@ -46,7 +49,8 @@ VM-execution 控制在 **CPL > 0 时被硬件忽略** ——
 
 ```
 guest 内核 CONFIG_PARAVIRT_SPINLOCKS
-  ├─ 未开（本仓 scripts/images/kernel.config:297 就是 "is not set"）
+  ├─ 未开（本仓 scripts/images/kernel.config:322 就是 "is not set"；★ 该文件是构建产物，
+  │    行号随配置增删漂移，定位一律用 grep -n PARAVIRT_SPINLOCKS）
   │    → kvm_spinlock_init() 整个没编译（arch/x86/kernel/kvm.c:1049-1139）
   │    → native_pv_lock_init() 见到 hypervisor 就使能 virt_spin_lock_key
   │      （arch/x86/kernel/paravirt.c:56-60），没人再关掉它
@@ -84,7 +88,7 @@ dmesg | grep -iE "PV spinlock|spinlocks (en|dis)abled"
 ### 2.2 别拿 `directed_yield_*` 当判据
 
 debugfs 那两个名字最贴切的统计 **不属于 PLE 路径**，恒为 0。
-详见 [`../annotations.md`](../annotations.md) §1.8 与
+详见 [`../annotations.md`](../annotations.md) §1「`directed_yield_attempted` 为什么不能当 PLE 的判据」与
 [`../corrections.md`](../corrections.md) C11。用 `kvm_vcpu_yield_to()` 函数计数替代。
 
 ### 2.3 超卖必须是"抢同一条 runqueue"，不是带宽限流
@@ -121,7 +125,10 @@ NUMA node0 = `0-23,48-71`，因此两组都要同时写 `cpuset.mems=0`，
       kvm_vm_enable_disable_exits() 只在 enable_cpu_pm 时调用
         （qemu-10.1.0-rc2 target/i386/kvm/kvm.c:3321-3322；cpu-pm 解析在 system/vl.c:1891）
       它一次性传 MWAIT|HLT|PAUSE|CSTATE 四个位
-        （同文件 :3120-3132）→ KVM 分别置四个 *_in_guest（x86.c:6595-6600,6606-6610）
+        （同文件 :3120-3132）→ KVM 分别置四个 *_in_guest
+        （PAUSE x86.c:6595-6596；MWAIT/HLT/CSTATE 三位都在
+         if (!mitigate_smt_rsb) 块内，:6601-6613 → 分别是 :6606-6608 / :6609-6610 / :6611-6612。
+         ★ 只有 PAUSE 不受 mitigate_smt_rsb 影响，逐位落点见 ../parameters.md §7）
       影响面：PLE **加上** HLT/MWAIT/CSTATE 退出全没了。
       → 只能当"这些退出合计值多少钱"的粗对照，不能单独归因给 PLE。
       （变量纠缠规则见 ../measurement.md §6）
@@ -216,7 +223,7 @@ sudo ./bench-ple.sh --all --repeat 3            # 全矩阵，需 root
 4. **每轮结果单调地越跑越慢/越快** → PLE 窗口是 **per-vCPU 且只增不减地
    在 `handle_pause` 里长**（`vmx.c:1417-1431`），回落只发生在
    `vmx_vcpu_load()` 里 `vcpu->scheduled_out && !kvm_pause_in_guest()` 时
-   （`vmx.c:1519-1523`，**唯一**触发点）。**同一进程内跨档比较一定被上一档污染**
+   （`vmx.c:1520-1522`，**唯一**触发点）。**同一进程内跨档比较一定被上一档污染**
    → 每档必须重启 VM。
 5. **`ple_window_shrink` 的想象**：它默认 **0**（`arch/x86/kvm/x86.h:75`），
    0 表示直接回到基值而不是做除法；它**不**由"PAUSE 间隔 > ple_gap"触发

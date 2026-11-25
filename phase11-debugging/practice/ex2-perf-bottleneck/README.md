@@ -23,7 +23,7 @@
 which bpftrace || apt install bpftrace
 
 # 启动测试 VM
-cd ../../scripts/vm/
+cd ../../../scripts/vm/
 ./boot-vm.sh ubuntu --memory 2G --cpus 2
 ```
 
@@ -51,8 +51,8 @@ sudo perf kvm stat report
 ```
 
 **判读**：
-- `EXTERNAL_INTERRUPT` > 40% → 考虑启用 APICv / Posted Interrupts（phase4）
-- `EPT_VIOLATION` > 20% → 检查大页配置，参考 phase9 E2
+- `EXTERNAL_INTERRUPT` > 40% → 考虑启用 APICv / Posted Interrupts（phase5）
+- `EPT_VIOLATION` > 20% → 检查大页配置，参考 phase10 E2
 - `CPUID` > 10% → VMM 应预填充 CPUID 缓存
 - `HLT` 多 → halt-polling 可能低效，检查 `halt_poll_ns` 参数
 
@@ -180,7 +180,7 @@ interval:s:10 {
 
 ## ⚠️ 注意事项
 
-1. **perf kvm stat 必须 -a**：用 `-p $PID` 会丢 vCPU 线程数据
+1. **perf kvm stat 用 `-a`**：统一 system-wide 口径，避免把"没采到"读成"没有退出"（`-p` 并非丢线程，见 `../../corrections.md` C19）
 2. **bpftrace 需要 root**：`sudo bpftrace`
 3. **tracefs 全局状态**：用 `>>` 追加事件，用 `: >` 清场
 4. **性能影响**：bpftrace 开销小，但 function_graph 开销大
@@ -192,4 +192,5 @@ interval:s:10 {
 - 性能分析: `../../performance-analysis.md` §3
 - KVM trace events: `../../annotations.md` §1
 - bpftrace 脚本集: `../../annotations.md` §6
-- halt-polling 机制: `../../phase10-performance/annotations.md` §1
+- halt-polling 机制: `../../../phase10-performance/annotations.md` §1
+- 参数默认值/权限: `../../../phase10-performance/parameters.md` §1（本章不复制数字）

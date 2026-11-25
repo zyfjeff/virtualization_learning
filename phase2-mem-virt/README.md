@@ -93,14 +93,22 @@ guest OS 用自己的页表把 GVA→GPA，它以为 GPA 就是物理地址。�
 - **EPT（硬件）**：硬件做第二层 GPA→HPA，guest 页表自治（改动不 trap），
   只有 EPT 缺页/权限违规才 VM-Exit。用硬件换"guest 自治 + 按需 trap"。
 - **取舍**：EPT 省了 guest PT 同步开销，代价是 EPT violation 处理 + TLB 失效
-  （INVEPT/VPID）+ 两级 walk 最多 24 次内存访问（大页缓解）。
+  （INVEPT/VPID）+ 两级 walk 的访存放大（大页缓解）。倍数关系是确定的，绝对次数
+  取决于计数口径，见下。
 
 ### 机制全景：二级翻译
 
 ```
 GVA → [Guest PT, guest CR3] → GPA → [EPT, VMCS.EPTP] → HPA
-      4-level guest PT × 4-level EPT = 最多 24 次内存访问（无大页）
 ```
+
+4 级 guest 页表 × 4 级 EPT、无大页、无缓存命中时的访存放大：guest 侧每读一条
+分页结构项（PML4E/PDPE/PDE/PTE，共 4 次），本身是一次 GPA 访问，需要 EPT 走 4 级
+（4 次）再取目标（1 次）＝ 5 次，4 级共 20 次；最后访问目标页本身再 4 + 1 = 5 次。
+合计 **25 次**（若不计最终那次数据访问本身，则为 24 次 —— 流传的"最多 24 次"是这个
+口径；本仓库 `intel-vmx.pdf` 是 Vol 3C（ch24–33），其中并无该数字，属机制推算）。
+**待实测**：实际倍数由 EPT/VPID 缓存命中率决定，
+量化见 [phase10](../phase10-performance/index.md)，本章不复制数字。
 
 EPT walk 失败 → VM-Exit（EPT Violation, reason 48）：
 
@@ -110,7 +118,18 @@ EPT walk 失败 → VM-Exit（EPT Violation, reason 48）：
 | 权限违规 | 访问类型与权限不符 | 脏页/访问位更新 |
 | Misconfiguration | 保留位组合（W+X 无 R） | **MMIO 机制**：故意设无效组合，handle_ept_misconfig 识别模拟 |
 
-EPTP（VMCS）指向 EPT 根：bits 2:0 级数（0=4 级）、bit 6 A/D 启用、bits 51:48 内存类型。
+EPTP（VMCS 字段，SDM Vol 3C §25.6.11 Table 25-9）的位段，**内存类型在最低位，不是地址**：
+
+| 位 | 含义 | 内核宏 |
+|---|---|---|
+| 2:0 | EPT paging-structure 内存类型：0 = UC、6 = WB，其余保留 | `VMX_EPTP_MT_MASK 0x7ull`（`vmx.h:531`，注释"encoded in bits 2:0, doesn't need to be shifted"）、`VMX_EPTP_MT_WB = X86_MEMTYPE_WB = 6`（`msr-index.h:50`） |
+| 5:3 | **页表级数减 1**：4 级 = `3`、5 级 = `4`（0/1/2 保留） | `VMX_EPTP_PWL_MASK 0x38ull`、`PWL_4 0x18ull`、`PWL_5 0x20ull`（`vmx.h:526-528`） |
+| 6 | 启用 EPT A/D 标志 | `VMX_EPTP_AD_ENABLE_BIT (1ull << 6)`（`vmx.h:529`） |
+| 7 | supervisor shadow-stack 访问权限强制 | — |
+| 11:8 | 保留 | — |
+| N-1:12 | EPT 根表（PML4/PML5）的物理地址，N = 物理地址宽度 | `eptp |= root_hpa;`（`construct_eptp()`，`vmx.c:3411-3423`） |
+| 63:N | 保留 | — |
+
 SPTE 位定义、make_spte、原子更新的逐行精读见 [annotations.md](annotations.md)。
 
 ---
@@ -159,6 +178,12 @@ SPTE 位定义、make_spte、原子更新的逐行精读见 [annotations.md](ann
 ---
 
 ## ⚡ 性能与测量
+
+> **本章所有正文里的 ns/μs/倍数一律是机制推算，不是实测**。包括
+> `ept-violation-handling.md`（"10-100 倍"、"10-20%"、"~200 ns"、"~1 ns"、"2-5 μs"）与
+> `tdp-mmu-concurrency.md`（同组数字）。按 AGENTS.md 的性能单一来源规则，
+> 需要数字请指向 [phase10](../phase10-performance/index.md)；本章只留机制与口径。
+> 已登记在 [`corrections.md`](corrections.md) 勘误 2。
 
 - 实测结论与分级：[`../phase10-performance/index.md`](../phase10-performance/index.md)
 - 测量方法：[`../phase10-performance/measurement.md`](../phase10-performance/measurement.md)

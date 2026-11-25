@@ -1,156 +1,118 @@
 # vhost 架构与核心数据结构
 
-> Phase 5 深度主题 | 从 README.md 拆出，正文内容未作改动
+> Phase 6 深度主题 | 2026-11-25 事实核查重写（原版结构体/协作机制虚构，见 corrections.md）
+> 源码基线：Linux 6.12.93 `drivers/vhost/`
 
 ---
 
-## 📐 vhost架构
+## 📐 vhost 架构
 
 ### 整体架构
 
 ```
-┌─ QEMU用户态 ─────────────────────────────────────────────┐
-│                                                           │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐   │
-│  │ 设备控制面  │  │ vhost控制面   │  │ virtio设备   │   │
-│  │ (配置/管理) │  │ (ioctl调用)   │  │ (virtqueue)  │   │
-│  └──────┬──────┘  └──────┬───────┘  └──────┬───────┘   │
-│         │                │                  │            │
-│         └────────────────┼──────────────────┘            │
-│                          │                               │
-│              ioctl(VHOST_*)                               │
-│                          │                               │
-└──────────────────────────┼───────────────────────────────┘
-                           │
+┌─ QEMU 用户态 ────────────────────────────────────────────┐
+│  设备控制面（配置/管理）+ vhost 控制面（ioctl VHOST_*）    │
+│  virtio 设备（virtqueue 在 guest 内存）                   │
+└──────────────────────────┬───────────────────────────────┘
+                           │ ioctl(VHOST_*) + eventfd
                            ▼
-┌──────────────────────────────────────────────────────────┐
-│              vhost内核模块                                 │
-│                                                           │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │  vhost核心框架 (vhost.c)                           │ │
-│  │  ├── vhost_dev: vhost设备结构                      │ │
-│  │  ├── vhost_virtqueue: vhost虚拟队列                │ │
-│  │  └── vhost_worker: vhost工作线程                   │ │
-│  └────────────────────────────────────────────────────┘ │
-│                                                           │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │  vhost-net (net.c)                                 │ │
-│  │  ├── 网络数据面处理                                │ │
-│  │  ├── TAP设备集成                                   │ │
-│  │  └── TX/RX路径                                     │ │
-│  └────────────────────────────────────────────────────┘ │
-│                                                           │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │  vhost-scsi (scsi.c)                               │ │
-│  │  ├── SCSI命令处理                                  │ │
-│  │  └── 块设备集成                                    │ │
-│  └────────────────────────────────────────────────────┘ │
-│                                                           │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │  vhost-vsock (vsock.c)                             │ │
-│  │  └── VM间通信                                      │ │
-│  └────────────────────────────────────────────────────┘ │
+┌─ vhost 内核模块 ─────────────────────────────────────────┐
+│  vhost 核心框架 (vhost.c)：vhost_dev / vhost_virtqueue /  │
+│                            vhost_worker（per-device）     │
+│  vhost-net (net.c)：网络数据面 + TAP/socket 集成 TX/RX    │
+│  vhost-scsi (scsi.c) / vhost-vsock (vsock.c)              │
 └──────────────────────────────────────────────────────────┘
 ```
 
-### vhost与KVM的协作
+### vhost 与 KVM 的协作（★ 经 eventfd，不直接调 KVM 符号）
+
+**关键事实**：`grep -rn kvm drivers/vhost/*.c` **零命中**——vhost 不依赖 KVM 符号，
+两者通过 **eventfd** 解耦协作：
 
 ```
-vhost与KVM协作:
+中断（host→guest）：
+  vhost_signal()（vhost.c:3036）→ eventfd_signal(vq->call_ctx.ctx)
+    → KVM irqfd（virt/kvm/eventfd.c:49-51）→ kvm_set_irq() 注入 guest
+  （vhost 只 signal eventfd，kvm_set_irq 是 KVM irqfd 侧调的，不是 vhost 直接调）
 
-┌─ QEMU ───────────────────────────────────────────────────┐
-│  1. 创建VM: ioctl(KVM_CREATE_VM)                        │
-│  2. 创建vCPU: ioctl(KVM_CREATE_VCPU)                    │
-│  3. 创建vhost-net: ioctl(VHOST_NET_SET_BACKEND)         │
-│  4. 关联vhost到VM: ioctl(KVM_SET_USER_MEMORY_REGION)    │
-│  5. 设置中断路由: ioctl(KVM_SET_GSI_ROUTING)            │
-└──────────────────────────────────────────────────────────┘
+通知（guest→host）：
+  guest kick → KVM ioeventfd（virt/kvm/eventfd.c）→ eventfd_signal
+    → vhost poll 唤醒 → handle_kick（handle_tx_kick/handle_rx_kick）
 
-┌─ KVM ────────────────────────────────────────────────────┐
-│  ├── struct kvm: VM实例                                  │
-│  ├── struct kvm_vcpu: 虚拟CPU                            │
-│  └── struct kvm_memory_slot: 内存slot                    │
-└──────────────────────────────────────────────────────────┘
-         │
-         │ vhost访问KVM资源
-         │
-┌─ vhost ──────────────────────────────────────────────────┐
-│  ├── 访问Guest内存: 通过KVM的memslot (GPA→HVA→HPA)     │
-│  ├── 注入中断: 直接调用kvm_set_irq() (无需ioctl!)       │
-│  ├── 唤醒vCPU: 直接调用kvm_vcpu_kick()                  │
-│  └→ 全程内核态，无系统调用!                              │
-└──────────────────────────────────────────────────────────┘
+guest 内存访问：
+  走 vhost 自己的 vhost_iotlb，不是 KVM memslot：
+  VHOST_SET_MEM_TABLE → vhost_set_memory()（vhost.c:1965）
+    → vhost_iotlb_add_range()（vhost.c:2000）
+  查表在 translate_desc()（vhost.c:1316/2624）内 vhost_iotlb_itree_first()
 ```
+
+> QEMU 侧仍负责 KVM_CREATE_VM/VCPU、KVM_SET_USER_MEMORY_REGION、KVM_SET_GSI_ROUTING、
+> 注册 irqfd/ioeventfd；vhost 侧只认 eventfd 与自己的 iotlb。详见 [annotations.md](annotations.md) §9。
 
 ---
 
-## 🔧 vhost核心数据结构
+## 🔧 vhost 核心数据结构（真实源码）
 
-### 1. struct vhost_dev - vhost设备
+### 1. struct vhost_dev — vhost 设备（`drivers/vhost/vhost.h:174`）
 
 ```c
-/* 来源: drivers/vhost/vhost.h */
-
+/* 来源: drivers/vhost/vhost.h:174-203（节选关键字段） */
 struct vhost_dev {
-    struct mm_struct *mm;             /* 用户空间内存映射 */
-    struct mutex control_lock;        /* 控制面锁 */
-    struct mutex vq_mutex;            /* virtqueue锁 */
-    
-    /* === virtqueue管理 === */
-    long nvqs;                        /* virtqueue数量 */
-    struct vhost_virtqueue **vqs;     /* virtqueue数组 */
-    
-    /* === 工作线程 === */
-    struct vhost_worker *worker;      /* vhost工作线程 */
-    struct task_struct *worker_task;  /* 工作线程task_struct */
-    
-    /* === 日志 === */
-    struct vhost_log *log;            /* 脏页日志 */
-    u64 log_size;                     /* 日志大小 */
-    
-    /* === 特性 === */
-    u64 features;                     /* 协商的特性 */
-    
-    /* === KVM关联 === */
-    struct kvm *kvm;                  /* 关联的KVM VM */
-    
-    /* ... 省略其他字段 ... */
+    struct mm_struct *mm;             /* _owner_ 进程内存（非 guest） */
+    struct mutex mutex;               /* 设备级锁（不是 control_lock/vq_mutex） */
+    struct vhost_virtqueue **vqs;     /* virtqueue 数组 */
+    int nvqs;                         /* virtqueue 数量（int，不是 long） */
+    struct eventfd_ctx *log_ctx;      /* 脏页日志 eventfd */
+    struct vhost_iotlb *umem;         /* 用户内存映射（GPA→HVA） */
+    struct vhost_iotlb *iotlb;        /* IOMMU 映射（IOVA→HVA） */
+    spinlock_t iotlb_lock;
+    struct xarray worker_xa;          /* worker 管理（不是 worker_task 指针） */
+    bool use_worker;
+    bool fork_owner;                  /* true=vhost_task 继承 owner cgroup */
+    int (*msg_handler)(struct vhost_dev *dev, u32 asid,
+                       struct vhost_iotlb_msg *msg);
 };
 ```
 
-### 2. struct vhost_virtqueue - vhost虚拟队列
+> ⚠️ 旧版文档写的 `control_lock`/`vq_mutex`/`worker_task`/`log_size`/`features`/`struct kvm *kvm`
+> 字段在 6.12.93 **均不存在**（已更正）。vhost_dev 不持有 kvm 指针。
+
+### 2. struct vhost_virtqueue — vhost 虚拟队列（`drivers/vhost/vhost.h:93`）
 
 ```c
-/* 来源: drivers/vhost/vhost.h */
-
+/* 来源: drivers/vhost/vhost.h:93-163（节选关键字段） */
 struct vhost_virtqueue {
-    struct vhost_dev *dev;            /* 所属vhost设备 */
-    
-    /* === virtqueue索引 === */
-    int index;                        /* virtqueue索引 (0=RX, 1=TX) */
-    
-    /* === virtio ring === */
-    struct vring desc;                /* 描述符表 (Guest内存) */
-    struct vring avail;               /* avail ring (Guest内存) */
-    struct vring used;                /* used ring (Guest内存) */
-    
-    /* === 状态 === */
-    u16 last_avail_idx;               /* 上次处理的avail索引 */
-    u16 last_used_idx;                /* 上次写入的used索引 */
-    bool signalled_used;              /* 是否已通知Guest */
-    
-    /* === 通知 === */
-    struct eventfd_ctx *call_ctx;     /* Guest→Host通知 (kick) */
-    struct eventfd_ctx *kick_ctx;     /* Host→Guest通知 (中断) */
-    
-    /* === 工作队列 === */
-    struct llist_head work_list;      /* 待处理工作列表 */
-    
-    /* === KVM中断注入 === */
-    struct kvm_vcpu *vcpu;            /* 关联的vCPU (用于中断注入) */
-    
-    /* ... 省略其他字段 ... */
+    struct vhost_dev *dev;
+    struct vhost_worker __rcu *worker;
+    struct mutex mutex;
+    unsigned int num;                 /* 队列深度 */
+    vring_desc_t __user *desc;        /* 描述符表（guest 内存，__user 指针） */
+    vring_avail_t __user *avail;      /* avail ring（guest 内存） */
+    vring_used_t __user *used;        /* used ring（guest 内存） */
+    struct file *kick;                /* guest→host 通知（ioeventfd） */
+    struct vhost_vring_call call_ctx; /* host→guest 中断（irqfd，含 ctx） */
+    struct eventfd_ctx *error_ctx;
+    vhost_work_fn_t handle_kick;      /* kick 处理函数 */
+    u16 last_avail_idx;               /* 上次处理的 avail 索引 */
+    u16 last_used_idx;                /* 上次写入的 used 索引 */
+    u16 signalled_used;               /* 上次通知 guest 的 used 索引 */
+    struct iovec iov[UIO_MAXIOV];     /* 数据面 iov（建 iter 用） */
+    struct vhost_iotlb *umem;         /* 地址翻译 */
+    struct vhost_iotlb *iotlb;
+    u64 acked_features;               /* 协商特性（在 vq 上，不是 dev） */
+    bool is_le;                       /* ring 字节序 */
+    u32 busyloop_timeout;
 };
 ```
 
+> ⚠️ 方向别搞反：`kick`（struct file*）是 **guest→host**；`call_ctx` 是 **host→guest** 中断。
+> 旧版把 `call_ctx`/`kick_ctx` 方向写反、且虚构 `int index`/`struct vring desc`/`struct kvm_vcpu *vcpu`
+> 字段（已更正）。ring 是 `__user` 指针（guest 内存），不是嵌入的 `struct vring`。
+
 ---
+
+## 🔗 相关
+
+- 数据面收发路径：[vhost-net-datapath.md](vhost-net-datapath.md)
+- 逐行精读：[annotations.md](annotations.md) §1/§2/§9
+- virtqueue 三环结构：[virtio-queue.md](virtio-queue.md)

@@ -27,9 +27,9 @@ ioctl(fd, KVM_CREATE_VM, type)
     ↓
 kvm_dev_ioctl()                          ← virt/kvm/kvm_main.c:5535
     └─ case KVM_CREATE_VM: → kvm_dev_ioctl_create_vm(arg)  ← kvm_main.c:5546
-        ├─ get_unused_fd_flags(O_CLOEXEC)  ← kvm_main.c:5497
+        ├─ get_unused_fd_flags(O_CLOEXEC)  ← kvm_main.c:5499
         ├─ kvm_create_vm(type, fdname)     ← kvm_main.c:1146-1287
-        │   ├─ kvm_arch_alloc_vm()         ← kvm_main.c:1152   (-ENOMEM)
+        │   ├─ kvm_arch_alloc_vm()         ← kvm_main.c:1148   (-ENOMEM)
         │   ├─ kvm_arch_init_vm()          ← kvm_main.c:1224  (x86.c:12803)
         │   │   ├─ 检查 type                ← x86.c:12808      (-EINVAL)
         │   │   └─ kvm_page_track_init()    ← x86.c:12819      (-ENOMEM)
@@ -37,7 +37,7 @@ kvm_dev_ioctl()                          ← virt/kvm/kvm_main.c:5535
         │   │   ├─ 系统关机中？              ← kvm_main.c:5722  (-EBUSY)
         │   │   └─ cpuhp_setup_state → VMXON ← kvm_main.c:5611 (-EIO)
         │   └─ ... (MMU notifier, debugfs 等)
-        └─ anon_inode_getfile("kvm-vm")    ← kvm_main.c:5507
+        └─ anon_inode_getfile("kvm-vm")    ← kvm_main.c:5511
 ```
 
 ### 1.2 错误码分析
@@ -49,7 +49,7 @@ kvm_dev_ioctl()                          ← virt/kvm/kvm_main.c:5535
 | `-ENOMEM` | `kvm_main.c:1217-1221` | `kvm_io_bus` kzalloc 失败 |
 | `-EINVAL` | `x86.c:12808` | 不支持的 VM type（只接受 `KVM_X86_DEFAULT_VM` 和 `KVM_X86_SW_PROTECTED_VM`） |
 | `-ENOMEM` | `x86.c:12819` | `kvm_page_track_init()` 失败 |
-| `-EBUSY` | `kvm_main.c:5722` | 系统正在关机（`system_state == SYSTEM_HALTING`） |
+| `-EBUSY` | `kvm_main.c:5722-5724` | 系统正在关机。★ 判据是 `system_state == SYSTEM_HALT \|\| SYSTEM_POWER_OFF \|\| SYSTEM_RESTART`，内核里**没有 `SYSTEM_HALTING` 这个枚举值**（`include/linux/kernel.h:183-192`） |
 | `-EIO` | `kvm_main.c:5611` | VMXON 在某个 CPU 上失败 — VT-x 未启用或 BIOS 禁用 |
 
 ### 1.3 诊断方法
@@ -89,9 +89,11 @@ sudo strace -e trace=ioctl qemu-system-x86_64 -enable-kvm ... 2>&1 | grep KVM_CR
 **Step 4：检查系统状态**
 
 ```bash
-# 系统是否在关机
-cat /proc/sys/kernel/system_state
-# 预期: running
+# 系统是否在关机：★ 没有 /proc/sys/kernel/system_state 这个文件
+#（内核没把它注册成 sysctl；本机实测 No such file or directory）。
+# system_state 是内核内部变量（include/linux/kernel.h:183-192），用户态只能间接判断：
+dmesg | tail -20 | grep -i 'reboot\|halt\|power off'   # 是否已进入关机流程
+cat /proc/loadavg                                      # 辅助判断系统是否还在正常调度
 
 # 检查 VT-x 是否启用
 grep -o 'vmx' /proc/cpuinfo | head -1
@@ -127,27 +129,38 @@ kvm_vm_ioctl()                           ← virt/kvm/kvm_main.c:5160
         ├─ kvm_arch_vcpu_precreate()       ← kvm_main.c:4241  (x86.c:12349)
         │   ├─ id >= max_vcpu_ids ?         ← x86.c:12358    (-EINVAL)
         │   └─ vmx_vcpu_precreate()        ← x86.c:12361    (-ENOMEM)
-        ├─ kmem_cache_zalloc(vcpu_cache)   ← kvm_main.c:4251  (-ENOMEM)
-        ├─ alloc_page(vcpu->run)           ← kvm_main.c:4258  (-ENOMEM)
-        ├─ kvm_arch_vcpu_create()          ← kvm_main.c:4267  (x86.c:12364)
-        │   ├─ kvm_mmu_create()            ← x86.c:12381    (-ENOMEM)
-        │   ├─ kvm_create_lapic()          ← x86.c:12385    (-ENOMEM)
-        │   └─ vmx_vcpu_create()           ← x86.c:12435    (vmx.c:7514)
+        ├─ kmem_cache_zalloc(kvm_vcpu_cache) ← kvm_main.c:4250  (-ENOMEM)
+        ├─ alloc_page(vcpu->run)           ← kvm_main.c:4257  (-ENOMEM)
+        ├─ kvm_arch_vcpu_create()          ← kvm_main.c:4266  (x86.c:12364)
+        │   ├─ kvm_mmu_create()            ← x86.c:12380    (-ENOMEM)
+        │   ├─ kvm_create_lapic()          ← x86.c:12384    (-ENOMEM)
+        │   └─ vmx_vcpu_create()           ← x86.c:12434    (vmx.c:7514)
         │       ├─ allocate_vpid()          ← vmx.c:7527     (-ENOMEM)
-        │       ├─ alloc_page(PML)          ← vmx.c:7537     (-ENOMEM)
+        │       ├─ alloc_page(PML)          ← vmx.c:7536     (-ENOMEM)
         │       └─ alloc_loaded_vmcs()      ← vmx.c:7554     (-ENOMEM)
         │           └─ alloc_vmcs()         ← vmx.c:2947     (-ENOMEM)
-        ├─ kvm_dirty_ring_alloc()          ← kvm_main.c:4273
+        ├─ kvm_dirty_ring_alloc()          ← kvm_main.c:4271
         └─ kvm_get_vcpu_by_id(duplicate) ? ← kvm_main.c:4285  (-EEXIST)
 ```
 
 ### 2.2 限制常量
 
 ```c
-/* arch/x86/include/asm/kvm_host.h:51-53 */
-#define KVM_MAX_VCPUS      CONFIG_KVM_MAX_NR_VCPUS   /* 默认 1024 */
-#define KVM_MAX_VCPU_IDS (KVM_MAX_VCPUS * KVM_VCPU_ID_RATIO)  /* x86 允许稀疏 ID */
+/* 来源: arch/x86/include/asm/kvm_host.h:49-54（KVM_MAX_VCPUS）与 :65-66（比例/ID 上限）
+ * 注意这两组 define 不相邻，不能写成 :51-53 一段。 */
+#ifdef CONFIG_KVM_MAX_NR_VCPUS
+#define KVM_MAX_VCPUS CONFIG_KVM_MAX_NR_VCPUS      /* :51 */
+#else
+#define KVM_MAX_VCPUS 1024                         /* :53，KVM=n 时的占位 */
+#endif
+
+#define KVM_VCPU_ID_RATIO 4                        /* :65 */
+#define KVM_MAX_VCPU_IDS (KVM_MAX_VCPUS * KVM_VCPU_ID_RATIO)  /* :66 */
 ```
+
+`CONFIG_KVM_MAX_NR_VCPUS` 的 Kconfig 默认值是 **1024**（`MAXSMP` 时为 4096），
+范围 1024-4096（`arch/x86/kvm/Kconfig`，`config KVM_MAX_NR_VCPUS`）。
+也就是说默认 `KVM_MAX_VCPU_IDS = 1024 * 4 = 4096`。
 
 ### 2.3 错误码分析
 
@@ -157,8 +170,8 @@ kvm_vm_ioctl()                           ← virt/kvm/kvm_main.c:5160
 | `-EINVAL` | `kvm_main.c:4236` | 已创建 vCPU 数 >= `max_vcpus`（默认 1024） |
 | `-EINVAL` | `x86.c:12358` | ID >= `kvm->arch.max_vcpu_ids`（可通过 `KVM_CAP_MAX_VCPU_ID` 调整） |
 | `-EEXIST` | `kvm_main.c:4285` | 重复的 vCPU ID |
-| `-ENOMEM` | `kvm_main.c:4251` | vCPU 结构体分配失败 |
-| `-ENOMEM` | `kvm_main.c:4258` | `vcpu->run` 页分配失败 |
+| `-ENOMEM` | `kvm_main.c:4250` | vCPU 结构体分配失败 |
+| `-ENOMEM` | `kvm_main.c:4257` | `vcpu->run` 页分配失败 |
 | `-ENOMEM` | `vmx.c:2947` | VMCS 分配失败 — VMXON region 不可用或内存不足 |
 | `-ENOMEM` | `vmx.c:7527` | VPID 耗尽 — 已创建过多 vCPU |
 | `-ENOMEM` | `x86.c:12381-12435` | MMU / LAPIC / FPU / emulate context 分配失败 |
@@ -223,7 +236,7 @@ echo 1 > /sys/module/kvm_intel/parameters/dump_invalid_vmcs
 dmesg | grep -A30 'VMCS'
 ```
 
-`dump_vmcs()`（`vmx.c:6239-6397`）在 `dump_invalid_vmcs=1` 时打印：
+`dump_vmcs()`（`vmx.c:6239-6430`）在 `dump_invalid_vmcs=1` 时打印：
 - Guest 状态：CR0/CR3/CR4、RSP/RIP/RFLAGS、所有段选择子、GDTR/IDTR、EFER
 - Host 状态：RIP/RSP、段选择子、CR0/CR3/CR4
 - 控制字段：CPU-based controls、VM-entry/exit controls、exception bitmap
@@ -282,41 +295,40 @@ static void dump_vmcs(struct kvm_vcpu *vcpu)
 
 ### 4.4 输出内容
 
-启用后，`dump_vmcs` 通过 `pr_err` 打印（可从 `dmesg` 查看）：
+启用后，`dump_vmcs` 通过 `pr_err` 打印（可从 `dmesg` 查看）。
+**下面的标签逐条照 `vmx.c` 的格式串抄**，grep 时请照这些字符串写，
+别照旧文档里那些"看着像"的名字（`host_mask` / `ProcBased` / `Exit reason` 都印不出来）：
 
-**Guest 状态**：
 ```
-*** Guest State ***
-CR0: actual=0x0000000000000011 shadow=0x0000000000000011 host_mask=0x...
-CR4: actual=0x0000000000002000 shadow=0x0000000000002000 host_mask=0x...
-CR3: 0x0000000000001000
-RSP: 0x0000000000007c00  RIP: 0x000000000000fff0
-RFLAGS: 0x0000000000000002  DR7: 0x0000000000000400
-CS: sel=0xf000 attr=0x0009b limit=0xffff base=0xffff0000
-DS: sel=0x0000 attr=0x00093 limit=0xffff base=0x00000000
-...
-EFER: 0x0000000000000000
+VMCS <ptr>, last attempted VM-entry on CPU <n>       ← vmx.c:6269
+*** Guest State ***                                   ← vmx.c:6271
+CR0: actual=0x..., shadow=0x..., gh_mask=0x...        ← vmx.c:6272（★ 是 gh_mask，不是 host_mask）
+CR4: actual=0x..., shadow=0x..., gh_mask=0x...        ← vmx.c:6274
+CR3 = 0x...                                           ← vmx.c:6276
+RSP = 0x...  RIP = 0x...                              ← vmx.c:6284
+RFLAGS=0x...         DR7 = 0x...                      ← vmx.c:6286
+CS:   sel=0x..., attr=0x..., limit=0x..., base=0x...  ← vmx_dump_sel(), vmx.c:6213-6214
+GDTR: limit=0x..., base=0x...                         ← vmx_dump_dtsel(), vmx.c:6222-6223
+EFER= 0x...                                           ← vmx.c:6303（Guest 段）
+*** Host State ***                                    ← vmx.c:6335
+RIP = 0x...  RSP = 0x...
+CS=... SS=... DS=... ES=... FS=... GS=... TR=...
+CR0=... CR3=... CR4=...
+EFER= 0x...                                           ← vmx.c:6356（Host 段）
+*** Control State ***                                 ← vmx.c:6366
+CPUBased=0x... SecondaryExec=0x... TertiaryExec=0x... ← ★ 不是 ProcBased/Proc2Based
+PinBased=0x... EntryControls=... ExitControls=...     ← ★ 不是 Entry=/Exit=
+ExceptionBitmap=... PFECmask=... PFECmatch=...        ← ★ 不是 "Exception bitmap="
+VMEntry: intr_info=... errcode=... ilen=...
+VMExit: intr_info=... errcode=... ilen=...
+        reason=... qualification=...                  ← ★ 只有数字，不印 EXIT_REASON_* 符号名
+IDTVectoring: info=... errcode=...
+TSC Offset = 0x...
 ```
 
-**Host 状态**：
-```
-*** Host State ***
-RIP: 0xffffffffc0...  RSP: 0xffffffff...
-CR0: 0x80050033  CR3: 0x...  CR4: 0x...
-...
-```
-
-**控制字段**：
-```
-*** Control State ***
-PinBased=0x...  ProcBased=0x...  Proc2Based=0x...
-Entry=0x...  Exit=0x...
-Exception bitmap=0x...
-VM-entry intr info=0x...  VM-exit intr info=0x...
-Exit reason=0x... (EXIT_REASON_...)
-Exit qualification=0x...
-IDT vectoring info=0x...
-```
+> ★ 想按符号名看退出原因，`dump_vmcs` 里没有；要么用 `kvm:kvm_exit` tracepoint
+> （`TP_printk` 才翻译成符号名，见 `annotations.md` §1），要么自己拿
+> `reason=0x...` 的低 16 位去查 `arch/x86/include/uapi/asm/vmx.h:32-95`。
 
 ---
 
@@ -385,7 +397,15 @@ dmesg | grep -i vmx       # VMXON 是否成功
 
 ### 6.2 VM-Entry 失败（KVM_EXIT_FAIL_ENTRY）
 
-**症状**：QEMU 报错 `KVM_RUN failed: Argument list too long`
+**症状**：QEMU stderr 打印 `KVM: entry failed, hardware error 0x...`
+
+> ★ 旧文档写的是 `KVM_RUN failed: Argument list too long`，这不对：
+> `KVM_EXIT_FAIL_ENTRY` 是经 `run->exit_reason` 上报的**正常 ioctl 返回**
+> （`vmx.c:6510-6515` 里 ioctl 返回 0），不是 ioctl 失败，
+> 也就不会有 `strerror(-E2BIG)` = "Argument list too long"。
+> QEMU 侧的打印在 `target/i386/kvm/kvm.c:6096-6099`
+> （`fprintf(stderr, "KVM: entry failed, hardware error 0x%" PRIx64 "\n", ...)`），
+> 且当 reason 是 `VMX_INVALID_GUEST_STATE` 时还会补一段 unrestricted-mode 提示。
 
 **根因**：Guest 状态无效（CR0/CR4/段选择子错误）
 
@@ -446,7 +466,7 @@ dmesg | grep -i vmxon     # "VMXON failed" → 检查 BIOS
 - kvm_arch_vcpu_create 源码：`arch/x86/kvm/x86.c:12364-12443`
 - vmx_vcpu_create 源码：`arch/x86/kvm/vmx/vmx.c:7514-7632`
 - dump_invalid_vmcs 参数：`arch/x86/kvm/vmx/vmx.c:133-134`
-- dump_vmcs 函数：`arch/x86/kvm/vmx/vmx.c:6239-6397`
+- dump_vmcs 函数：`arch/x86/kvm/vmx/vmx.c:6239-6430`
 - KVM_EXIT_FAIL_ENTRY 设置：`arch/x86/kvm/vmx/vmx.c:6508-6524`
 - vCPU 退出诊断：`vcpu-exit-diagnosis.md`
 - 性能分析：`performance-analysis.md`

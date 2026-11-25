@@ -58,13 +58,45 @@ Container
 ### IOMMUFD 模型（支持嵌套）
 
 ```
-IOAS (统一管理)
-  ├─ Parent HWPT (stage 2, HPA → PA)
-  └─ Nested HWPT (stage 1, GPA → HPA)
-       └─ Group
+IOAS (软件账本)
+  └─ Parent HWPT = nest_parent 的 paging HWPT
+       ＝ stage-2 页表：输入 GPA → 输出 HPA
+       │
+       └─ Nested HWPT（用户态自备 stage-1 表基址）
+            ＝ stage-1 页表：输入 进程地址/VA → 输出 GPA
 
-翻译链：GPA → (Nested) → HPA → (Parent) → PA
+翻译链（一次设备请求）：
+  VA/IOVA ──stage-1(Nested)──▶ GPA ──stage-2(Parent)──▶ HPA
 ```
+
+**勘误（旧稿把整条链下移了一级）**：原来写的是
+`Parent HWPT (stage 2, HPA → PA)`、`Nested HWPT (stage 1, GPA → HPA)`、
+`翻译链：GPA → (Nested) → HPA → (Parent) → PA`。三处都不对：
+
+| 旧稿 | 正确 | 依据 |
+|---|---|---|
+| stage-1 是 `GPA → HPA` | stage-1 是 **VA/进程地址 → GPA** | VT-d Rev 4.1 §3.6：first-stage 的输入地址必须是 canonical address（4 级 48 位 / 5 级 57 位），也就是 CPU 那套 64 位页表能表示的地址空间 |
+| stage-2 是 `HPA → PA` | stage-2 是 **GPA → HPA** | §3.7：second-stage 输入受 MGAW 检查，输出才是宿主物理地址；**根本不存在 "HPA → PA" 这一层** |
+| 链里第一个输入是 GPA | 第一个输入是 VA | §3.8 (Nested)："requests translated through first-stage translation are also subjected to nested second-stage translation" —— first-stage 先跑，其输出再喂给 second-stage |
+
+对象侧的对应关系（内核 6.12.93）：
+
+- `struct iommufd_hwpt_paging` 里有 `nest_parent` 位（`drivers/iommu/iommufd/iommufd_private.h:301-310`），
+  由 `IOMMU_HWPT_ALLOC_NEST_PARENT`（`include/uapi/linux/iommufd.h:364`）置上；它是**内核管理的
+  那张真实页表**，在 nested 场景承担 **stage-2**。
+- `struct iommufd_hwpt_nested` 只有一个 `parent` 指针（`:312-315`）—— 它自己**不带 IOAS**，
+  只携带用户态递上来的 stage-1 表信息：`struct iommu_hwpt_vtd_s1 { pgtbl_addr; addr_width; flags; }`
+  （`include/uapi/linux/iommufd.h:381-394`，`IOMMU_HWPT_DATA_VTD_S1`）。
+- 一个 IOAS 可以挂多个 paging HWPT：`struct iommufd_ioas.hwpt_list`（`:258-263`），
+  注释明确 `/* Head at iommufd_ioas::hwpt_list */`。所以"一对多"指的是 **IOAS → paging HWPT**，
+  nested HWPT 不在这张表里（它挂 parent，不挂 IOAS）。
+
+### 为什么要分两级
+
+Guest 里跑着自己的 stage-2（Guest 认为的"GPA→HPA"，其实是 L2 的 EPT/二级页表），
+宿主侧把这张表**原样交给硬件**做 stage-1，宿主自己的 stage-2 再把 GPA 落到真 HPA。
+传统 `iommu_domain` 没有"父域"概念，表达不了这个父子关系，所以才需要 IOMMUFD 把
+"页表对象"和"地址空间账本"拆开。
 
 ---
 

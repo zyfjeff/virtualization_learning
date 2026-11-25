@@ -1,6 +1,7 @@
 # vhost-user 协议入门
 
-> Phase 5 深度主题 | 从 README.md 拆出，正文内容未作改动；协议字段速查见 vhost-user-protocol-latest.md
+> Phase 6 深度主题 | 2026-11-25 事实核查修订（修正项见 [corrections.md](corrections.md) 勘误 6）；
+> 协议字段速查见 vhost-user-protocol-latest.md
 
 ---
 
@@ -157,8 +158,16 @@ struct vhost_user_memory_region {
 ```
 ┌─ vhost-user 初始化流程 ────────────────────────────────────┐
 │                                                               │
-│  1. QEMU 启动 vhost-user 后端进程                           │
-│     · 通过 Unix domain socket 连接                          │
+│  1. 后端进程先起，QEMU 只是连上去                          │
+│     · ★ QEMU **不会** fork/exec 后端：`hw/virtio/vhost-user.c` │
+│       里 g_spawn/fork()/execvp/posix_spawn 共 0 命中          │
+│       （QEMU 10.1.0-rc2 与 11.1.0 皆如此）                    │
+│     · 连接由 chardev 建立：-chardev socket,id=char0,path=/tmp/… │
+│     · 谁是 client/server 不固定：docs/interop/vhost-user.rst:38-39 │
+│       "The *front-end* and *back-end* can be either a client      │
+│       (i.e. connecting) or server (listening)"                    │
+│       例：DPDK 侧 rte_vhost_driver_register() 监听 → QEMU 连过去； │
+│           OVS 侧起 socket → 也可由 QEMU `-chardev ...,server=on` 监听 │
 │                                                               │
 │  2. 特性协商                                                │
 │     · QEMU: VHOST_USER_GET_FEATURES                        │

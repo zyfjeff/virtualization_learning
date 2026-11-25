@@ -31,8 +31,11 @@ Linux x86 引导协议见
    - `cmd_line_ptr`（:62，偏移 0228）+ `cmdline_size`（偏移 0238，
      协议 2.06+ 必填）
    - `ramdisk_image` / `ramdisk_size`（:56-57，偏移 0218/021C）；
-     initrd 超过 4 GB 时用 `setup_data` 的 `ext_ramdisk_image/size`
-     （bootparam.h:128-130）
+     initrd 超过 4 GB 时填 **struct boot_params 的直接字段**
+     `ext_ramdisk_image/size`（bootparam.h:128-129，它们是 boot_params 成员、
+     不是 setup_data 条目；内核 `get_ramdisk_image()` 以
+     `(u64)boot_params.ext_ramdisk_image << 32` 拼出 64 位地址，
+     `arch/x86/kernel/setup.c:233-243`）
 3. **加载内核**：载入 `pref_address`（bootparam.h:74，协议 2.10+，可重定位
    内核的首选地址），空间不足再按 `kernel_alignment`（:64）对齐下移；
    大小参考 `init_size`（:75）。
@@ -52,7 +55,16 @@ cmdline 建议：
 在 `kvm-demo.c` 的骨架上调整：
 
 1. `KVM_CREATE_VM` → `KVM_SET_TSS_ADDR` / `KVM_SET_IDENTITY_MAP_ADDR`
-   （VMX 需要这两块宿主保留页，**不能落在 guest RAM 里**）。
+   （api.rst 仍写 "This ioctl is required on Intel-based hosts"
+   （api.rst:1427/:1611），且要求地址在低 4 GB、**不与 memory slot / MMIO 冲突**——
+   按此约定照 QEMU 习惯填没有坏处。但注意 6.12.93 里这两块页只在
+   **unrestricted guest 关闭**时才真正被使用：`vmx_set_tss_addr()` 在
+   `enable_unrestricted_guest` 时直接 `return 0` 不做任何分配
+   （`vmx.c:5110-5111`，URG 默认开 `vmx.c:101`；本机
+   `kvm_intel.unrestricted_guest=Y`），identity map 页也只在
+   `enable_ept && !enable_unrestricted_guest` 时才初始化
+   （`vmx.c:7599`）。即本机配置下这两步实际是 no-op，"VMX 必需"是
+   !URG/旧内核前提）。
 2. **`KVM_CREATE_IRQCHIP` 必须在 `KVM_CREATE_VCPU` 之前**。内核硬拒反序：
    `kvm->created_vcpus` 非零直接 `-EINVAL`
    （`arch/x86/kvm/x86.c:7090-7099`，case 主体依次
@@ -70,11 +82,20 @@ cmdline 建议：
    `KVM_GET_VCPU_MMAP_SIZE`（`kvm_main.c:5552`）→ mmap `struct kvm_run`。
 2. `KVM_SET_CPUID2`（case @ `x86.c:5957`）。推荐直接以
    `KVM_GET_SUPPORTED_CPUID` 的返回为底，只改下面几处，别整表重写：
-   - **leaf1 ECX bit24 `X86_FEATURE_TSC_DEADLINE_TIMER` 必须保留**：
-     `kvm_vcpu_after_set_cpuid()` 依它把 `timer_mode_mask` 设成 `3<<17`，否则只给
-     `1<<17`（`cpuid.c:399-402`）——guest 写 LVT Timer 的 deadline 位(bit18)
-     会被 `lapic.c:2391` 掩掉，TSC-deadline 模式设不上。这是
-     `../phase8-timer-virt/practice/` 实验 3 实测踩过的坑（该 README
+   - **leaf1 ECX bit24 `X86_FEATURE_TSC_DEADLINE_TIMER` 必须自己置位**
+     （与下面 bit31 同理——`KVM_GET_SUPPORTED_CPUID` 根本没有这一位）：
+     `cpuid.c:647-660` 的 `kvm_cpu_cap_mask(CPUID_1_ECX, …)` 白名单在 bit24
+     处显式为 `0 /* Reserved*/`，全树无任何 `kvm_cpu_cap_set(X86_FEATURE_TSC_DEADLINE_TIMER)`，
+     而 `cpuid.h:61-68` 用 kvm_cpu_caps 整体覆盖 ECX——所以 supported CPUID
+     的 bit24 恒 0（本机实测 ECX=`0x76fab223`，bit24=0）。QEMU 同样是自己补的：
+     `target/i386/kvm/kvm.c:461-467` 注释 "tsc-deadline flag is not returned
+     by GET_SUPPORTED_CPUID"，门槛是 `KVM_CAP_TSC_DEADLINE_TIMER`
+     （恒 1，`x86.c:4652` 在无条件 `r = 1` 的 case 组里；本机实测=1）+
+     in-kernel irqchip。VMM 置位后 `kvm_vcpu_after_set_cpuid()` 才会把
+     `timer_mode_mask` 设成 `3<<17`，否则只有 `1<<17`（`cpuid.c:399-402`）
+     ——guest 写 LVT Timer 的 deadline 位(bit18) 会被 `lapic.c:2391` 掩掉，
+     TSC-deadline 模式设不上。`../phase8-timer-virt/practice/` 实验 3 即
+     手动置 `1u<<24`（`experiment3-lapic.c:125`）；该坑为其实测踩过（该 README
      §前置条件 ②，细节勘误见 `../phase8-timer-virt/corrections.md`）。
    - **leaf1 ECX bit31 `X86_FEATURE_HYPERVISOR` 必须自己置位**：
      `KVM_GET_SUPPORTED_CPUID` 的返回里没有它（本机实测 ECX=`0x76fab223`，
@@ -82,9 +103,12 @@ cmdline 建议：
      门槛。缺了就没有 `Hypervisor detected: KVM`，kvmclock/PV 全灭。
      定义 `cpufeatures.h:144`。guest 内核侧另需 `CONFIG_HYPERVISOR_GUEST` /
      `CONFIG_KVM_GUEST`（见 `scripts/vm/kernel-config`）。
-   - **leaf1 EBX[31:24] 初始 APIC ID 归零、EBX[23:16] 改 1**：宿主透传值
-     （本机 0x60）与 in-kernel LAPIC 的 ID 0 不符，guest 会打
-     `[Firmware Bug]: ... APIC ID mismatch`（`topology_common.c:174-176`）。
+   - **leaf1 EBX[31:24] 初始 APIC ID 归零、EBX[23:16] 改 1**：leaf1 的 EBX
+     是宿主 CPUID 原样透传（`cpuid.c:974-979`，`get_cpu()` + `do_host_cpuid()`，
+     EBX 不在 override 白名单内），[31:24] 取决于**执行 ioctl 的那个核**——
+     本机按核实测 `0x00`–`0x74` 浮动，并非机器常数——一般与 in-kernel LAPIC 的
+     ID 0 不符，guest 会打 `[Firmware Bug]: ... APIC ID mismatch`
+     （`arch/x86/kernel/cpu/topology_common.c:174-176`）。
    - **leaf1 ECX bit21 x2APIC 第一版清掉**（见"已知陷阱"3）。
    - KVM 半虚拟化叶 `0x40000000`/`0x40000001`：宿主 KVM 已在
      `KVM_GET_SUPPORTED_CPUID` 里填好（本机 feature 叶 eax=`0x01007efb`，
@@ -182,7 +206,9 @@ cmdline 建议：
    `kvm->created_vcpus`（`x86.c:7098-7099`）。顺序必须是
    VM → TSS/identity → irqchip → vCPU。
 2. **CPUID 缺 TSC-deadline 位，deadline 模式设不上**：
-   `kvm_vcpu_after_set_cpuid()` 是 if/else（`cpuid.c:399-402`）——有该位
+   `KVM_GET_SUPPORTED_CPUID` 的 leaf1 ECX bit24 恒 0（`cpuid.c:647-660`
+   白名单排除，见 M3），所以"有该位"以 **VMM 自行置位**为前提。置位与否
+   经 `kvm_vcpu_after_set_cpuid()` 的 if/else（`cpuid.c:399-402`）生效——有该位
    `timer_mode_mask = 3<<17`，没有则 `1<<17`（不是 0）。mask 只有
    `1<<17` 时，guest 写 LVT Timer 的 deadline 位(bit18)被 `lapic.c:2391`
    掩掉，TSC-deadline 模式设不上。只有**从未给 leaf1 建 CPUID 条目**

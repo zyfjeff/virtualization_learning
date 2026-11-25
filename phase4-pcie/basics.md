@@ -45,7 +45,7 @@ PCIe 拓扑由三种核心组件构成：
 **Root Complex** 是 PCIe 拓扑的根节点，连接 CPU/内存子系统：
 
 ```c
-/* 源码位置: drivers/pci/probe.c:3058 */
+/* 源码位置: drivers/pci/probe.c:3113 */
 /* PCI 子系统初始化时创建 Root Bus */
 struct pci_bus *pci_create_root_bus(struct device *parent, int bus,
         struct pci_ops *ops, void *sysdata, struct list_head *resources)
@@ -346,7 +346,7 @@ BAR 用于设备向系统请求内存或 IO 映射区域：
 BAR 支持三种类型：
 
 ```c
-/* 源码位置: include/uapi/linux/pci_regs.h:88 */
+/* 源码位置: include/uapi/linux/pci_regs.h:102-108 */
 #define PCI_BASE_ADDRESS_SPACE     0x01  /* 0 = memory, 1 = I/O */
 #define PCI_BASE_ADDRESS_SPACE_IO  0x01
 #define PCI_BASE_ADDRESS_SPACE_MEMORY 0x00
@@ -475,7 +475,7 @@ PCIe 能力是可选的扩展功能，通过 **Capability Pointer** 链接：
 ### 5.3 PCIe Capability 结构
 
 ```c
-/* 源码位置: include/uapi/linux/pci_regs.h:586 */
+/* 源码位置: include/uapi/linux/pci_regs.h:474 起 */
 /* PCIe Capability (ID = 0x10) */
 #define PCI_EXP_FLAGS         2     /* Capabilities register */
 #define PCI_EXP_FLAGS_VERS    0x000f /* Capability version */

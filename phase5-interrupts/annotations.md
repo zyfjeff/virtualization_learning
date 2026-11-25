@@ -79,8 +79,8 @@ static inline void __pi_clear_sn(struct pi_desc *pi_desc)        /* :90 */
 
 | 条件 | 行为 | VM-Exit? |
 |------|------|----------|
-| vCPU 在 Guest 且 SN=0 | 硬件在 VM-Entry 前自动 PIR→VIRR | ★ **零 VM-Exit** |
-| vCPU 在 Guest 且 SN=1 | 不投递，等 SN 清除后处理 | 延迟 |
+| vCPU 在 Guest 且 SN=0 | guest 态收到通知中断（向量=NV）时，硬件自动完成 PIR→VIRR→RVI（SDM 30.6，posted-interrupt processing 由中断到达触发，不是 VM-Entry 时机） | ★ **零 VM-Exit** |
+| vCPU 在 Guest 且 SN=1 | 非紧急中断不发送通知；紧急中断（URG=1）不受 SN 抑制 | 延迟 |
 | vCPU 不在 Guest | IOMMU 发通知中断到 NDST 指向的 pCPU | 需软件处理 |
 
 **为什么 64 字节对齐？** 确保整个结构在一个缓存行内，IOMMU 和 CPU 对 `control` 字段的
@@ -147,8 +147,8 @@ struct irte {
 | 规范名 | 内核字段 | 位置 | 说明 |
 |--------|---------|------|------|
 | IM (IRTE Mode) | `pst` / `p_pst` | bit 15 | **0=Remapped, 1=Posted** |
-| VV (Virtual Vector) | `p_vector` / `vector` | bits 23:16 | IRTE 中的通知向量 |
-| NV (Notification Vector) | — | PI Desc `nv` | PI 描述符中，值与 VV 相同 |
+| VV (Virtual Vector) | `p_vector` / `vector` | bits 23:16 | **guest 向量**——"the vector associated with the interrupt requests posted through this IRTE"（Spec 9.10, Figure 9-10），即写入 PIR 的位索引 |
+| NV (Notification Vector) | — | PI Desc `nv`（bits 279:272） | **宿主物理通知向量**——"the physical vector used for the notification event"（Spec 9.11）；KVM 中为 POSTED_INTR_VECTOR(0xf2)/WAKEUP(0xf1)。**与 VV 值不同** |
 | PDAL | `pda_l` | bits 63:38 | PDA 低 26 位（地址 bits 31:6） |
 | PDAH | `pda_h` | bits 127:96 | PDA 高 32 位（地址 bits 63:32） |
 | URG | `p_urgent` | bit 14 | Posted 模式紧急位 |
@@ -157,8 +157,10 @@ struct irte {
 Remapped 格式里 `DM` (Destination Mode, bit 2) 和 `DLM` (Delivery Mode, bits 7:5) 是
 两个完全不同的字段。在 Posted 上下文中写 `DM=1` 表示 PI 模式是**错误的**。
 
-**⚠️ 已知陷阱**（CLAUDE.md #2）：IRTE 里该字段叫 `VV` (Virtual Vector)；PI Descriptor
-里叫 `NV` (Notification Vector)。值相同，命名不同，别混用。
+**⚠️ 已知陷阱**（CLAUDE.md #2）：IRTE 里该字段叫 `VV` (Virtual Vector)，PI Descriptor
+里叫 `NV` (Notification Vector)——**命名与值都不同**：VV 是记录进 PIR 的 guest 向量
+（`posted_intr.c` 中 `vcpu_info.vector = irq.vector`，来自 MSI 路由项），NV 是宿主侧
+通知 IPI 的物理向量（0xf2/0xf1）。别把 VV 写成"通知向量"。
 
 ### Q: PDA 的地址对齐和位范围？
 
@@ -262,22 +264,24 @@ int vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
 
 ### Q: 为什么清 ON 之后需要 `smp_mb__after_atomic()`？
 
-**执行顺序必须是：① 读 PIR → ② 清 ON → ③ 屏障**
+**执行顺序必须是：① 清 ON → ② 屏障 → ③ 读 PIR**（与上方代码一致，`pi_clear_on`
+在 `kvm_apic_update_irr` 之前）
 
 ```
 KVM:                    IOMMU:
-① 读 PIR（全部拷贝）
-② 清 ON=0
-③ smp_mb()
-                        ④ 写 PIR[新向量]
+① 清 ON=0
+② smp_mb()
+③ 读 PIR（全部拷贝）    ④ 写 PIR[新向量] + 设 ON=1
                         ⑤ 看到 ON=0 → 发通知中断
 ```
 
-屏障保证 ② 对 IOMMU 可见时，① 已经完成。否则 IOMMU 可能在 KVM 还在读 PIR 时
-就重设 ON=1，后续 KVM 看到 ON=1 再次清除但漏掉新的 PIR 写入。
-
-**实际上**：`pi_clear_on` 本身是原子操作（`test_and_clear_bit`），带隐式屏障。
-显式的 `smp_mb__after_atomic()` 是防御性编程，确保在所有架构上顺序正确。
+为什么不能先读 PIR 再清 ON：若顺序反过来，IOMMU 可能在"KVM 读完 PIR、还没清 ON"
+的窗口里写入新位并发现 ON=1 而**不发通知**，随后 KVM 清掉 ON——这个中断就丢了。
+现在的顺序保证：清 ON 之后到达的任何 PIR 写入都伴随一次新的 ON 0→1 转换，
+IOMMU 必然发通知；而 KVM 清 ON 与读 PIR 之间的屏障保证"ON 被 IOMMU 观察到为 0 时，
+KVM 尚未开始读"这一交错不会漏位。内核注释（vmx.c:6924-6926）明确：
+"IOMMU can write to PID.ON, so the barrier matters even on UP"——它是配对所需的
+真屏障（x86 上恰因 `clear_bit` 已是锁定指令而退化为编译器屏障），**不是防御性摆设**。
 
 ### Q: `vmx_set_rvi()` 做了什么？
 
@@ -321,58 +325,104 @@ RVI 和 VPPR（虚拟 PPR）。RVI > VPPR → 硬件自动注入中断到 Guest�
 **注意**：`vmx_pi_update_irte()` **不直接操作 IRTE 字段**。它构建 `struct vcpu_data`
 传给 IOMMU 层，由 `intel_ir_set_vcpu_affinity()` 完成实际的 IRTE 写入。
 
+真实签名与主体（节选自 6.12.93 源码，循环骨架保留）：
+
 ```c
-/* 来源: arch/x86/kvm/vmx/posted_intr.c:272（简化） */
-void vmx_pi_update_irte(struct kvm_vcpu *vcpu,
-                        u32 gvec, u32 girq, bool set)
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:272（节选，省略多路由项循环体注释） */
+int vmx_pi_update_irte(struct kvm *kvm, unsigned int host_irq,
+		       uint32_t guest_irq, bool set)
 {
-    struct vcpu_vmx *vmx = to_vmx(vcpu);
-    struct vcpu_data vcpu_info;
+	/* ...取 irq_routing，检查 guest_irq 是否有路由... */
 
-    if (!set)
-        return;
+	hlist_for_each_entry(e, &irq_rt->map[guest_irq], link) {
+		if (e->type != KVM_IRQ_ROUTING_MSI)
+			continue;
 
-    /* ★ 构建 vCPU 信息，传给 IOMMU 层 */
-    vcpu_info.pi_desc_addr = __pa(&vmx->pi_desc);  /* PI 描述符物理地址 */
-    vcpu_info.vector = vmx->pi_desc.nv;             /* 通知向量 */
+		kvm_set_msi_irq(kvm, e, &irq);
+		if (!kvm_intr_is_single_vcpu(kvm, &irq, &vcpu) ||
+		    !kvm_irq_is_postable(&irq))
+			continue;
 
-    host_irq = kvm_irq_to_host_irq(girq);
-    irq_set_vcpu_affinity(host_irq, &vcpu_info);    /* → IOMMU 层 */
+		vcpu_info.pi_desc_addr = __pa(vcpu_to_pi_desc(vcpu));
+		vcpu_info.vector = irq.vector;      /* ★ guest 向量（写进 PIR 的位），
+		                                       不是 PI desc 的 nv */
+
+		if (!set)
+			continue;
+
+		enable_remapped_mode = false;
+		ret = irq_set_vcpu_affinity(host_irq, &vcpu_info); /* → IOMMU 层 */
+	}
+
+	if (enable_remapped_mode)
+		ret = irq_set_vcpu_affinity(host_irq, NULL); /* ★ 退回 Remapped 模式 */
+	/* ... */
 }
 ```
+
+要点：① `host_irq` 是入参，调用方为 `kvm_arch_irq_bypass_add/del_producer` 与
+`kvm_arch_update_irqfd_routing`（x86.c:13678/13708/13723 → `pi_update_irte` static call）；
+函数内部**没有** `kvm_irq_to_host_irq()` 这个转换函数（内核不存在该符号）；
+② 传给 IOMMU 的 `vector` 是 **guest 向量** `irq.vector`；③ `set=false` 不是简单
+return——当没有任何可投递的路由项时走 `irq_set_vcpu_affinity(host_irq, NULL)`
+把 IRTE 切回 Remapped。
 
 ### Q: IOMMU 层怎么写 IRTE？
 
 **文件**: `drivers/iommu/intel/irq_remapping.c:1248` — `intel_ir_set_vcpu_affinity()`
 
 ```c
-/* 来源: drivers/iommu/intel/irq_remapping.c:1270（节选） */
-/* intel_ir_set_vcpu_affinity() 内部 */
+/* 来源: drivers/iommu/intel/irq_remapping.c:1269-1279（节选） */
 
 irte_pi.p_pst     = 1;        /* ★ IM=1 → Posted 模式（内核字段名 p_pst） */
 irte_pi.p_urgent  = 0;
-irte_pi.p_vector  = vcpu_pi_info->vector;    /* 通知向量 = PI desc 的 nv */
+irte_pi.p_vector  = vcpu_pi_info->vector;  /* ★ VV = guest 向量（KVM 传入的
+                                            *    irq.vector），不是通知向量！
+                                            *    通知向量 NV 在 PI Descriptor 里 */
 irte_pi.pda_l = (vcpu_pi_info->pi_desc_addr >> (32 - PDA_LOW_BIT))
                 & ~(-1UL << PDA_LOW_BIT);
 irte_pi.pda_h = (vcpu_pi_info->pi_desc_addr >> 32)
                 & ~(-1UL << PDA_HIGH_BIT);
 
-modify_irte(&data->irq_2_iommu, &irte_pi);   /* line 1279 → 写入 IR 表 */
+ir_data->irq_2_iommu.posted_vcpu = true;    /* :1278 */
+modify_irte(&ir_data->irq_2_iommu, &irte_pi); /* :1279 → 写入 IR 表 */
 ```
 
 ### Q: `modify_irte()` 的更新协议？
 
 **文件**: `drivers/iommu/intel/irq_remapping.c:156` — `modify_irte()`
 
-```
-1. 清 Present 位（防止更新过程中错误投递）
-2. 写入新 IRTE 到内存中的 IR 表
-3. qi_flush_iec() → 刷新 IOMMU 的 IEC（Interrupt Entry Cache）
-4. 设 Present 位（重新启用）
+**不存在"清 Present → 写 → 设 Present"的四步协议**。Posted IRTE 用 128 位原子比较交换
+一次性替换，避免中间态（6.12.93 实际代码）：
+
+```c
+/* 来源: drivers/iommu/intel/irq_remapping.c:174-189（节选） */
+	if ((irte->pst == 1) || (irte_modified->pst == 1)) {
+		/*
+		 * We use cmpxchg16 to atomically update the 128-bit IRTE, ...
+		 */
+		u128 old = irte->irte;
+		WARN_ON(!try_cmpxchg128(&irte->irte, &old, irte_modified->irte));
+	} else {
+		WRITE_ONCE(irte->low, irte_modified->low);
+		WRITE_ONCE(irte->high, irte_modified->high);
+	}
+	__iommu_flush_cache(iommu, irte, sizeof(*irte));
+
+	rc = qi_flush_iec(iommu, index, 0);
 ```
 
-**每次 vCPU 迁移 pCPU 都需要更新 IRTE 的 destination 并刷新 IEC**。这是 PI 的
-运维开销 — 中断投递本身零 VM-Exit，但 vCPU 迁移有 IOMMU 侧的缓存失效成本。
+（index = `irte_index + sub_handle`，全程持 `irq_2_ir_lock`；非 posted 情况是两次
+WRITE_ONCE，同样没有先清 Present。）
+
+**注意：vCPU 迁移（宿主调度）不会走到这里**——Posted 格式 IRTE 没有 destination
+字段（VT-d Spec 9.10, Figure 9-10 仅含 P/FPD/AVAIL/URG/IM/VV/PDA/SID/SQ/SVT），
+通知目标是 PI Descriptor 的 NDST，迁移只由 `vmx_vcpu_pi_load()` 以
+`try_cmpxchg64` 更新 NDST，**不写 IRTE、不刷 IEC**。`modify_irte()` 的调用时机是
+路由/绑定变更（`intel_ir_set_vcpu_affinity`、回退 Remapped、宿主 posted-MSI 亲和性
+变更等）。宿主中断亲和性变更对 guest posted IRTE 更是显式跳过：
+`__intel_ir_reconfigure_irte()` 开头 `if (ir_data->irq_2_iommu.posted_vcpu && !force_host) return;`
+（irq_remapping.c:1173-1176）。（AGENTS.md 陷阱 #18）
 
 ---
 
@@ -383,32 +433,46 @@ modify_irte(&data->irq_2_iommu, &irte_pi);   /* line 1279 → 写入 IR 表 */
 **文件**: `arch/x86/kvm/vmx/posted_intr.c:53` — `vmx_vcpu_pi_load()`
 
 ```c
-/* 来源: arch/x86/kvm/vmx/posted_intr.c:53（简化） */
+/* 来源: arch/x86/kvm/vmx/posted_intr.c:53-133（节选，省略 wakeup 链表摘除与注释） */
 void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
 {
     struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
     struct pi_desc old, new;
     unsigned int dest;
 
+    if (!enable_apicv || !lapic_in_kernel(vcpu))
+        return;
+
     /* 快速路径：没迁移 + 不在 wakeup 列表 → 只需清 SN */
     if (pi_desc->nv != POSTED_INTR_WAKEUP_VECTOR && vcpu->cpu == cpu) {
         if (pi_test_and_clear_sn(pi_desc))
             goto after_clear_sn;
+        return;                       /* 没清到 SN：什么都不做 */
     }
+
+    /* （此处：若之前挂在 wakeup 列表，先从旧 pCPU 链表摘除，:91-95） */
+
+    dest = cpu_physical_id(cpu);      /* :97 = per_cpu(x86_cpu_to_apicid, cpu),
+                                       *   arch/x86/include/asm/smp.h:129 */
+    if (!x2apic_mode)
+        dest = (dest << 8) & 0xFF00;  /* :99 xAPIC：APIC ID 放在 NDST 高字节 */
 
     /* ★ 慢路径：try_cmpxchg64 原子更新整个 control 字段 */
     old.control = READ_ONCE(pi_desc->control);
     do {
         new.control = old.control;
-        new.ndst = per_cpu(x86_cpu_to_physical_apicid, cpu);  /* 新 pCPU APIC ID */
-        __pi_clear_sn(&new);                      /* 清 SN → 允许通知 */
-        new.nv = POSTED_INTR_VECTOR;              /* 通知向量 */
+        new.ndst = dest;                              /* 新 pCPU 物理 APIC ID */
+        __pi_clear_sn(&new);                          /* 清 SN → 允许通知 */
+        new.nv = POSTED_INTR_VECTOR;                  /* 恢复通知向量 0xf2 */
     } while (pi_try_set_control(pi_desc, &old.control, new.control));
                                               /* 内部: try_cmpxchg64 (line 47) */
 
 after_clear_sn:
+    /* Clear SN before reading the bitmap...（内核注释 :123-127） */
+    smp_mb__after_atomic();             /* :129 */
     if (!pi_is_pir_empty(pi_desc))
-        kvm_make_request(KVM_REQ_EVENT, vcpu);  /* PIR 有数据 → 同步 */
+        pi_set_on(pi_desc);             /* :132 ★ 置 ON=1，不是 KVM_REQ_EVENT！
+                                         *   让后续通知/同步路径把 PIR 搬进 IRR */
 }
 ```
 
@@ -516,7 +580,7 @@ void vmx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
   设备 MSI → IOMMU IR → IRTE(IM=1, PDA) → pi_desc.pir[vec]=1, ON=1
     │
     ├── vCPU 在 Guest + SN=0:
-    │   硬件 VM-Entry 前自动 PIR→VIRR → Guest 直接处理（零 VM-Exit!）
+    │   guest 态收到通知中断时硬件自动 PIR→VIRR（SDM 30.6）→ Guest 直接处理（零 VM-Exit!）
     │
     └── vCPU 不在 Guest:
         IOMMU 发通知 IPI → 宿主 IRQ handler
@@ -583,10 +647,10 @@ Intel SDM Section 30.6 原文："without transferring control to the VMM"。
 | 特性 | VMCS 控制位 | 作用 |
 |------|-----------|------|
 | Virtual APIC Page | `VIRTUAL_APIC_PAGE_ADDR` | Guest 读 TPR/IRR/ISR 不 VM-Exit |
-| Virtual Interrupt Delivery (VID) | 二级执行控制 bit 37 | 硬件自动评估 IRR 并注入 |
-| EOI Virtualization | 二级执行控制 bit 38 | 硬件自动处理 EOI |
-| Posted Interrupts | `PIN_BASED` bit 7 | 外部中断零 VM-Exit 投递 |
-| APIC-register Virt | 二级执行控制 bit 39 | LAPIC 寄存器访问不 VM-Exit |
+| Virtual Interrupt Delivery (VID) | 二级执行控制 **bit 9**（`SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY`=0x200，`VMX_FEATURE_VIRT_INTR_DELIVERY`=2*32+9，vmxfeatures.h:71） | 硬件自动评估 IRR 并注入 |
+| EOI Virtualization | **不是独立控制位**：随 VID 生效，由 VMCS 的 EOI-exit bitmap 决定哪些向量不产生 MSR-write VM-Exit（SDM 30.1.2） | 硬件自动处理 EOI |
+| Posted Interrupts | `PIN_BASED` bit 7（`VMX_FEATURE_POSTED_INTR`=0*32+7，vmxfeatures.h:21） | 外部中断零 VM-Exit 投递 |
+| APIC-register Virt | 二级执行控制 **bit 8**（`SECONDARY_EXEC_APIC_REGISTER_VIRT`=0x100，vmxfeatures.h:70） | LAPIC 寄存器访问不 VM-Exit |
 
 依赖链：`Posted Interrupts → APICv → Virtual Interrupt Delivery + EOI Virt`
 
@@ -595,8 +659,10 @@ Intel SDM Section 30.6 原文："without transferring control to the VMM"。
 **不一定**。PI 路径需要以下条件全部满足：
 
 1. CPU 支持 APICv（`cpu_has_vmx_apicv()`）
-2. `enable_apicv=1`（模块参数，0444 只读）
-3. vCPU 的 `apicv_active` 被设置（直通设备通过 `irqfd` 注册后才会）
+2. `enable_apicv=1`（模块参数，0444 只读；宿主实测 `/sys/module/kvm_intel/parameters/enable_apicv`）
+3. vCPU 的 `apicv_active` 已置位——由 enable_apicv 且无 inhibit 位决定（vCPU 创建/apicv
+   状态变更时设置），**与"直通设备是否注册 irqfd"无关**；反过来，有直通设备但平台不支持
+   PI 才是 inhibit 来源之一
 4. IOMMU 中断重映射已配置 Posted 模式（`p_pst = 1`）
 
 **虚拟设备（virtio 等）的中断通常走传统路径**：`kvm_lapic_set_irr()` 直接写 vLAPIC IRR。
@@ -716,29 +782,29 @@ Guest EOI:
     ▼
   KVM:
     vmx_pi_update_irte()              (posted_intr.c:272)
-      ├→ vcpu_info.pi_desc_addr = __pa(&vmx->pi_desc)
-      ├→ vcpu_info.vector = pi_desc.nv
+      ├→ vcpu_info.pi_desc_addr = __pa(vcpu_to_pi_desc(vcpu))
+      ├→ vcpu_info.vector = irq.vector      ★ guest 向量（非 pi_desc.nv）
       └→ irq_set_vcpu_affinity()     (irq_remapping.c)
           └→ intel_ir_set_vcpu_affinity()  (irq_remapping.c:1248)
               ├→ irte_pi.p_pst = 1          ★ IM=1 (Posted 模式)
-              ├→ irte_pi.p_vector = vector
+              ├→ irte_pi.p_vector = vector  （VV = guest 向量）
               ├→ irte_pi.pda_l / pda_h = 物理地址
               └→ modify_irte()              (irq_remapping.c:156)
-                  ├→ 清 Present 位
-                  ├→ 写新 IRTE
-                  ├→ qi_flush_iec()         ★ 刷新 IEC
-                  └→ 设 Present 位
+                  ├→ try_cmpxchg128 原子替换 128 位 IRTE（pst 相关路径）
+                  ├→ __iommu_flush_cache()
+                  └→ qi_flush_iec()         ★ 刷新 IEC
 
 
 ═══════════════════ vCPU 调度时的 PI 维护 ═══════════════════
 
   vcpu_load() → vmx_vcpu_pi_load()    (posted_intr.c:53)
-    ├→ 快速路径: pi_test_and_clear_sn()
+    ├→ 快速路径: pi_test_and_clear_sn()（未迁移且非 wakeup → 清 SN 后返回）
     └→ 慢路径: try_cmpxchg64(&pi_desc->control, ...)
-        ├→ new.ndst = 当前 pCPU APIC ID
+        ├→ new.ndst = cpu_physical_id(cpu)（xAPIC 时 (dest<<8)&0xFF00）
         ├→ __pi_clear_sn(&new)
         ├→ new.nv = POSTED_INTR_VECTOR
-        └→ PIR 非空 → KVM_REQ_EVENT
+        └→ after_clear_sn: smp_mb(); PIR 非空 → pi_set_on()   ★ 不是 KVM_REQ_EVENT
+        （★ 只改 PI Descriptor，IRTE 不动——Posted IRTE 无 destination 字段）
 
   vcpu_put() → vmx_vcpu_pi_put()      (posted_intr.c:196)
     ├→ blocking + 中断未屏蔽:

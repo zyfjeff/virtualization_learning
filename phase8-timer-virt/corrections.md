@@ -608,3 +608,237 @@ Linux 时钟基础(508行) → [clock-basics.md](clock-basics.md)，
 KVM 时钟虚拟化详解(1941行) → [kvm-clock-virtualization.md](kvm-clock-virtualization.md)，内容未改。
 `vmclock-phase1-analysis.md` → [vmclock-analysis-stage1.md](vmclock-analysis-stage1.md)
 （避免与 phase1-cpu-virt 混淆，COURSE_FRAMEWORK §5 命名规范）。
+
+---
+
+## 勘误 30（2026-11-25 二轮事实核查，已同步修正正文）
+
+> 核查材料：`/root/code/linux-6.12.93/`（基线）、`/root/code/linux`（git，v5.10/
+> v5.16/v6.13/v7.3 tags）、QEMU 10.1.0-rc2/11.1.0、Firecracker 本地 git、
+> util-linux v2.39.3（`/tmp/util-linux-src`）、宿主实测（**Ubuntu 6.8.0-51-generic**）。
+> 以下所有"实际"均经源码 grep 或本机运行核实。
+
+### 30.1 pvclock 换算公式 ">> (22 + tsc_shift)" 常数与移位方向均错
+
+**原文**：annotations.md §4/§8、kvm-clock-virtualization.md §4 框：
+`delta_ns = (delta_tsc × mul) >> (22 + tsc_shift)`
+
+**实际**：guest 侧唯一实现 `pvclock_scale_delta()`
+（`arch/x86/include/asm/pvclock.h:44-77`）：shift≥0 → `delta <<= shift`
+（shift<0 → `delta >>= -shift`），随后 `(delta × mul) >> 32`（x86_64 为
+`mulq + shrd $32`）。合并闭式 = **`(delta × mul) >> (32 − tsc_shift)`**。
+常数 22 在任何定义中都不存在（VMX/SVM/pvclock 的定点小数都是 32 位）。
+
+### 30.2 README §性能-3 给 `kvm_synchronize_tsc()` 配了不存在的代码体
+
+**原文**：`if (kvm_check_tsc_unstable()) { kvm->arch.use_master_clock = false; }`，
+并称该函数"检查各 pCPU 的 TSC 偏移，差异过大则标记为不稳定"。
+
+**实际**：`x86.c:2717-2786` 全函数无 `use_master_clock` 赋值、也不标记 unstable——
+它**消费** host 已有的 TSC 状态：稳定→共享 `cur_tsc_offset`（:2774），
+不稳定→`data += nsec_to_cycles(elapsed)` 重算 offset（:2776-2779）。
+`use_master_clock` 的决定在 `pvclock_update_vm_gtod_copy()`（`x86.c:3034-3037`）；
+marking 来自 host tsc watchdog 与 KVM `vcpu_load` 的
+`mark_tsc_unstable("KVM discovered backwards TSC")`（`x86.c:5018`）。
+正文已替换为真实节选（x86.c:2771-2780）。
+
+### 30.3 KVM_GET_CLOCK/KVM_SET_CLOCK 被当成 /dev/kvm 或 vCPU ioctl
+
+**原文**：README 练习5（`open("/dev/kvm")` 后直接 `ioctl(fd, KVM_GET_CLOCK,...)`）、
+练习2（grep debugfs 里的 pvclock GPA）、kvm-clock-realtime.md 全篇 24 处
+`ioctl(vcpu_fd, KVM_GET/SET_CLOCK,...)`。
+
+**实际**：两者均为 **VM ioctl**（api.rst §4.29/§4.30 "Type: vm ioctl"，
+`Documentation/virt/kvm/api.rst:1021-1027/:1071`；分发在 `kvm_vm_ioctl`，
+`x86.c:7307-7311`）。本机实测（自写程序，宿主 6.8.0-51）：
+`/dev/kvm` fd → EINVAL，vCPU fd → EINVAL，VM fd → 成功。
+另：KVM 没有导出 pvclock 页 GPA 的 debugfs 入口——per-vCPU 只有
+`guest_mode`/`tsc-offset`/`lapic_timer_advance_ns`/`tsc-scaling-ratio*`
+（`arch/x86/kvm/debugfs.c:61-75`，本机实测一致）。练习5 示例已改为
+KVM_CREATE_VM 后用 VM fd，realtime 篇 `vcpu_fd` 已全部改 `vm_fd`。
+
+### 30.4 pvclock 页锚点字段语义写错（kvm-clock-virtualization.md §4 框）
+
+**原文**："tsc_timestamp ← 写结构时的 Host TSC"、"system_time ← 写结构时的
+Host monotonic 时间"。
+
+**实际**：`tsc_timestamp = kvm_read_l1_tsc(v, host_tsc)` 是 **guest(L1) TSC**
+（`x86.c:3265`）；`system_time = kernel_ns + kvmclock_offset` 是 **guest kvmclock**
+（`x86.c:3302`）。若真是裸 host TSC，任何 TSC_OFFSET≠0 的 VM 该协议都不自洽。
+
+### 30.5 lapic timer advance 参数接口：宿主与 6.12.93 基线不一致（已加显著标注）
+
+**基线 6.12.93**（文档描述正确）：只有 bool `lapic_timer_advance`（`lapic.c:70-71`，
+0444）；提前量 per-vCPU 自适应、经 debugfs 只读观察（`debugfs.c:67`）。
+**宿主 Ubuntu 6.8.0-51-generic 实测**：**没有** `lapic_timer_advance` 参数；
+存在 int 参数 `lapic_timer_advance_ns`（`/sys/module/kvm/parameters/`，
+**-rw-r--r--（0644，运行时可写）**，当前值 **-1**）。README/annotations 相关命令
+处已加"宿主版本差异"框；用宿主观测口前先
+`ls /sys/module/kvm/parameters/ | grep timer`。
+
+### 30.6 `kvm_queue_pending_eoi()` 不存在
+
+**原文**：annotations.md §2/§8 称 `apic_timer_expired()` 通过
+`kvm_queue_pending_eoi` 或 `kvm_vcpu_kick()` 唤醒 vCPU。
+
+**实际**：全树 grep 零命中。真实路径（`lapic.c:1915-1950`）：
+`atomic_inc(&lapic_timer.pending)` + `kvm_make_request(KVM_REQ_UNBLOCK)`，
+仅 `from_timer_fn` 时 `kvm_vcpu_kick()`；APICv/posted-timer 路径走
+`kvm_apic_inject_pending_timer_irqs()`（:1925-1943）。
+
+### 30.7 VMX `TSC_MULTIPLIER` 的 1.0 写成了 SVM 的值
+
+**原文**：annotations.md §3 "1.0 = 0x0000000100000000"。
+
+**实际**：VMX 是 **16.48** 定点（SDM Vol.3 "TSC Scaling"；
+`kvm_caps.tsc_scaling_ratio_frac_bits = 48`，`vmx.c:8502`），
+1.0 = 2^48 = `0x0001000000000000`；`0x100000000`(2^32) 对应 **SVM**
+（`svm.c:5478`，frac_bits=32）。kvm-clock-virtualization.md 原本就写对了，
+两处已统一。
+
+### 30.8 kvm-clock-realtime.md 三组行号是旧内核残留
+
+**原文 → 实际（6.12.93）**：
+- `__get_kvmclock` "x86.c:1661-1694" → **x86.c:3107-3139**
+- `kvm_vm_ioctl_set_clock` "x86.c:4321-4358" → **x86.c:7006-7048**
+- "`include/uapi/linux/kvm.h:1085-1099`（含 KVM_CLOCK_VALID_FLAGS）" →
+  flags/结构在 **kvm.h:1025-1038**；`KVM_CLOCK_VALID_FLAGS` **不在 uapi**，
+  在 `arch/x86/include/asm/kvm_host.h:2377-2378`。
+
+### 30.9 GET_CLOCK 快照 flags："0xC / 5.16" 数字错
+
+**原文**（kvm-clock-virtualization.md 迁移注意事项）：
+"5.16+ 主机打的快照带 flags=0xC，灌到 5.10 KVM 上会直接 -EINVAL"。
+
+**实际**：masterclock 生效时 `__get_kvmclock` 置
+TSC_STABLE|REALTIME|HOST_TSC = 2|4|8 = **0xE**（`x86.c:3123/:3128`；
+git 核实 v5.16 的 `x86.c:2856/:2861` 与 uapi 值完全相同，即 5.16 起就是这套编号）。
+**-EINVAL 半句成立**：git `v5.10` `arch/x86/kvm/x86.c:5619-5621` 对一切非零
+flags 直接 `-EINVAL`。
+
+### 30.10 `KVM_SET_TSC_OFFSET` ioctl 不存在
+
+**原文**（kvm-clock-virtualization.md 两处）：把用户态设置 TSC 偏移写成
+`KVM_SET_TSC_OFFSET` ioctl。
+
+**实际**：uapi 只有 `KVM_SET_TSC_KHZ/KVM_GET_TSC_KHZ`
+（`include/uapi/linux/kvm.h:1223-1224`）。真实接口：
+① `KVM_SET_MSRS` 写 `MSR_IA32_TSC`（host_initiated →
+`kvm_synchronize_tsc`，`x86.c:3939-3940`）；
+② **`KVM_VCPU_TSC_OFFSET` vCPU device attribute**
+（`arch/x86/include/uapi/asm/kvm.h:920`；经 `KVM_SET_DEVICE_ATTR` 落在
+`kvm_arch_tsc_set_attr`，`x86.c:5757`，case @ :5765）。
+
+### 30.11 practice 实验2 预期 `KVM_CAP_ADJUST_CLOCK = 0x9` 错
+
+**实际**：`case KVM_CAP_ADJUST_CLOCK: r = KVM_CLOCK_VALID_FLAGS`（`x86.c:4714`）
+= 2|4|8 = **0xE**；宿主 6.8.0-51 实测 `0xe`。预期输出已改。
+
+### 30.12 README 陷阱2 与勘误 22 矛盾（残留旧结论）
+
+**原文**："current_clocksource 应该是 kvm-clock；不是就切到 kvm-clock"。
+
+**实际**：现代 host（invariant TSC + vCPU 对齐）guest 默认**应是 tsc**
+——kvmclock 主动 400→299 让位（`kvmclock.c:342-345`）。陷阱2 已改写为
+"tsc 没被选中先查原因，仅 TSC unstable 时固定 kvm-clock"。
+
+### 30.13 kvm-clock-realtime.md §1.1 核心公式失真
+
+**原文**："guest_time = host_tsc × tsc_to_system_mul + system_time"，
+"system_time = 宿主机 CLOCK_MONOTONIC"。
+
+**实际**：`__pvclock_read_cycles`（`arch/x86/include/asm/pvclock.h:84-89`）：
+`ns = pvclock_scale_delta(guest_tsc − tsc_timestamp) + system_time`；
+锚点与读取同为 guest TSC；system_time 含 kvmclock_offset（`x86.c:3302`）。
+§1.1 已重写；连带 30.1（"22+shift"）同源。
+
+### 30.14 vmclock.md：「KVM/QEMU Host 侧未实现」对 QEMU 而言已过时
+
+**实际**：QEMU 自 2025-01-07 commit **`3634039b93`**（"hw/acpi: Add vmclock
+device"，git 核实）即有 host 侧设备，本仓基线 `qemu-10.1.0-rc2/hw/acpi/vmclock.c`
+就在：分配 `VMCLOCK_ADDR 0xfeffb000` 4KiB 页（`include/hw/acpi/vmclock.h:11`）、
+生成 SSDT、realize 写常量、post_load 递增 `disruption_marker`（:64-97）。
+**仅填充时间参数的 KVM 内核侧确实未实现**（7.4.0-rc3 树 `VMCLOCK_MAGIC` 只有
+`drivers/ptp/ptp_vmclock.c` 命中）。§8.1 表与 §8.4 已拆分改写；QEMU 也不填
+时间字段（counter_id=INVALID）。
+
+### 30.15 vmclock.md §7.1 ACPI 示例的 `_HID "VCLK0001"`/`_CID "VMCLK0001"` 无人匹配
+
+**实际**：内核驱动只匹配 **AMZNC10C / VMCLOCK**（`drivers/ptp/ptp_vmclock.c:771-774`），
+QEMU/Firecracker 亦同（`hw/acpi/vmclock.c:40-41`、`devices/acpi/vmclock.rs:200-201`）。
+示例已按 QEMU 实际 AML 改写（device VCLK、_STA 0xf、QWORD cacheable/read-only
+0xfeffb000）；"通知码 0x80"本机无规范原文可证，标**待核实**（内核 handler 不检查
+event 值，`ptp_vmclock.c:522-530`）。
+
+### 30.16 vmclock.md §7.2 DT `compatible = "vmclock"` 不会绑定
+
+**实际**：binding 为 const **`amazon,vmclock`**
+（`Documentation/devicetree/bindings/ptp/amazon,vmclock.yaml:20`；驱动 of 表
+`ptp_vmclock.c:778-780`；Firecracker fdt 同值）。
+
+### 30.17 vmclock 驱动合入版本："Linux 7.0+" / "7.0 (2026)" 错
+
+**实际**：commit `205032724226`（author 2024-10-06）首个包含它的 tag 是
+**v6.13**（`git tag --contains` 于 /root/code/linux 核实）。vmclock.md §8.1/§8.5
+与 kvm-clock-realtime.md §6.1 对比表均已改。
+
+### 30.18 "clock_status=UNKNOWN → 驱动返回 -EINVAL" 臆造
+
+**实际**：驱动唯一的状态检查是 **UNRELIABLE**（`ptp_vmclock.c:124-125`）。
+Phase 1 无法同步的真实机制：`counter_id=INVALID` 使 `vmclock_ptp_register()`
+直接 `return NULL`（`ptp_vmclock.c:332/:338-345`，probe 调用点 :749），PTP 设备
+根本不存在，谈不上返回错误；可用面只剩 mmap 通知字段。
+
+### 30.19 "Firecracker Phase 1 提供迁移通知" 名不副实
+
+**实际**：FC 无热迁移——`disruption_marker` 唯一递增路径是快照恢复
+`do_post_restore()`（`devices/acpi/vmclock.rs:122-153`；函数注释即
+"after snapshot restore"；引入 commit `ef215b91b` 原话 "we don't support live
+migration, the device won't do anything at the moment"）。FC 文档中
+"Live migration through the disruption_marker" 是设计意图。迁移递增目前只有
+**QEMU** 实现（`hw/acpi/vmclock.c:78-80`）。vmclock.md §8.3 与
+vmclock-analysis-stage1.md §功能分解/价值2 已改写。
+
+### 30.20 §4.2 定点数示例中间十进制值错
+
+**原文**：`0x44B82FA0A` = "18014398506.97"；`0x89705F4136B4A597` =
+"9765625000734658967"；`2^93` = "5.76×10²⁷"。
+
+**实际**（Python 精确计算）：`0x44B82FA0A` = **18446744074**；
+`0x89705F4136B4A597` = **9903520314283042199**（恰为 10⁻⁹×2⁹³）；
+2⁹³ ≈ **9.9035×10²⁷**。原数值组合的除法结果 ≈1.69×10⁻⁹，与其自称的 1×10⁻⁹
+都不自洽。已修正。
+
+### 30.21 行号/措辞类小项（已随手修正）
+
+| 原文 | 实际 |
+|------|------|
+| debugfs 文件名 `tsc_offset` | `tsc-offset`（`arch/x86/kvm/debugfs.c:63`，连字符） |
+| "kvm_arch_init_vm **归零** kvmclock_offset" | `= -get_kvmclock_base_ns()`（`x86.c:12841`）：归零的是 clock 纪元，offset 非 0 |
+| get_kvmclock_base_ns "TSC 时钟下/否则" 两分支 | 按**编译期** `#ifdef CONFIG_X86_64`（`x86.c:2247/#else :2305`）选择，非运行时 |
+| "检测 CPUID 0x40000001 (KVM 签名)" | 签名 leaf = **0x40000000**（`KVM_CPUID_SIGNATURE`，`kvm_para.h:10`）；0x40000001 是 feature 页 |
+| wall epoch `wall_nsec = ktime_get_real_ns() − get_kvmclock_ns()` | 这是**回退路径**（`x86.c:3400`）；主路径为 `kvm_get_wall_clock_epoch()` 原子配对（`x86.c:3346-3397`） |
+| `struct kvm_clock_pairing { u64 sec; u64 nsec; u64 tsc; u32 flags; }` | sec/nsec 为 **`__s64`**，且有 `__u32 pad[9]`（`arch/x86/include/uapi/asm/kvm_para.h:75-81`） |
+| FC `vmclock.rs` 289 行 / `tests/host_tools/vmclock.c` 188 行 | `wc -l` 实测 **288 / 187** |
+| FC Phase 1 "首次合入 2025-10-21" | author 2025-10-21，committer（进 main）**2025-11-20**（`git show ef215b91b`） |
+| "kvmclock 支持迁移（TSC不行）" | tsc 同样可迁移（VMM 恢复 TSC 值 + offset/scaling 补偿；无 scaling 硬件时跨频迁移不可行），已限定措辞 |
+
+### 30.22 未标注数字的处置
+
+kvm-clock-virtualization.md "时钟读取性能对比"（PIT ~1000ns 等）、vDSO 框
+（~100-500ns / ~20-30ns / 10-100 倍）、ptp_kvm（hypercall ~μs、期望偏移 <1μs）
+与 README 练习4（"预期亚微秒级"）——README 早已声明这些**无本仓实测出处**，
+但拆出文档未带标记。本次按 phase10 规则统一标注"量级估计，本仓未实测，
+待实测（方法见 phase10/measurement.md）"，未改机制叙述。
+
+### 30.23 待核实（本机无资料，不臆断）
+
+- VMClock 规范版本自相矛盾：文头 v1.0（"2025-12-15 发布"）vs 正文/引用 v1.1；
+  本机无 UAPI.13 规范 PDF，两处的版本与日期归属均**待核实**。
+- ACPI 通知码 0x80：内核 handler 不检查 event 值（`ptp_vmclock.c:522-530`），
+  规范文本本机不可得，**待核实**。
+- §4.2 "运行 1 天误差 ≈ 几微秒/1 月 ≈ 几十微秒"：按 1ns tick 的 2⁻⁶⁴ s 量化
+  误差量级推算与结论一致，但非本仓实测，保留为量级说明。
+- Firecracker PR 编号 #5809：机制叙述与 6.12.93 代码、Firecracker 现行代码
+  （`vm.rs restore_state(..., clock_realtime)`，默认 `flags=0`）吻合；PR 编号
+  本身本机不可核，**待核实**。

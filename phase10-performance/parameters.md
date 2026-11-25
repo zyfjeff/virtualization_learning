@@ -159,10 +159,10 @@ idle/flood × 四档窗口扫描），索引见 [index.md](index.md)。
    （`arch/x86/kvm/x86.c` 的 `KVM_CAP_X86_DISABLE_EXITS` 路径）做"完全关掉"这一档。
 2. **per-vCPU 窗口只增长不回落到全局值**。`grow_ple_window()`
    （`arch/x86/kvm/vmx/vmx.c:1417`）把 `vmx->ple_window` 几何放大，唯一的回落点是
-   `vmx_vcpu_load()`（`arch/x86/kvm/vmx/vmx.c:1519-1523`）：
+   `vmx_vcpu_load()`（`arch/x86/kvm/vmx/vmx.c:1520-1522`）：
 
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c:1519-1523 */
+/* 来源: arch/x86/kvm/vmx/vmx.c:1520-1522 */
 void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 {
 	if (vcpu->scheduled_out && !kvm_pause_in_guest(vcpu->kvm))
@@ -182,8 +182,32 @@ per-vCPU 的进程内状态，同一 VM 的第二轮会继承第一轮的窗口�
 | `lapic_timer_advance` | kvm | `true` | **0444** | **不存在** |
 | `min_timer_period_us` | kvm | 200 | 0644 | — |
 | `kvmclock_periodic_sync` | kvm | true | **0444** | Y |
-| `pi_inject_timer` | kvm | 0（`bint`） | 0644 | 0 |
+| `pi_inject_timer` | kvm | **-1（auto）**（`bint`） | 0644 | 0（解析后的值） |
 | `preemption_timer` | kvm_intel | 见下 | **0444** | Y |
+
+**`pi_inject_timer` 的默认值是 `-1`（auto），不是 0** —— 本节旧版写成 0。
+源码：`arch/x86/kvm/x86.c:185` `int __read_mostly pi_inject_timer = -1;`
+（`:186` `module_param(pi_inject_timer, bint, 0644)`），auto 的落地在
+`kvm_x86_vendor_init()`：
+
+```c
+/* 来源: arch/x86/kvm/x86.c:9840-9841 (Linux 6.12.93) */
+	if (pi_inject_timer == -1)
+		pi_inject_timer = housekeeping_enabled(HK_TYPE_TIMER);
+```
+
+即 **-1 在模块初始化时被改写**成"宿主是否配了 timer housekeeping CPU"
+（`housekeeping_enabled()` `kernel/sched/isolation.c:33`，`HK_TYPE_TIMER`
+`include/linux/sched/isolation.h:10`；典型来源是 `nohz_full=` / `isolcpus=` 一类 cmdline）。
+本机 6.8 实读 `0` 就是这条改写的结果（`/proc/cmdline` 无 `nohz_full=`，
+`/sys/devices/system/cpu/nohz_full` 为空 → auto 判为关）。
+所以：**sysfs 里读到的值永远不等于 -1**，写文档时不能拿实读的 0/1 当"默认值"，
+而要写"默认 auto，实际取决于宿主 cmdline"。
+它管的是"vLAPIC 定时器能否走 posted interrupt 注入"
+（`kvm_can_post_timer_interrupt()`，`arch/x86/kvm/lapic.c:160-164`：
+`pi_inject_timer && kvm_vcpu_apicv_active(vcpu) && (mwait_in_guest || hlt_in_guest)`）
+—— 注意它本身就要求 HLT/MWAIT 有一项在 guest 里（即 §7 那几个位的组合），
+机制细节归 `../phase5-interrupts/`。
 
 **`lapic_timer_advance_ns` 不是模块参数** —— 这是本章旧版的一处硬错误。
 `practice/timer-bench.md` 旧版给的
@@ -275,15 +299,66 @@ default to 1/2 of the NTP threshold"*）。它决定主时钟能否维持：见
 ## 7. 关掉退出：per-VM 而非模块级
 
 想"消除某类 VM-Exit"，多数情况正确的开关不是模块参数，而是
-`KVM_CAP_X86_DISABLE_EXITS`：
+`KVM_CAP_X86_DISABLE_EXITS`。**6.12.93 只有四个位**
+（`include/uapi/linux/kvm.h:621-624`），没有第五个：
 
-```
-KVM_X86_DISABLE_EXITS_MWAIT / HLT / PAUSE / SHUTDOWN / PLE
+```c
+/* 来源: include/uapi/linux/kvm.h:621-628 (Linux 6.12.93) */
+#define KVM_X86_DISABLE_EXITS_MWAIT          (1 << 0)
+#define KVM_X86_DISABLE_EXITS_HLT            (1 << 1)
+#define KVM_X86_DISABLE_EXITS_PAUSE          (1 << 2)
+#define KVM_X86_DISABLE_EXITS_CSTATE         (1 << 3)
+#define KVM_X86_DISABLE_VALID_EXITS          (KVM_X86_DISABLE_EXITS_MWAIT | \
+                                              KVM_X86_DISABLE_EXITS_HLT | \
+                                              KVM_X86_DISABLE_EXITS_PAUSE | \
+                                              KVM_X86_DISABLE_EXITS_CSTATE)
 ```
 
-QEMU 侧对应 `-overcommit cpu-pm=on`（禁 MWAIT/HLT）。与 `ple_gap=0` 的效果一致
-（都落到 `kvm->arch.pause_in_guest = true`，见 `arch/x86/kvm/vmx/vmx.c:7639-7640`
-的 `vmx_vm_init()`），但**不需要重载模块、只影响本 VM**，做对照实验时优先用它。
+> ★ **不存在** `KVM_X86_DISABLE_EXITS_SHUTDOWN`，也**不存在**名为 `..._PLE` 的位
+> （`grep -rn "DISABLE_EXITS_SHUTDOWN\|DISABLE_EXITS_PLE" /root/code/linux-6.12.93/` 零命中）。
+> 关 PLE 用的位是 `KVM_X86_DISABLE_EXITS_PAUSE`（`(1 << 2)`，`kvm.h:623`）——
+> 它关掉的是 guest 的 `PAUSE` **指令退出**，而 PLE 是硬件在 `PAUSE` 上叠加的机制，
+> 二者由同一个 `pause_in_guest` 联动（见下）。越界位不会"被忽略"：
+> `x86.c:6590-6593` 开头 `r = -EINVAL;` +
+> `if (cap->args[0] & ~KVM_X86_DISABLE_VALID_EXITS) break;`，即**整个 cap 调用失败**。
+
+四个位在 KVM 侧的落点（`arch/x86/kvm/x86.c`，`case KVM_CAP_X86_DISABLE_EXITS`）：
+
+| 位 | 置的字段 | 行号 | 附加门控 |
+|---|---|---|---|
+| `PAUSE` | `kvm->arch.pause_in_guest` | `:6595-6596` | 无（在 `mitigate_smt_rsb` 块**外**） |
+| `MWAIT` | `kvm->arch.mwait_in_guest` | `:6606-6608` | `kvm_can_mwait_in_guest()`，且在下述块内 |
+| `HLT` | `kvm->arch.hlt_in_guest` | `:6609-6610` | 同上块内 |
+| `CSTATE` | `kvm->arch.cstate_in_guest` | `:6611-6612` | 同上块内 |
+
+★ 后三位都在 `if (!mitigate_smt_rsb) {`（`:6601`，块到 `:6613`）里面。
+`mitigate_smt_rsb` 本身是 `kvm` 模块的 bool 参数，默认 false、**0444**
+（`:197-198`；本机实读 `N`）。也就是说在开了该缓解的宿主上
+**HLT/MWAIT/CSTATE 三档会静默不生效**（cap 仍返回 0），而 `PAUSE` 不受它影响
+—— 又一次说明"关 PLE 那一档"与另外三档不同类。
+
+`pause_in_guest` 为真时 KVM 直接把硬件的 PLE 关掉
+（`vmx.c:4627-4628`：`exec_control &= ~SECONDARY_EXEC_PAUSE_LOOP_EXITING`），
+所以**这一位与 `ple_gap=0` 殊途同归** —— `ple_gap=0` 是在
+`vmx_vm_init()`（`arch/x86/kvm/vmx/vmx.c:7637`，赋值在 `:7639-7640`）里
+把 `kvm->arch.pause_in_guest` 置起来，走的是同一个字段。
+
+QEMU 侧的 `-overcommit cpu-pm=on` **不是"禁 MWAIT/HLT"**：`enable_cpu_pm`
+（解析在 `system/vl.c:1891`）触发 `kvm_vm_enable_disable_exits()`
+（qemu-10.1.0-rc2 `target/i386/kvm/kvm.c:3321-3322`），该函数把检测到的能力
+**与 MWAIT|HLT|PAUSE|CSTATE 四个位取交集后一次全传**（同文件 `:3124-3127`），
+于是 HLT/MWAIT/CSTATE 退出和 PAUSE/PLE **一起消失**。
+
+> **做 PLE 的 A/B 时不要拿它当"关 PLE"档**（本节旧版写过"对照实验优先用它"，
+> 那句已删）：它同时抹掉**另外三类**退出（HLT / MWAIT / CSTATE），
+> 收益无法归因给 PLE。
+> `practice/bench-ple.md` §2.4 早就把它归为"省事但**混淆**"的一档。
+> 干净的关法是 **`ple_gap=0`（重载 `kvm_intel`）** 或
+> **只传 `KVM_X86_DISABLE_EXITS_PAUSE` 的 per-VM cap**。后者 QEMU **没有**单一位的开关
+> （它只会四个位一起传），本仓 `../phase9-capstone/` 的 minivmm 目前也**没有**实现这条
+> cap —— 要用就得自己加一行 `kvm_vm_enable_cap(s, KVM_CAP_X86_DISABLE_EXITS, 0,
+> KVM_X86_DISABLE_EXITS_PAUSE)`，写法照 QEMU `target/i386/kvm/kvm.c:3130`
+> （`kvm_vm_enable_cap(s, KVM_CAP_X86_DISABLE_EXITS, 0, disable_exits)`）。
 
 ---
 

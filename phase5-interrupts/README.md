@@ -70,7 +70,7 @@ amd-avic.md（AVIC vs Intel PI）── 取证 → practice ex1–ex6
 第5步: vcpu-migration-affinity.md + msi-affinity-migration.md — 调度迁移
 第6步: amd-avic.md — AMD 对照
 第7步: practice ex1–ex6 取证；性能指针 → phase10
-第8步: 陷阱勘误（AGENTS.md #1–9）；深度自测 → phase6
+第8步: 陷阱勘误（AGENTS.md #1–9 / #18 / #19）；深度自测 → phase6
 ```
 
 ---
@@ -97,7 +97,8 @@ amd-avic.md（AVIC vs Intel PI）── 取证 → practice ex1–ex6
   发一个专用通知向量；**硬件**自动清 ON→PIR→VIRR→评估中断，**不产生 VM-Exit**
   （SDM 30.6 "without transferring control to the VMM"）。
 - **取舍**：Posted 用硬件复杂度换零 VM-Exit；但 vCPU 被抢占/迁移时要软件维护 PI 状态
-  （SN 位、NDST、IRTE Dest_ID）——这是 vcpu-migration-affinity.md 的全部。
+  （SN 位、NDST——都在 **PI Descriptor** 里；Posted 格式 IRTE 无 destination 字段，
+  迁移不写 IRTE、不刷 IEC，AGENTS.md 陷阱 #18）——这是 vcpu-migration-affinity.md 的全部。
 
 ### 机制全景：传统 vs Posted
 
@@ -136,7 +137,7 @@ IRTE 两种格式与 PI Descriptor 字段详见 [posted-interrupts.md](posted-in
 | annotations（pi_desc/IRTE） | PI Descriptor 为什么 64 字节对齐？ | PIR/ON/SN 各干什么？ | `struct pi_desc` |
 | annotations（桥梁函数） | IRTE 怎么从 Remapped 变 Posted？ | 为什么由 KVM-VFIO 触发而非组列表？ | `vmx_pi_update_irte()` |
 | annotations（PIR→IRR） | 硬件投递后软件还要做什么？ | vmx_sync_pir_to_irr 何时调？ | `vmx_sync_pir_to_irr()` |
-| vcpu-migration-affinity | vCPU 迁移中断为什么丢？ | NDST/Dest_ID 怎么更新？SN 位干嘛？ | `vmx_vcpu_load/put` |
+| vcpu-migration-affinity | vCPU 迁移中断为什么丢？ | NDST/SN 怎么更新？IRTE 何时才需要重写？ | `vmx_vcpu_load/put` |
 | amd-avic | AMD 怎么实现同一目标？ | GA Log 为什么存在？IsRun vs SN？ | `avic.c` |
 
 ---
@@ -152,7 +153,7 @@ IRTE 两种格式与 PI Descriptor 字段详见 [posted-interrupts.md](posted-in
 | ex3 | 零 VM-Exit（SDM 30.6） | Posted 路径通知中断不产生 kvm_exit | `ex3-pi-trace.sh` |
 | ex4 | Posted vs Remapped 开销 | Posted 中断延迟/exit 数低于 Remapped | `ex4-pi-vs-remapped.sh` |
 | ex5 | SN 位（vCPU 抢占） | vCPU 阻塞时 SN=1，避免无谓通知 | `ex5-on-sn-observe.sh` |
-| ex6 | 迁移 IRTE 更新 | vCPU 迁移后 Dest_ID/NDST 更新 | `ex6-vcpu-migration.sh` |
+| ex6 | 迁移只改 PI desc | vCPU 迁移后 PI Descriptor NDST 更新，**IRTE 不变**（无 posted IRTE 写入/IEC 刷新） | `ex6-vcpu-migration.sh` |
 
 ---
 
@@ -168,12 +169,13 @@ IRTE 两种格式与 PI Descriptor 字段详见 [posted-interrupts.md](posted-in
 
 ## ⚠️ 陷阱与勘误
 
-**本章是 AGENTS.md 全局陷阱 #1–9 的密集区，读前必过**：
+**本章是 AGENTS.md 全局陷阱 #1–9 / #18 / #19 的密集区，读前必过**：
 
 1. **#1 IRTE 模式位是 IM（bit15）不是 DM**：Remapped IM=0、Posted IM=1。
    内核里叫 `pst`/`p_pst`（`include/linux/dmar.h:212/240`）。Remapped 格式的 DM（bit2）
    是 Destination Mode、DLM（bits7:5）是 Delivery Mode，别混。
-2. **#2 向量字段命名**：IRTE 里是 VV（bits23:16），PI Descriptor 里才是 NV（bits279:272）。
+2. **#2 向量字段命名**：IRTE 里是 VV（bits23:16）= 记入 PIR 的 **guest 向量**，
+   PI Descriptor 里才是 NV（bits279:272）= 宿主**通知向量**（0xf2/0xf1）——命名与值都不同。
 3. **#3 向量空间**：无"全局共享 256 vector"，每 CPU 独立 LAPIC，唯一性是 (CPU_ID, vector)。
 4. **#4 PDA 位范围**：PDAL bits63:38、PDAH bits127:96，共 58 位，64 字节对齐。
 5. **#5 VFIO MSI-X 直通**：QEMU 始终中间协调（msix_table_mmio_write → KVM_SET_GSI_ROUTING
@@ -182,6 +184,11 @@ IRTE 两种格式与 PI Descriptor 字段详见 [posted-interrupts.md](posted-in
 7. **#8 CONFIG_X86_POSTED_MSI ≠ KVM PI**：前者是宿主 MSI 合并，后者是 guest VT-d PI，
    `irq_2_iommu` 里 posted_msi 与 posted_vcpu 是两个标志。
 8. **#9 .isra/.constprop 符号 kprobe 取参不可信**：抓 IRTE 先验证 SID=设备 BDF。
+9. **#18 Posted IRTE 无 destination 字段**：vCPU 迁移只更新 PI Descriptor 的 NDST
+   （`vmx_vcpu_pi_load` cmpxchg），不写 IRTE、不刷 IEC；宿主亲和性变更对
+   `posted_vcpu` 的 IRTE 显式跳过（`irq_remapping.c:1176-1177`）。
+10. **#19 向量常量**：`POSTED_INTR_VECTOR=0xf2`、`POSTED_INTR_WAKEUP_VECTOR=0xf1`
+    （irq_vectors.h:87-88），不是 0xf7/0xf6。
 
 本章勘误：[`corrections.md`](corrections.md)
 

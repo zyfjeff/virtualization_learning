@@ -683,16 +683,36 @@ read_unlock(&kvm->mmu_lock);
 
 **场景**：清除脏页日志
 
+批量入口是 `kvm_mmu_clear_dirty_pt_masked()`（一次调用处理一个 `unsigned long`
+位图 = 最多 64 个 4K 帧），**TDP MMU 分支一次进锁、按位图走一遍叶 SPTE**，
+而不是"每个置位调一次函数"：
+
 ```c
-// 批量清除多个 SPTE 的 Dirty 位
-for_each_set_bit(gfn, mask, BITS_PER_LONG) {
-    tdp_mmu_clear_dirty_pt_masked(kvm, slot, gfn, mask, false);
-}
+/* 来源: arch/x86/kvm/mmu/mmu.c:1297-1305 */
+static void kvm_mmu_clear_dirty_pt_masked(struct kvm *kvm,
+					 struct kvm_memory_slot *slot,
+					 gfn_t gfn_offset, unsigned long mask)
+{
+	struct kvm_rmap_head *rmap_head;
+
+	if (tdp_mmu_enabled)
+		kvm_tdp_mmu_clear_dirty_pt_masked(kvm, slot,
+				slot->base_gfn + gfn_offset, mask, false);
+	/* 后面是旧式 rmap 路径的 while (mask) { __clear_dirty_... } 循环 */
 ```
 
+注意**真实函数名带 `kvm_` 前缀**：`kvm_tdp_mmu_clear_dirty_pt_masked()`
+（`arch/x86/kvm/mmu/tdp_mmu.c:1607`，旧稿写成 `tdp_mmu_clear_dirty_pt_masked()`）。
+它内部对每个 root 调 `clear_dirty_pt_masked()`（`:1561`），后者用
+`tdp_root_for_each_leaf_pte(iter, root, gfn + __ffs(mask), gfn + BITS_PER_LONG)`
+（`:1570-1571`）沿位图**最低置位**起步做一次遍历，边遍历边 `mask &= ~(1UL << (iter.gfn - gfn))`
+（`:1585`）消掉已处理的位；要清的位由
+`dbit = (wrprot || tdp_mmu_need_write_protect(root)) ? PT_WRITABLE_MASK : shadow_dirty_mask`
+（`:1564-1565`）决定 —— 没有硬件 A/D（或需要写保护）时清的是**写权限位**而不是 D 位。
+
 **优势**：
-- 减少锁获取次数
-- 批量处理提高效率
+- 一次锁 + 一次走表处理整张位图，而不是 64 次
+- `__ffs(mask)` 作起点，跳过高位置图前那段没有脏页的区间
 
 ---
 

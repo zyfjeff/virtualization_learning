@@ -72,18 +72,47 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 
 ### Q: 为什么表上标 `__initdata`，但回调还能在运行时用？
 
-`__initdata` 让**结构体本身**在初始化后释放。但初始化结束时，KVM 把每个回调指针
-拷进了 `static_call_key`：
+`__initdata` 让**结构体本身**在初始化后释放。释放能成立，是因为 `kvm_ops_update()`
+一次性做了两件事——先把整张表拷进常驻的全局 `kvm_x86_ops`，再把可 static-call 的
+回调逐个烤进调用点：
 
 ```c
-/* arch/x86/kvm/x86.c:9698 — kvm_ops_update() */
+/* 来源: arch/x86/kvm/x86.c:9698-9714 — kvm_ops_update() */
+static inline void kvm_ops_update(struct kvm_x86_init_ops *ops)
+{
+	memcpy(&kvm_x86_ops, ops->runtime_ops, sizeof(kvm_x86_ops));
+
 #define __KVM_X86_OP(func) \
-    static_call_update(kvm_x86_##func, kvm_x86_ops.func);
-/* ... 展开为每个回调做 static_call_update */
+	static_call_update(kvm_x86_##func, kvm_x86_ops.func);
+#define KVM_X86_OP(func) \
+	WARN_ON(!kvm_x86_ops.func); __KVM_X86_OP(func)
+#define KVM_X86_OP_OPTIONAL __KVM_X86_OP
+#define KVM_X86_OP_OPTIONAL_RET0(func) \
+	static_call_update(kvm_x86_##func, (void *)kvm_x86_ops.func ? : \
+					   (void *)__static_call_return0);
+#include <asm/kvm-x86-ops.h>
+#undef __KVM_X86_OP
+
+	kvm_pmu_ops_update(ops->pmu_ops);
+}
 ```
 
-释放的是**表本身**，不是函数。函数在 `.text` 段里，一直在。这样设计是为了在嵌套虚拟化
-需要切换回调表（VMX → SVM 不可能，但 L1 KVM 做 nested VMX 时需要换实现）时保留灵活性。
+所以运行时**两个副本都在**：不能进 static_call 的字段（如 `.name`、`.nested_ops`、
+`.cpu_dirty_log_size` 这类数据/子表）留在 `kvm_x86_ops` 全局变量里；能进的被 patch 成
+直接调用。释放掉的只是厂商模块里那张 `__initdata` 源表。函数在 `.text` 段里，一直在。
+
+**纠正旧表述（2026-11-25 核查，见本章 corrections.md 勘误 4）**：原文接着说"这样设计是为了
+在嵌套虚拟化需要切换回调表……L1 KVM 做 nested VMX 时需要换实现"。这个理由**不成立**，
+KVM 从不因嵌套而换 `kvm_x86_ops`：
+
+- L1 跑 L2 时切换的是 **VMCS**（vmcs01 → vmcs02），执行路径仍是同一个 `vmx_vcpu_run()`；
+- 嵌套相关回调挂在**子表**上，初始化时就一起拷进来了：
+  `arch/x86/kvm/vmx/main.c:133` `.nested_ops = &vmx_nested_ops,`
+  （子表本体 `arch/x86/kvm/vmx/nested.c:7310`），通用层用
+  `kvm_x86_ops.nested_ops->get_state/enable_evmcs/...` 间接分发，例如
+  `arch/x86/kvm/x86.c:4767`；
+- static_call 这层抽象真正服务的对象是**厂商**（VMX vs SVM）与 retpoline/IBRS 下的
+  间接调用开销，而不是嵌套。
 
 ---
 
@@ -115,12 +144,41 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
     vmx_vcpu_enter_exit(vcpu, __vmx_vcpu_run_flags(vmx));
     /* ═══════════ 回到 C ═══════════ */
 
-    /* 4. 读 VM-Exit 信息 */
-    vmx->exit_qualification = vmcs_read32(EXIT_QUALIFICATION);
-    vmx->exit_reason.full   = vmcs_read32(VM_EXIT_REASON);
+    /* 4. VM-Exit 信息：exit_reason 在 enter_exit 里读，
+     *    exit_qualification **不在这读** —— 惰性取 */
     ...
 }
 ```
+
+**`exit_reason` 与 `exit_qualification` 的读取位置/宽度都不一样**（2026-11-25 核查，
+旧版把两者都写成在 `vmx_vcpu_run()` 里 `vmcs_read32`）：
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:7326-7328 —— 在 vmx_vcpu_enter_exit() 内 */
+	vmx->exit_reason.full = vmcs_read32(VM_EXIT_REASON);
+	if (likely(!vmx->exit_reason.failed_vmentry))
+		vmx->idt_vectoring_info = vmcs_read32(IDT_VECTORING_INFO_FIELD);
+```
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.h:708-716 */
+static __always_inline unsigned long vmx_get_exit_qual(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	if (!kvm_register_test_and_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_1))
+		vmx->exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
+
+	return vmx->exit_qualification;
+}
+```
+
+- `EXIT_QUALIFICATION` 是宽字段（64 位模式 64 bit），必须 `vmcs_readl`，旧版的
+  `vmcs_read32(EXIT_QUALIFICATION)` 会截断高 32 位（EPT violation 的 GPA 相关位、
+  APIC-access 的 offset 等虽然都在低 32 位，但按 32 位读本身就是错的类型）。
+- `VCPU_EXREG_EXIT_INFO_1/2` 这套可用性位表示"只有第一个真正需要它的 exit handler
+  才去读 VMCS"，多数 exit 根本不读 `exit_qualification`，省一次 VMCS 访问。
+- `VM_EXIT_REASON` 本身是 32 位字段 ⇒ `vmcs_read32` 正确。
 
 ### Q: 汇编入口里到底做了什么？
 
@@ -155,7 +213,7 @@ SYM_FUNC_START(__vmx_vcpu_run)
     /* --- 某个时刻 VM-Exit 触发，CPU 回到 Root 模式 --- */
     /* --- 硬件自动：恢复 HOST_RSP/HOST_RIP，跳到 vmx_vmexit --- */
 
-SYM_INNER_LABEL(vmx_vmexit, SYM_L_GLOBAL)
+SYM_INNER_LABEL_ALIGN(vmx_vmexit, SYM_L_GLOBAL)   /* vmenter.S:193 */
     /* VM-Exit 后：保存 Guest 通用寄存器到 vcpu_vmx */
     /* 恢复 Host 寄存器 */
     pop %rbx
@@ -257,13 +315,62 @@ return kvm_vmx_exit_handlers[exit_handler_index](vcpu);
 | `PREEMPTION_TIMER` | `handle_preemption_timer()` | 内核 | 更新定时器 |
 | `APIC_WRITE` | `handle_apic_write()` | 内核 | 同步虚拟 LAPIC |
 | `MSR_WRITE` | `kvm_emulate_wrmsr()` | 内核 | 模拟 MSR 写 |
+| `MSR_READ` | `kvm_emulate_rdmsr()` | 内核 | 模拟 MSR 读 |
+| `CPUID` | `kvm_emulate_cpuid()` | **内核，恒重入** | 见下方"两处纠正" |
 | — | — | — | — |
-| `IO_INSTRUCTION` | `handle_io()` | 用户空间* | `KVM_EXIT_IO` |
-| `MMIO` | — | 用户空间 | `KVM_EXIT_MMIO` |
-| `CPUID` | `handle_cpuid()` | 用户空间* | 处理后重入 |
+| `IO_INSTRUCTION` | `handle_io()` | 用户空间* | `KVM_EXIT_IO`（无内核态设备时） |
+| EPT violation 打到未映射 GPA | — | 用户空间 | `KVM_EXIT_MMIO` |
 | `TRIPLE_FAULT` | `handle_triple_fault()` | 用户空间 | `KVM_EXIT_SHUTDOWN` |
 
-*注：`handle_io()` 和 `handle_cpuid()` 在内核态处理后可能返回 1（重入）或 0（回用户空间），取决于是否模拟完成。
+*注：`handle_io()` 在内核态处理后可能返回 1（重入，命中内核态设备/PIO 直连）或 0（回用户空间，
+填 `KVM_EXIT_IO`），取决于是否模拟完成。
+
+**两处纠正（2026-11-25 核查，见本章 corrections.md 勘误 4）**：
+
+1. 旧版这张表写的是 `CPUID | handle_cpuid() | 用户空间*`。**`handle_cpuid()` 在
+   6.12.93 的 KVM 里不存在**（全树搜索只命中 `arch/x86/coco/tdx/tdx.c:425` 那个 TDX VE
+   处理函数，与 KVM VMX 退出表无关）。真正的处理函数是 `kvm_emulate_cpuid()`。
+2. **CPUID 不是慢速路径，也不会返回用户空间**：
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:6103-6107 */
+	[EXIT_REASON_CPUID]                   = kvm_emulate_cpuid,
+	[EXIT_REASON_MSR_READ]                = kvm_emulate_rdmsr,
+	[EXIT_REASON_MSR_WRITE]               = kvm_emulate_wrmsr,
+	[EXIT_REASON_INTERRUPT_WINDOW]        = handle_interrupt_window,
+	[EXIT_REASON_HLT]                     = kvm_emulate_halt,
+```
+
+```c
+/* 来源: arch/x86/kvm/cpuid.c:1681-1697 */
+int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
+{
+	u32 eax, ebx, ecx, edx;
+
+	if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))
+		return 1;
+
+	eax = kvm_rax_read(vcpu);
+	ecx = kvm_rcx_read(vcpu);
+	kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, false);
+	kvm_rax_write(vcpu, eax);
+	kvm_rbx_write(vcpu, ebx);
+	kvm_rcx_write(vcpu, ecx);
+	kvm_rdx_write(vcpu, edx);
+	return kvm_skip_emulated_instruction(vcpu);
+}
+```
+
+返回值恒为 `kvm_skip_emulated_instruction()` 的结果（1 = 继续内核态循环），所以
+**Guest 的 CPUID 从不产生 `KVM_EXIT_*`**，QEMU 只在启动时用 `KVM_SET_CPUID2` 把表灌进
+`vcpu->arch.cpuid_entries`（见 cpu-virtualization.md §1）。MSR 同理：只有 `kvm_get/set_msr_*`
+未命中**且**开启了用户态 MSR 过滤（`KVM_CAP_X86_USER_SPACE_MSR`）时，才由
+`kvm_msr_user_space()`（`arch/x86/kvm/x86.c:2032`，调用点 `:2069`/`:2091`）填
+**`KVM_EXIT_X86_RDMSR` / `KVM_EXIT_X86_WRMSR`**；否则就地注入 #GP。
+`KVM_EXIT_INTERNAL_ERROR` 与此无关，它只用于模拟失败一类
+（`x86.c:8812` 在 `prepare_emulation_failure_exit()`（定义 `:8796`）里，对外入口是
+`kvm_prepare_emulation_failure_exit()` `:8861`；`x86.c:11969` 在 `kvm_task_switch()`
+里遇到 MMIO；`x86.c:13833` 在 `kvm_handle_memory_failure()`（定义 `:13817`）里）。
 
 ### Q: MSR 访问一定在内核处理吗？`user_space_msr` 机制是什么？
 
@@ -347,10 +454,40 @@ struct vcpu_vmx {
     struct nested_vmx   nested;            /* L1 的 VMX 状态（做嵌套时才用） */
 
     /* --- 其他 --- */
-    u16                 vpid;              /* VPID（避免 TLB flush） */
-    struct hrtimer      preemption_timer;  /* 抢占定时器 */
+    int                 vpid;              /* VPID（避免 TLB flush） */
+    bool                emulation_required;
+    union vmx_exit_reason exit_reason;
+    /* 注意: vcpu_vmx 里**没有** preemption_timer 字段，见下方纠正 */
 };
 ```
+
+**纠正旧表述（2026-11-25 核查）**：本节的字段表原来写
+`u16 vpid;` + `struct hrtimer preemption_timer;`，两处都与 6.12.93 不符：
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.h:317-329 */
+	int vpid;
+	bool emulation_required;
+
+	union vmx_exit_reason exit_reason;
+
+	/* Posted interrupt descriptor */
+	struct pi_desc pi_desc;
+
+	/* Used if this vCPU is waiting for PI notification wakeup. */
+	struct list_head pi_wakeup_list;
+
+	/* Support for a guest hypervisor (nested VMX) */
+	struct nested_vmx nested;
+```
+
+- `vpid` 是 **`int`**（`vmx.h:317`），不是 `u16`；`u16` 的那两个在 `struct nested_vmx` 里
+  （`vpid02` / `last_vpid`，`vmx.h:231-232`）。
+- `struct hrtimer preemption_timer` **属于 `struct nested_vmx`，不属于 `vcpu_vmx`**
+  （`arch/x86/kvm/vmx/vmx.h:210`，紧跟 `preemption_timer_deadline` /
+  `has_preemption_timer_deadline` / `preemption_timer_expired`）。
+  含义别搞反：L1 用的是**硬件** VMCS preemption timer（`handle_preemption_timer()`，
+  见 §3 表）；那把 hrtimer 是 L0 替 **L2** 模拟 vmcs12 里的抢占定时器时才用的软件定时器。
 
 ### Q: `vmcs01` 和 `loaded_vmcs` 什么关系？
 
@@ -450,36 +587,160 @@ __init int vmx_hardware_setup(void)
 
 **文件**: `arch/x86/kvm/vmx/vmx.c:2590`
 
-| MSR | 内容 |
-|-----|------|
-| `MSR_IA32_VMX_BASIC` | VMCS revision、VMXON region 大小、true-CTLS 是否可用 |
-| `MSR_IA32_VMX_PINBASED_CTLS` | 引脚控制（外部中断/NMI/虚拟 NMI 等）|
-| `MSR_IA32_VMX_PROCBASED_CTLS` | 主 CPU 控制（IO 退出/MSR 退出/HLT 退出等）|
-| `MSR_IA32_VMX_PROCBASED_CTLS2` | 二级控制（EPT/VPID/RDTSCP/ Posted Interrupts 等）|
-| `MSR_IA32_VMX_EXIT_CTLS` | VM-Exit 控制（Host 地址空间大小/ACK 中断等）|
-| `MSR_IA32_VMX_ENTRY_CTLS` | VM-Entry 控制（加载 EFER/IA32_PAT 等）|
-| `MSR_IA32_VMX_EPT_VPID_CAP` | EPT/VPID 能力（4 级页表/WB/INVVPID 类型等）|
+| MSR | 内容 | `setup_vmcs_config()` 里的读取点 |
+|-----|------|------|
+| `MSR_IA32_VMX_BASIC` | VMCS revision、VMXON region 大小、true-CTLS 是否可用 | `vmx.c:2743` `rdmsrl(MSR_IA32_VMX_BASIC, basic_msr)` |
+| `MSR_IA32_VMX_MISC` | 抢占定时器移位量、可加载 MSRs 数、`SMM/VMFUNC` 等杂项 | `vmx.c:2763` |
+| `MSR_IA32_VMX_PINBASED_CTLS` | 引脚控制（外部中断退出/NMI 退出/**Process posted interrupts = bit 7**）| `vmx.c:2689` |
+| `MSR_IA32_VMX_PROCBASED_CTLS` | 主 CPU 控制（IO/MSR/HLT/RDTSC/PLE 退出、CR3/CR8 退出等）| `vmx.c:2623` |
+| `MSR_IA32_VMX_PROCBASED_CTLS2` | 二级控制（**Virtualize APIC accesses bit 0 / Enable EPT bit 1 / Enable RDTSCP bit 3 / virtualize x2APIC mode bit 4 / Enable VPID bit 5 / unrestricted guest bit 7 / APIC-register virtualization bit 8 / virtual-interrupt delivery bit 9 / PAUSE-loop exiting bit 10 / Enable INVPCID bit 12 / VMCS shadowing bit 14 / PML bit 17 / TSC scaling bit 25 / BUS_LOCK_DETECTION bit 30** 等，逐位见 `arch/x86/include/asm/vmxfeatures.h:62-89`）| `vmx.c:2626-2629` |
+| `MSR_IA32_VMX_PROCBASED_CTLS3` | 三级控制（**IPI virtualization bit 4**，`VMX_FEATURE_IPI_VIRT = 3*32+4`，`vmxfeatures.h:92`）| `vmx.c:2676-2679` |
+| `MSR_IA32_VMX_EXIT_CTLS` | VM-Exit 控制（Host 地址空间大小/ACK 中断/保存调试寄存器…）| `vmx.c:2683` |
+| `MSR_IA32_VMX_ENTRY_CTLS` | VM-Entry 控制（加载 EFER/IA32_PAT/PERF_GLOBAL_CTRL…）| `vmx.c:2699-2701` |
+| `MSR_IA32_VMX_EPT_VPID_CAP` | EPT/VPID 能力（4 级页表/WB/INVVPID 与 INVEPT 类型）| `vmx.c:2648` `rdmsr_safe(...)` |
 
-每个 CTL MSR 的格式都一样：bits 31:0 是「必须为 1」的硬约束，bits 63:32 是「可以为 1」
-的可选能力。KVM 取交集合：`_vmx_report_error` 检查硬件是否满足最低要求。
+**纠正旧表述（2026-11-25 核查）**：原表把 **Posted Interrupts 归到了 CTLS2**，并把
+"虚拟 NMI 退出"归到 pin-based 之外的表述混在一起。按规范与源码，
+**"Process posted interrupts" 是 Pin-Based 控制的 bit 7**：
+
+- 规范：intel-vmx.pdf Vol.3C Table 25-5 "Definitions of Pin-Based VM-Execution
+  Controls"，bit 7 = "Process posted interrupts"——"If this control is 1, the processor
+  treats interrupts with the posted-interrupt notification vector … specially, updating
+  the virtual-APIC page with posted-interrupt requests"。
+- 源码：`cpu_has_vmx_posted_intr()` 读的就是 pin 表（`capabilities.h:92-95`
+  `vmcs_config.pin_based_exec_ctrl & PIN_BASED_POSTED_INTR`），
+  `PIN_BASED_POSTED_INTR = VMCS_CONTROL_BIT(POSTED_INTR)`，而
+  `VMX_FEATURE_POSTED_INTR = (0*32+7)`（`vmxfeatures.h:21`，word 0 = pin-based ⇒ bit 7）。
+- Secondary 控制表（Table 25-7）里没有 "posted" 这一位，别在 CTLS2 里找它。
+
+每个 CTL MSR 的格式都一样：bits 31:0 是「必须为 1」的硬约束（allowed-0），
+bits 63:32 是「可以为 1」（allowed-1）。6.12.93 里的实际算法是这段（不是旧版写的
+`_vmx_report_error`，该符号在本树不存在）：
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:2563-2580 */
+static int adjust_vmx_controls(u32 ctl_min, u32 ctl_opt, u32 msr, u32 *result)
+{
+	u32 vmx_msr_low, vmx_msr_high;
+	u32 ctl = ctl_min | ctl_opt;
+
+	rdmsr(msr, vmx_msr_low, vmx_msr_high);
+
+	ctl &= vmx_msr_high; /* bit == 0 in high word ==> must be zero */
+	ctl |= vmx_msr_low;  /* bit == 1 in low word  ==> must be one  */
+
+	/* Ensure minimum (required) set of control bits are supported. */
+	if (ctl_min & ~ctl)
+		return -EIO;
+
+	*result = ctl;
+	return 0;
+}
+```
+
+即：**先砍掉硬件不允许为 1 的位，再强制置上硬件要求为 1 的位**；只要
+`ctl_min`（KVM 必需集合，`KVM_REQUIRED_VMX_*`）里有任何一位没落到最终 `ctl` 上，
+就返回 `-EIO`，`setup_vmcs_config()` 往上抛 → `vmx_hardware_setup()` 返回 -EIO →
+`kvm_x86_vendor_init()` 失败，模块加载不了（不是"降级运行"）。64 位宽的那些
+（tertiary controls）另有 `adjust_vmx_controls64()`（`vmx.c:2581-2588`），只做
+`ctl_opt & allowed`，没有 must 集合。
+
+> 补充：`error_on_inconsistent_vmcs_config`（`vmx.c:130-131`，默认 1，0444）也在
+> `setup_vmcs_config()` 内部，管的是**能力自相矛盾**时怎么办：
+> "EPT CAP 存在但 secondary 里没 Enable EPT"（`vmx.c:2651-2661`）、
+> "VPID CAP 存在但没 Enable VPID"（`:2662-2671`）、
+> "VM-Entry/VM-Exit 控制位成对约束不满足"（`:2705-2719`）。
+> 为真 → 直接 `-EIO` 拒绝加载；为假 → 只 `pr_warn_once` 并把相关位清掉继续跑。
+> 它跟上面"必需控制位缺失"是两条不同的判定路径。
 
 ### Q: 特性依赖链长什么样？
 
+下面每条都按 6.12.93 的实际判据写（左边是开关，右边是 `file:line`）：
+
 ```
-硬件 capability MSR
+硬件 capability MSR / VMX-control 位
     │
-    ├─ EPT 要求：4 级页表 + WB 内存类型 + INVEPT 全局
-    │   └─ EPT_AD 要求：EPT + A/D 位支持
-    │       └─ unrestricted_guest 要求：EPT
+    ├─ enable_ept       ← cpu_has_vmx_ept() && cpu_has_vmx_ept_4levels()
+    │                     && cpu_has_vmx_ept_mt_wb() && cpu_has_vmx_invept_global()
+    │                     (vmx.c:8434-8438)
+    │   ├─ enable_ept_ad_bits        ← cpu_has_vmx_ept_ad_bits() && enable_ept
+    │   │                             (vmx.c:8446-8447)
+    │   └─ enable_unrestricted_guest ← cpu_has_vmx_unrestricted_guest() && enable_ept
+    │                                  (vmx.c:8449-8450)
     │
-    ├─ VPID 要求：INVVPID（single 或 global）
+    ├─ enable_vpid      ← cpu_has_vmx_vpid() && cpu_has_vmx_invvpid()
+    │                     && (cpu_has_vmx_invvpid_single() || ..._global())
+    │                     (vmx.c:8430-8432)
     │
-    ├─ APICv 要求：虚拟中断投递 + EOI 虚拟化 + MSR 位图
-    │   └─ IPIv 要求：APICv + 虚拟 IPI 投递
-    │       └─ Posted Interrupts 要求：APICv
+    ├─ enable_apicv     ← cpu_has_vmx_apicv()
+    │       │              == cpu_has_vmx_apic_register_virt()
+    │       │               && cpu_has_vmx_virtual_intr_delivery()
+    │       │               && cpu_has_vmx_posted_intr()      (capabilities.h:274-279)
+    │       │              三个判据落在两张不同的控制表上（别都当成 Secondary）：
+    │       │                · "APIC-register virtualization"  = Secondary bit 8
+    │       │                  (capabilities.h:187-191, VMX_FEATURE_APIC_REGISTER_VIRT
+    │       │                   = 2*32+8, vmxfeatures.h:70)
+    │       │                · "virtual-interrupt delivery"    = Secondary bit 9
+    │       │                  (capabilities.h:193-197, VMX_FEATURE_VIRT_INTR_DELIVERY
+    │       │                   = 2*32+9, vmxfeatures.h:71)
+    │       │                · "Process posted interrupts"     = **Pin-Based** bit 7
+    │       │                  (capabilities.h:92-95 读 pin_based_exec_ctrl &
+    │       │                   PIN_BASED_POSTED_INTR；
+    │       │                   VMX_FEATURE_POSTED_INTR = 0*32+7, vmxfeatures.h:21)
+    │       │
+    │       ├─ enable_ipiv ← enable_apicv && cpu_has_vmx_ipiv()   (vmx.c:8495-8496)
+    │       │              注意 ipiv 的硬件位在 **Tertiary** Exec controls:
+    │       │              cpu_has_vmx_ipiv() = cpu_based_3rd_exec_ctrl &
+    │       │              TERTIARY_EXEC_IPI_VIRT              (capabilities.h:281-284)
+    │       │
+    │       └─ Guest 侧 VT-d Posted Interrupt（IRTE 进 Posted 模式）
+    │              ← enable_apicv && irq_remapping_cap(IRQ_POSTING_CAP)
+    │              (arch/x86/kvm/x86.c:13662 → enable_posted_intr)
+    │              —— 这是"IR 层的 PI"，与上面 CPU 侧的 "Process posted
+    │                 interrupts" 是一对，缺任一侧都不成立
     │
-    └─ FlexPriority 要求：TPR Shadow
+    └─ flexpriority_enabled ← cpu_has_vmx_flexpriority()
+                             == cpu_has_vmx_tpr_shadow()
+                              && cpu_has_vmx_virtualize_apic_accesses()
+                             (capabilities.h:286-290；vmx.c:8452-8453)
 ```
+
+**纠正旧表述（2026-11-25 核查，见本章 corrections.md 勘误 4）**：原来这张图写的是
+"APICv 要求：虚拟中断投递 + **EOI 虚拟化 + MSR 位图**"。按源码，
+`cpu_has_vmx_apicv()`（`capabilities.h:274-279`）的三个合取项是
+**APIC-register virtualization + virtual-interrupt delivery + Process posted interrupts**，
+既**不含 EOI 虚拟化**，也**不含 MSR 位图**：
+
+```c
+/* 来源: arch/x86/kvm/vmx/capabilities.h:274-284 */
+static inline bool cpu_has_vmx_apicv(void)
+{
+	return cpu_has_vmx_apic_register_virt() &&
+		cpu_has_vmx_virtual_intr_delivery() &&
+		cpu_has_vmx_posted_intr();
+}
+
+static inline bool cpu_has_vmx_ipiv(void)
+{
+	return vmcs_config.cpu_based_3rd_exec_ctrl & TERTIARY_EXEC_IPI_VIRT;
+}
+```
+
+（补充两点容易混的：
+
+- **EOI 虚拟化不是一道入门判据，也没有 `SECONDARY_EXEC_VIRTUALIZE_APIC_WRITES` 这个符号**
+  （6.12.93 全树无此宏）。硬件侧的实现载体是 VMCS 的 `EOI_EXIT_BITMAP0..3`
+  （字段号 `arch/x86/include/asm/vmx.h:235-242`；运行期由
+  `vmx_load_eoi_exitmap()` `arch/x86/kvm/vmx/vmx.c:6958-6965` 按 LAPIC 的 ISRR 刷进去；
+  vCPU 初始化时若 `enable_apicv && lapic_in_kernel()` 先把四个 bitmap 清零，
+  `vmx.c:4755-4760`），只在 VID 生效时才有意义。`fasteoi` 参数
+  （`vmx.c:111-112`，默认 1，0444）是另一码事：它只是 `handle_apic_access()`
+  （`vmx.c:5676-5698`）里对"guest 用 MOV 写 xAPIC EOI 寄存器"这一种 access 走的捷径
+  ——直接 `kvm_lapic_set_eoi()` + 跳指令，省掉一遍重量级指令模拟。
+- **"FlexPriority 要求 TPR Shadow" 也不完整**：`cpu_has_vmx_flexpriority()`
+  = `cpu_has_vmx_tpr_shadow() && cpu_has_vmx_virtualize_apic_accesses()`
+  （`capabilities.h:286-290`），后者读的是 Secondary bit 0
+  "Virtualize APIC accesses"（`capabilities.h:139-143`）。）
 
 ---
 
@@ -489,20 +750,49 @@ __init int vmx_hardware_setup(void)
 
 **文件**: `arch/x86/kvm/vmx/vmx.c:89-125`
 
-| 参数名 | 变量名 | 权限 | 默认 | 作用 |
-|--------|--------|------|------|------|
-| `ept` | `enable_ept` | 0444 | 1 | Extended Page Tables |
-| `eptad` | `enable_ept_ad_bits` | 0444 | 1 | EPT A/D 位 |
-| `vpid` | `enable_vpid` | 0444 | 1 | Virtual Processor ID |
-| `apicv` | `enable_apicv` | 0444 | 1 | APIC 虚拟化（含 PI）|
-| `ipiv` | `enable_ipiv` | 0444 | 1 | 虚拟 IPI 投递 |
-| `nested` | `nested` | 0444 | 1 | 嵌套虚拟化 |
-| `unrestricted_guest` | `enable_unrestricted_guest` | 0444 | 1 | 无限制 Guest |
-| `flexpriority` | `flexpriority_enabled` | 0444 | 1 | TPR Shadow |
-| `emulate_invalid_guest_state` | 同名 | 0444 | 1 | 模拟无效 Guest 状态 |
+| 参数名（`/sys/module/kvm_intel/parameters/`） | 变量名 | 权限 | 默认 | 注册处 | 作用 |
+|--------|--------|------|------|------|------|
+| `ept` | `enable_ept` | 0444 | 1 | `vmx.c:98-99` `module_param_named` | Extended Page Tables |
+| `eptad` | `enable_ept_ad_bits` | 0444 | 1 | `vmx.c:105-106` | EPT A/D 位 |
+| `vpid` | `enable_vpid` | 0444 | 1 | `vmx.c:89-90` | Virtual Processor ID |
+| **`enable_apicv`** | `enable_apicv` | 0444 | 1 | `vmx.c:114` `module_param` | APIC 虚拟化（含 PI）|
+| **`enable_ipiv`** | `enable_ipiv` | 0444 | 1 | `vmx.c:117` `module_param` | 虚拟 IPI 投递 |
+| `nested` | `nested` | 0444 | 1 | `vmx.c:124-125` | 嵌套虚拟化 |
+| `unrestricted_guest` | `enable_unrestricted_guest` | 0444 | 1 | `vmx.c:101-103` | 无限制 Guest |
+| `flexpriority` | `flexpriority_enabled` | 0444 | 1 | `vmx.c:95-96` | TPR Shadow |
+| `emulate_invalid_guest_state` | 同名 | 0444 | 1 | `vmx.c:108-109` | 模拟无效 Guest 状态 |
+
+**纠正旧表述（2026-11-25 核查，见本章 corrections.md 勘误 4）**：原表把这两行写成
+"参数名 `apicv` / `ipiv`"。它们是 `module_param()`（不是 `module_param_named()`），
+**参数名与变量同名**：
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:113-117 */
+module_param(enable_apicv, bool, 0444);
+
+bool __read_mostly enable_ipiv = true;
+module_param(enable_ipiv, bool, 0444);
+```
+
+宿主实测与之一致（不存在 `apicv`/`ipiv` 这两个文件）：
+
+```
+$ ls /sys/module/kvm_intel/parameters/ | grep -E 'apicv|ipiv'
+enable_apicv          enable_ipiv
+$ cat /sys/module/kvm_intel/parameters/enable_apicv   # → Y
+$ cat /sys/module/kvm_intel/parameters/enable_ipiv    # → N
+$ stat -c %a /sys/module/kvm_intel/parameters/enable_apicv   # → 444
+```
+
+还有一个容易踩的细节：`enable_apicv` 这个**变量并不在 vmx.c 里**，它定义在
+`arch/x86/kvm/x86.c:229-230`（`bool __read_mostly enable_apicv = true;` +
+`EXPORT_SYMBOL_GPL`，属于 kvm.ko），`vmx.c:114` 只是用 `module_param()` 把这个
+**已存在变量的符号**注册成 kvm-intel.ko 的参数（全树检索 `module_param.*enable_apicv`
+只命中这一处 —— SVM 侧没有重复注册，AMD 用 AVIC 那套自己的开关）。所以
+`modprobe kvm_intel enable_apicv=0` 改的是 kvm.ko 的全局量，不是模块私有状态。
 
 **参数名 vs 变量名**：`module_param_named(参数名, 变量名, ...)` 允许两者不同（如 `ept` 参数对应
-`enable_ept` 变量），`module_param(变量名, ...)` 则同名。
+`enable_ept` 变量），`module_param(变量名, ...)` 则同名 —— 上表最后一列就是区分这两者的依据。
 
 **权限 `0444` 意味着什么？** 模块加载后**不能改**。要在加载时设置：
 
@@ -531,29 +821,64 @@ struct kvm_x86_init_ops vt_init_ops __initdata = {
 ```
 
 ```
-module_init(kvm_intel)
+module_init(vmx_init)                       ← vmx.c:8638 / 注册在 vmx.c:8699
   │
-  ├→ kvm_init(&vt_init_ops)              ← kvm_main.c
-  │   │
-  │   ├→ kvm_arch_hardware_setup()       ← x86.c
-  │   │   └→ vt_init_ops.hardware_setup()
-  │   │       └→ vmx_hardware_setup()
-  │   │           ├→ setup_vmcs_config()       ← 读 VMX MSR
-  │   │           ├→ 特性检测 + 裁剪
-  │   │           └→ 配置回调表（禁用不用的）
-  │   │
-  │   ├→ static_call_update(kvm_x86_*, ...) ← 把回调指针烤进代码
-  │   │
-  │   └→ kvm_chardev_ops 注册（/dev/kvm）
+  ├→ kvm_is_vmx_supported() + hv_init_evmcs()          ← vmx.c:8642-8650
   │
-  └→ 完成，可以接受 ioctl 了
+  ├→ kvm_x86_vendor_init(&vt_init_ops)     ← 调用在 vmx.c:8651，
+  │   │     定义在 x86.c:9741（不是 kvm_main.c！）
+  │   │     └ 这里才是"把 vt_init_ops 交给通用层"的入口
+  │   ├→ kvm_mmu_vendor_module_init()                            ← x86.c:9797
+  │   ├→ ops->hardware_setup()                                  ← x86.c:9821
+  │   │     └→ vmx_hardware_setup()                     ← vmx.c:8404
+  │   │         ├→ setup_vmcs_config()       ← 读 VMX capability MSR（vmx.c:8415）
+  │   │         ├→ 特性检测 + 按依赖裁剪（enable_ept/vpid/apicv/ipiv/...）
+  │   │         └→ 就地改 vt_x86_ops 的回调（如 sync_pir_to_irr = NULL）
+  │   ├→ kvm_ops_update(ops)                                     ← x86.c:9825
+  │   │     ├→ memcpy(&kvm_x86_ops, ops->runtime_ops, ...)       ← x86.c:9700
+  │   │     └→ static_call_update(kvm_x86_*, ...)                ← 烤进调用点
+  │   └→ 逐 CPU 兼容性检查 kvm_x86_check_cpu_compat()         ← x86.c:9827-9828
+  │
+  ├→ vmx_setup_l1d_flush()                                      ← vmx.c:8662
+  ├→ per-CPU INIT_LIST_HEAD + pi_init_cpu()                     ← vmx.c:8666-8670
+  │
+  └→ kvm_init(sizeof(struct vcpu_vmx), __alignof__(struct vcpu_vmx),
+              THIS_MODULE)                                       ← vmx.c:8686
+        └→ kvm_main.c:6476
+            ├→ kvm_chardev_ops.owner = module                    ← kvm_main.c:6510
+            └→ misc_register(&kvm_dev)  → /dev/kvm 出现          ← kvm_main.c:6534
 ```
+
+**纠正旧表述（2026-11-25 核查，见本章 corrections.md 勘误 4）**：原来这段写的是
+`module_init(kvm_intel) → kvm_init(&vt_init_ops) ← kvm_main.c → kvm_arch_hardware_setup()`。
+三处与 6.12.93 不符：
+
+1. **没有 `kvm_intel` 这个符号**，模块入口是 `vmx_init()`（`vmx.c:8638`，
+   `module_init(vmx_init)` 在 `vmx.c:8699`）。
+2. **`kvm_init()` 不接 `ops` 参数**，签名是
+   `int kvm_init(unsigned vcpu_size, unsigned vcpu_align, struct module *module)`
+   （`include/linux/kvm_host.h:1058`，定义 `virt/kvm/kvm_main.c:6476`）——
+   它只负责通用字符设备/vCPU 对象大小，**不做 hardware_setup**。
+   把 `vt_init_ops` 交出去的是 `kvm_x86_vendor_init()`（`x86.c:9741`）。
+3. **6.12.93 里已经没有 `kvm_arch_hardware_setup()`**（全树无此符号）。
+   通用层直接调 `ops->hardware_setup()`（`x86.c:9821`）。
+   "开硬件"也挪走了：现在由 `enable_virt_at_load`（`kvm_main.c:5583-5584`，默认 1）
+   或**第一个 VM 创建时**经 `kvm_enable_virtualization()`（`kvm_main.c:5693`，
+   调用点 `kvm_create_vm()` `kvm_main.c:1228`）→
+   `kvm_arch_enable_virtualization_cpu()`（`x86.c:12682`）→
+   `kvm_x86_call(enable_virtualization_cpu)()`（`x86.c:12698`）→
+   `vmx_enable_virtualization_cpu()`（`vmx.c:2853`，这才是 VMXON 的地方）。
+
+顺序上有个细节值得记：**static_call 烤入发生在 `kvm_x86_vendor_init()` 里，
+早于 `kvm_init()` 注册 `/dev/kvm`**——`vmx_init()` 的注释也明说
+"Common KVM initialization _must_ come last, after this, /dev/kvm is exposed to
+userspace!"（`vmx.c:8682-8685`）。
 
 ### Q: 为什么需要 `vt_init_ops` 和 `vt_x86_ops` 两张表？
 
 | 表 | 生命周期 | 用途 |
 |----|---------|------|
-| `vt_init_ops` | `__initdata`，初始化后释放 | 只给 `kvm_init()` 用一次，含 `hardware_setup` |
+| `vt_init_ops` | `__initdata`，初始化后释放 | 只给 `kvm_x86_vendor_init()`（`x86.c:9741`）用一次，含 `hardware_setup` |
 | `vt_x86_ops` | 回调指针拷进 `static_call`，结构体本身可释放 | 运行期所有 VMX 操作入口 |
 
 分两张表的原因：`hardware_setup` 这类初始化函数只在加载时调用一次，没必要占着运行时

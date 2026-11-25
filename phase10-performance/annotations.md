@@ -17,22 +17,36 @@ KVM **从不设置** `CPU_BASED_PAUSE_EXITING`。`PAUSE_INSTRUCTION`（退出号
 超过窗口才退出：
 
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c:5911-5924 */
+/* 来源: arch/x86/kvm/vmx/vmx.c:5911-5924（逐字，含源码原注释） */
 static int handle_pause(struct kvm_vcpu *vcpu)
 {
-    if (!kvm_pause_in_guest(vcpu->kvm))
-        grow_ple_window(vcpu);          /* ★ PLE 退出 → 放大窗口 */
+	if (!kvm_pause_in_guest(vcpu->kvm))
+		grow_ple_window(vcpu);          /* ★ PLE 退出 → 放大窗口 */
 
-    /* SDM 25.1.3: PAUSE-loop exiting is ignored if CPL > 0.
-     * KVM 从不设 PAUSE_EXITING，所以到达这里的 vCPU 必定 CPL=0 */
-    kvm_vcpu_on_spin(vcpu, true);       /* ★ 定向让出 */
-    return kvm_skip_emulated_instruction(vcpu);
+	/*
+	 * Intel sdm vol3 ch-25.1.3 says: The "PAUSE-loop exiting"
+	 * VM-execution control is ignored if CPL > 0. OTOH, KVM
+	 * never set PAUSE_EXITING and just set PLE if supported,
+	 * so the vcpu must be CPL=0 if it gets a PAUSE exit.
+	 */
+	kvm_vcpu_on_spin(vcpu, true);           /* ★ 定向让出 */
+	return kvm_skip_emulated_instruction(vcpu);
 }
 ```
 
-### Q: 为什么 SDM 25.1.3 那句话决定了实验设计？
+### Q: 为什么"PLE 在 CPL > 0 时被忽略"这句规范决定了实验设计？
 
-*"PAUSE-loop exiting VM-execution control is ignored if CPL > 0"* ——
+规范原文（intel-vmx.pdf, **Section 26.1.3 "Instructions That Cause VM Exits
+Conditionally"**，PAUSE 条目末尾）：
+
+> The "PAUSE-loop exiting" VM-execution control is ignored if CPL > 0.
+
+★ **章节号不要照抄源码注释**：上面 `vmx.c:5916-5921` 的注释写的是
+"Intel sdm vol3 **ch-25.1.3**"，那是旧版编号；本章规范副本
+（`../spec/intel-vmx.pdf`）里这段在 **26.1.3**，且全 PDF 中 "25.1.3" 出现 **0 次**
+（该句所在页页眉为 "Vol. 3C 26-3"；`Section 26.1.3` 作为交叉引用在 PDF 里出现 30 次）。
+以规范为准，源码注释为辅。
+
 **用户态自旋永远不会产生 PLE 退出**。推论：
 
 - `stress-ng --mutex/--futex` 这类用户态争抢**不可能**触发 PLE，只能当阴性对照
@@ -68,35 +82,41 @@ static void grow_ple_window(struct kvm_vcpu *vcpu)
 **文件**: `arch/x86/kvm/x86.h:96` — `__shrink_ple_window()`
 
 ```c
-/* 来源: arch/x86/kvm/x86.h:96-107 */
+/* 来源: arch/x86/kvm/x86.h:96-107（逐字） */
 static inline unsigned int __shrink_ple_window(unsigned int val,
-        unsigned int base, unsigned int modifier, unsigned int min)
+		unsigned int base, unsigned int modifier, unsigned int min)
 {
-    if (modifier < 1)                  /* ★ shrink=0 → 直接回 base */
-        return base;
+	if (modifier < 1)                  /* ★ shrink=0 → 直接回 base */
+		return base;
 
-    if (modifier < base)
-        ret /= modifier;
-    else
-        ret -= modifier;
+	if (modifier < base)
+		val /= modifier;
+	else
+		val -= modifier;
 
-    return max(ret, (u64)min);
+	return max(val, min);
 }
 ```
+
+> **勘误**：本节旧版把这段抄成了 `ret /= modifier; … return max(ret, (u64)min);` ——
+> 那是 `__grow_ple_window()`（`x86.h:80-94`，局部变量是 `u64 ret`、收尾
+> `return min(ret, (u64)max)`）的形态。shrink 版没有 `u64` 中间量、
+> 变量名是形参 `val`，末行是无强制转换的 `max(val, min)`。结论不受影响，
+> 但代码示例必须与源码一致（见 `../corrections.md` C19）。
 
 `modifier < 1` 早退意味着：默认 `ple_window_shrink = 0`（`arch/x86/kvm/x86.h:75`）
 不是"不缩小"，而是**一旦被抢占，窗口直接回到全局 4096**。
 
 ### Q: 窗口回落只在什么条件下发生？
 
-**文件**: `arch/x86/kvm/vmx/vmx.c:1519` — `vmx_vcpu_load()`
+**文件**: `arch/x86/kvm/vmx/vmx.c:1520` — `vmx_vcpu_load()`
 
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c:1519-1523 */
+/* 来源: arch/x86/kvm/vmx/vmx.c:1520-1522（逐字） */
 void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 {
-    if (vcpu->scheduled_out && !kvm_pause_in_guest(vcpu->kvm))
-        shrink_ple_window(vcpu);       /* ★ 唯一的回落点 */
+	if (vcpu->scheduled_out && !kvm_pause_in_guest(vcpu->kvm))
+		shrink_ple_window(vcpu);       /* ★ 唯一的回落点 */
 ```
 
 条件 `vcpu->scheduled_out` 由 `kvm_sched_out()` 置位。
@@ -108,7 +128,7 @@ void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 
 ### Q: 关掉 PLE 有哪两条路？
 
-**文件**: `arch/x86/kvm/vmx/vmx.c:7638` — `vmx_vm_init()`
+**文件**: `arch/x86/kvm/vmx/vmx.c:7637` — `vmx_vm_init()`
 
 | 路径 | 机制 | 影响范围 |
 |------|------|---------|
@@ -116,20 +136,26 @@ void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 | per-VM | `KVM_CAP_X86_DISABLE_EXITS` + `KVM_X86_DISABLE_EXITS_PAUSE` | 只影响本 VM |
 
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c:7638-7641 */
+/* 来源: arch/x86/kvm/vmx/vmx.c:7637-7640（逐字） */
 int vmx_vm_init(struct kvm *kvm)
 {
-    if (!ple_gap)
-        kvm->arch.pause_in_guest = true;
+	if (!ple_gap)
+		kvm->arch.pause_in_guest = true;
 ```
 
+两条路的终点都是 `pause_in_guest`，硬件位由
+`vmx_secondary_exec_control()`（`vmx.c:4608` 起）清掉：
+
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c:4627-4628 */
-    if (kvm_pause_in_guest(vmx->vcpu.kvm))
-        exec_control &= ~SECONDARY_EXEC_PAUSE_LOOP_EXITING;
+/* 来源: arch/x86/kvm/vmx/vmx.c:4627-4628（逐字） */
+	if (kvm_pause_in_guest(vmx->vcpu.kvm))
+		exec_control &= ~SECONDARY_EXEC_PAUSE_LOOP_EXITING;
 ```
 
 两条路实验形态完全不同：前者改一次影响全宿主（需重载模块），后者每个 VM 独立。
+★ 但 **per-VM 那条不要用 QEMU 的 `-overcommit cpu-pm=on` 来实现** —— 它一次传
+四个位，会把 HLT/MWAIT/CSTATE 一起关掉；只要 PAUSE 位得自己下发 cap
+（判据与逐位落点见 [parameters.md](parameters.md) §7）。
 
 ### Q: `kvm_vcpu_on_spin()` 到底在挑谁？
 
@@ -327,25 +353,77 @@ guest 侧长尾变少。`eager_page_split` 是 **0644**，可运行时调。
 
 ### Q: PML 的真实开销模型是什么？旧版讲反了哪？
 
-PML 是硬件行为：开启后，guest 对可写页的**首次写**由硬件把 GPA 追加进 512 条目的
-VMCS 缓冲区（`PML_ENTITY_NUM`，`arch/x86/kvm/vmx/vmx.h:336`），缓冲区耗尽才产生
+PML 是硬件行为：开启后，guest 对可写页的**首次写**（准确说：处理器需要把某条 EPT
+表项的 dirty flag 由 0 改 1 时）由硬件把 GPA 追加进日志，日志满才产生
 `PML_FULL`（退出号 **62**）。**正常写入不退出**。
 
-关键修正：`handle_pml_full()` 其实**什么都不做**：
+★ **日志不在 VMCS 里**（本节旧版写成"512 条目的 VMCS 缓冲区"，是错的）。
+规范（intel-vmx.pdf, **Section 29.3.6 Page-Modification Logging**）：
+
+> The page-modification log is a **4-KByte region of memory** located at the physical
+> address in the PML address VM-execution control field. The page-modification log
+> consists of 512 64-bit entries; the PML index VM-execution control field indicates
+> the next entry to use.
+
+VMCS 里只有两个字段：`PML_ADDRESS`（指向那块内存）与 `GUEST_PML_INDEX`（下一个空位，
+**从 511 往下减**）。源码一一对上：
 
 ```c
-/* 来源: arch/x86/kvm/vmx/vmx.c:5962-5985 */
+/* 来源: arch/x86/kvm/vmx/vmx.c:4820-4823（逐字） */
+	if (enable_pml) {
+		vmcs_write64(PML_ADDRESS, page_to_phys(vmx->pml_pg));
+		vmcs_write16(GUEST_PML_INDEX, PML_ENTITY_NUM - 1);
+	}
+```
+
+`vmx->pml_pg` 是 `alloc_page()` 拿到的**一个物理页**（`vmx.c:7536`，声明
+`struct page *pml_pg` 在 `vmx.h:337`），512 条目的上限来自 `PML_ENTITY_NUM 512`
+（`vmx.h:336`），消费端 `vmx_flush_pml_buffer()` 用 `page_address(vmx->pml_pg)`
+取回它（`vmx.c:6200`）。规范还有一条常被漏掉的语义：日志满时**该次访问不执行**、
+dirty flag 也不置位（"the accessed or dirty flag is not set, and the guest-physical
+access that triggered the event does not occur"），所以 `PML_FULL` 之后同一页会被重试
+并重新记账 —— 这就是"每 512 页一次退出"而不是"每 512 页才记一次"。
+
+另外两条**硬件位的开合条件**，直接决定"每次退出的 flush"这笔账有多大：
+
+| 条件 | 源码 | 后果 |
+|---|---|---|
+| PML 依赖 EPT **与** EPT A/D 位 | `vmx.c:8525-8526`（判据），源码注释原话 *"PML depends on them to work"* 在 `:8521-8524` | `eptad=0` 时 `enable_pml` 被强制清零，且 `cpu_dirty_log_size = 0`（`:8528-8529`）→ 脏日志退回**逐页写保护**路径 |
+| VMCS 里的 PML 位只在**真有 memslot 开着脏日志**时保持 | `vmx.c:4656-4657`（注释在 `:4651-4655`） | 模块参数 `pml=1` 只是"允许"；没人做迁移时硬件根本不记 → 每次退出那次 flush 只剩 `vmcs_read16` + 空早退（`vmx.c:6188-6192`） |
+
+关键修正：`handle_pml_full()` **不消费 PML buffer**。
+（★ 本节旧版写"其实什么都不做"，把中间那段 NMI blocking 善后一起否掉了 ——
+`corrections.md` C4 的说法才是准确的：**只做 NMI blocking，不碰 buffer**。）
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:5962-5985（源码逐字；只有末行的 ★ 是本章注解） */
 static int handle_pml_full(struct kvm_vcpu *vcpu)
 {
-    trace_kvm_pml_full(vcpu->vcpu_id);
+	unsigned long exit_qualification;
 
-    /* PML buffer already flushed at beginning of VMEXIT.
-     * Nothing to do here.., and there's no userspace involvement needed for PML. */
-    return 1;                            /* ★ 直接返回，不消费 buffer */
+	trace_kvm_pml_full(vcpu->vcpu_id);
+
+	exit_qualification = vmx_get_exit_qual(vcpu);
+
+	/*
+	 * PML buffer FULL happened while executing iret from NMI,
+	 * "blocked by NMI" bit has to be set before next VM entry.
+	 */
+	if (!(to_vmx(vcpu)->idt_vectoring_info & VECTORING_INFO_VALID_MASK) &&
+			enable_vnmi &&
+			(exit_qualification & INTR_INFO_UNBLOCK_NMI))
+		vmcs_set_bits(GUEST_INTERRUPTIBILITY_INFO,
+				GUEST_INTR_STATE_NMI);
+
+	/*
+	 * PML buffer already flushed at beginning of VMEXIT. Nothing to do
+	 * here.., and there's no userspace involvement needed for PML.
+	 */
+	return 1;                            /* ★ 不读 buffer、不叫用户态 */
 }
 ```
 
-真正的消费在**每一次 VM-Exit 的最前面**，与退出原因无关：
+真正的消费在**每一次 VM-Exit 处理的最前面**（`__vmx_handle_exit()`），与退出原因无关：
 
 ```c
 /* 来源: arch/x86/kvm/vmx/vmx.c:6451-6452 */
@@ -416,19 +494,36 @@ static int handle_pml_full(struct kvm_vcpu *vcpu)
 **只在"离开 TSC 基"这一侧动作**；换回 `tsc` 时 `gtod_is_based_on_tsc()` 为真，
 整条链根本不启动。同时把全局 `kvm_guest_has_master_clock` 清 0。
 
-**开的那条边没有任何自动触发**。重算 `ka->use_master_clock` 的入口只有六个：
+**clocksource 换回 `tsc` 这一事件本身不会触发任何 KVM 代码**（notifier 只在离边动作，
+`pvclock_gtod_notify()` `:9687-9689` 的 `&&` 已经说明了方向）。
+但**这不等于"已经在跑的 VM 就永远停在关闭态"** —— 重算 `ka->use_master_clock` 的入口
+是一批与 clocksource 切换无关的事件，它们中的任何一个都可能把 on 边重新踩下去。
+6.12.93 里这样的入口有 **9 个**（旧版只列了六个）—— 其中三个是**直接调重算函数**
+（`pvclock_update_vm_gtod_copy()` 的调用点只有 `:3086`/`:7024`/`:9504`/`:12844` 四处），
+另外六个是**发 `KVM_REQ_MASTERCLOCK_UPDATE` 请求**、等该 vCPU 下一次进 guest 时由
+`kvm_update_masterclock()` 消费（请求点 `:2361`/`:2538`/`:9652`/`:12761` +
+`hyperv.c:1439` + `xen.c:101`）：
 
-| 重算点 | 位置 | 谁能碰它 |
+| 重算入口 | 位置 | 谁能碰它 |
 |--------|------|---------|
-| `kvm_arch_init_vm()` | `:12803`，调用 `:12844` | 新建 VM |
-| `kvm_vm_ioctl_set_clock()` | `:7006`→`:7024` | 迁移恢复 |
-| `__kvm_synchronize_tsc()` | `:2670`→`:2714` | vCPU 创建后、guest 写 MSR_IA32_TSC |
-| `kvm_write_system_time()` | `:2354-2361` | 新旧 kvmclock MSR 切换 |
-| `kvm_hyperv_tsc_notifier()` | `:9483`→`:9504` | Hyper-V |
-| `pvclock_gtod_update_fn()` | `:9643` | **只有 TSC→非 TSC 一条边** |
+| `kvm_arch_init_vm()` | `:12803`，调用 `:12844` | 新建 VM（**直接重算**） |
+| `kvm_vm_ioctl_set_clock()` | `:7006`→`:7024` | 迁移恢复 `KVM_SET_CLOCK`（直接重算） |
+| `kvm_hyperv_tsc_notifier()` | `:9483`→`:9504` | Hyper-V 宿主回调（直接重算） |
+| `kvm_update_masterclock()` | `:3082`→`:3086` | 下面这些**发请求**的入口的公共出口 |
+| `__kvm_synchronize_tsc()` | `:2670`→`:2714`（`kvm_track_tsc_matching()` 判定在 `:2536-2537`、发请求在 `:2538`） | **新建 vCPU**：`kvm_arch_vcpu_postcreate()` `:12463`→`:12470`；**宿主**写 `MSR_IA32_TSC`（`msr_info->host_initiated` 分支 `:3939-3940`，即 `KVM_SET_MSRS`/迁移恢复）；宿主设 vCPU TSC 频率：`kvm_arch_tsc_set_attr()` `:5757`→`:5784`。★ **guest 自己**写 `MSR_IA32_TSC` 走的是 `else` 分支的 `adjust_tsc_offset_guest()`（`:3942-3943`），**不**发这个请求 |
+| `kvm_write_system_time()` | `:2354-2361` | guest 写**旧版** `MSR_KVM_SYSTEM_TIME`（要求 `vcpu_id == 0 && !host_initiated`） |
+| `pvclock_gtod_update_fn()` | `:9643`，请求点 `:9652` | **只有 TSC→非 TSC 这一条边** |
+| `kvm_hv_set_msr_pw()` | `arch/x86/kvm/hyperv.c:1375` 起，请求在 `:1439` | guest 启用 TSC reference page（写 `HV_X64_MSR_REFERENCE_TSC`） |
+| `kvm_xen_shared_info_init()` | `arch/x86/kvm/xen.c:38` 起，请求在 `:101` | Xen PV 的 wall-clock 重建（**发给全 VM 所有 vCPU**） |
+| `kvm_arch_enable_virtualization_cpu()` | `arch/x86/kvm/x86.c:12682` 起，请求在 `arch/x86/kvm/x86.c:12761` | CPU 上线/恢复启动时检测到 **TSC 倒退**（suspend/hibernate 恢复路径） |
 
-**结论**：宿主 `tsc` 换出去再换回来，已经在跑的 VM 不会恢复；
-同期新建的 VM 却是开着的。同一台宿主上两台 VM 的时钟路径就此分叉。
+**结论（按上面的分类，两句话都要说全）**：
+
+1. 宿主 `tsc` 换出去再换回来，**已经跑着且不再产生任何上述事件的 VM** 不会自己恢复 ——
+   同期新建的 VM 却是开着的，同一台宿主上两台 VM 的时钟路径就此分叉。
+2. 但只要发生 vCPU 创建、`KVM_SET_CLOCK`、guest 动那些 MSR/Hyper-V/Xen 接口，
+   **关闭态的 VM 也会被重新点亮**。所以"永久分叉"不成立，
+   `practice/bench-clock-master.md` 的 P2 只能证到"在**没有**上述事件的静默窗口里不恢复"。
 
 ### Q: 主时钟关着时，vCPU 迁移多付什么代价？
 
@@ -558,7 +653,7 @@ PLE 路径:
     │
     ├→ 硬件 PLE 机制检测到 → PAUSE_INSTRUCTION(40) VM-Exit
     │
-    └→ handle_pause()                    vmx.c:5907
+    └→ handle_pause()                    vmx.c:5911
         ├→ grow_ple_window()             vmx.c:1417
         │   └→ __grow_ple_window()       x86.h:80
         │       └→ vmx->ple_window 几何放大
@@ -577,7 +672,8 @@ PML 路径:
     │
     ├→ buffer 满: PML_FULL(62) VM-Exit
     │   └→ handle_pml_full()             vmx.c:5962
-    │       └→ return 1（什么都不做，buffer 已在 VM-Exit 开头 flush）
+    │       └→ return 1（不消费 buffer —— 它在 VM-Exit 处理开头已被 flush；
+    │           中间只做 NMI blocking 善后，见 §2.4）
     │
     └→ 每次 VM-Exit 开头:
         └→ vmx_flush_pml_buffer()        vmx.c:6182

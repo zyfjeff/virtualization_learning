@@ -204,8 +204,12 @@ grep -oE "constant_tsc|nonstop_tsc|tsc_deadline_timer|tsc_known_freq|tsc_adjust"
 ### 练习2: 观察 pvclock 共享页
 
 ```bash
-# 在 Host 上查看 pvclock 页的 GPA
-grep -E "pvclock|system_time" /sys/kernel/debug/kvm/*/vcpu* 2>/dev/null | head -10
+# ⚠️ KVM **没有**导出 pvclock 页 GPA 的 debugfs 入口（arch/x86/kvm/debugfs.c:61-75
+# 只创建 guest_mode、tsc-offset、lapic_timer_advance_ns、tsc-scaling-ratio、
+# tsc-scaling-ratio-frac-bits；实测宿主 vcpu0/ 亦如此）。想验证 guest 在用
+# 半虚拟化时钟，可看每 vCPU 的 TSC 锚点和 KVM_GET_CLOCK：
+cat /sys/kernel/debug/kvm/<pid>-<vmid>/vcpu0/tsc-offset
+# 配合练习5 的 KVM_GET_CLOCK 程序观察 clock/flags/host_tsc
 
 # 在 Guest 内查看 pvclock 页内容
 # 需要 root 权限和 debugfs
@@ -256,7 +260,7 @@ systemctl restart chrony
 chronyc sources
 chronyc tracking
 
-# 预期: stratum 1, 精度亚微秒级
+# 预期: stratum 1, 精度亚微秒级（量级预期，本仓待实测；方法见 phase10/measurement.md）
 ```
 
 ### 练习5: 观察 kvmclock_offset 变化
@@ -266,21 +270,27 @@ chronyc tracking
 # 需要 debugfs 和 root 权限
 
 # 方法 1: 通过 KVM_GET_CLOCK ioctl
+# ⚠️ KVM_GET_CLOCK / KVM_SET_CLOCK 都是 **VM ioctl**（api.rst §4.29/§4.30
+# "Type: vm ioctl"；内核分发在 kvm_vm_ioctl，x86.c:7307-7311）。
+# 实测（2026-11-25，宿主 6.8.0-51）：在 /dev/kvm fd 或 vCPU fd 上调用返回
+# EINVAL，必须用 KVM_CREATE_VM 创建的 VM fd。
 cat > /tmp/get_kvmclock.c << 'EOF'
 #include <stdio.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/kvm.h>
 
-int main(int argc, char *argv[]) {
-    int fd = open("/dev/kvm", O_RDWR);
+int main(void) {
+    int kvm_fd = open("/dev/kvm", O_RDWR);
+    int vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0UL);   /* ★ 必须 VM fd */
     struct kvm_clock_data data;
-    
-    ioctl(fd, KVM_GET_CLOCK, &data);
+
+    if (ioctl(vm_fd, KVM_GET_CLOCK, &data)) { perror("KVM_GET_CLOCK"); return 1; }
     printf("clock: %llu\n", data.clock);
     printf("flags: 0x%x\n", data.flags);
     printf("realtime: %llu\n", data.realtime);
-    
+    printf("host_tsc: %llu\n", data.host_tsc);   /* KVM_CLOCK_HOST_TSC 置位时有效 */
+
     return 0;
 }
 EOF
@@ -315,8 +325,9 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep -E "exit|timer"
 - [ ] 说明 TSC-deadline 为什么比 Periodic/One-shot 模式高效
 - [ ] 对比 `tsc` 与 `kvm-clock` 两个 clocksource 的读取路径、迁移语义与失效模式，
       说出 rating 400→299 让位逻辑（kvmclock.c:342-345）
-- [ ] 说出 VM 启动三个时间基准的首次同步点：`kvm_arch_init_vm` 归零
-      `kvmclock_offset`、`kvm_arch_vcpu_postcreate` 强制同步 TSC、
+- [ ] 说出 VM 启动三个时间基准的首次同步点：`kvm_arch_init_vm` 置
+      `kvmclock_offset = -get_kvmclock_base_ns()`（纪元从 0 起算，offset 本身
+      非 0，x86.c:12841）、`kvm_arch_vcpu_postcreate` 强制同步 TSC、
       首次 KVM_RUN 建立 masterclock
 - [ ] 解释 vm 迁移时 Guest 时间连续性的保证机制
 - [ ] 说明 kvmclock 的 pvclock 协议如何工作
@@ -394,7 +405,7 @@ expire = ktime_add_ns(now, ns);
 expire = ktime_sub_ns(expire, ktimer->timer_advance_ns);  /* ★ 同上 */
 ```
 
-**配置与观察**：
+**配置与观察**（以下按 **6.12.93 基线**）：
 ```bash
 # 唯一的模块参数是 bool 开关（权限 0444，运行时只读，
 # 只能在模块加载时改: modprobe kvm lapic_timer_advance=0）
@@ -405,6 +416,15 @@ cat /sys/kernel/debug/kvm/<pid>-<fd>/vcpu0/lapic_timer_advance_ns
 # 初始 1000 (LAPIC_TIMER_ADVANCE_NS_INIT, lapic.c:75)，自适应调整
 ```
 
+> ⚠️ **宿主版本差异（2026-11-25 实测）**：当前实验宿主是 Ubuntu
+> **6.8.0-51-generic**，其 kvm 模块的参数接口与 6.12.93 基线**不同**：
+> 没有 bool `lapic_timer_advance` 参数（上面第一条 `cat` 在本机会报
+> No such file），取而代之是一个**运行时可写**的 int 参数
+> `lapic_timer_advance_ns`（`/sys/module/kvm/parameters/lapic_timer_advance_ns`，
+> 权限 0644，实测当前值 -1）。per-vCPU debugfs 文件在本机存在（实测值 1000）。
+> 用宿主观测口做实验前先 `ls /sys/module/kvm/parameters/ | grep timer`
+> 确认接口形态；基线机制描述仍以 6.12.93 源码为准。
+
 **效果**：
 - 抵消定时器注入延迟，让中断尽量贴近 guest 编程的 deadline
 - 详见下文"陷阱4"对常见调优误区的澄清
@@ -413,23 +433,29 @@ cat /sys/kernel/debug/kvm/<pid>-<fd>/vcpu0/lapic_timer_advance_ns
 
 **问题**：多pCPU的TSC不同步
 
-**解决**：启动时检查TSC同步，标记为unstable
+**解决**：host 内核的 TSC watchdog/校准发现不同步后 `mark_tsc_unstable()`
+（`arch/x86/kernel/tsc.c`，KVM 自己的 `vcpu_load` 检测到倒退也会标
+`mark_tsc_unstable("KVM discovered backwards TSC")`，`x86.c:5018`）。
+`kvm_synchronize_tsc()`（`x86.c:2717`）**不检查各 pCPU 的偏移、也不标记
+unstable**，它只**消费** host 的稳定状态来决定 offset：TSC 稳定 → 所有 vCPU
+共享 `cur_tsc_offset`；不稳定 → 按流逝墙钟推进 guest TSC 值后重算 offset。
+`use_master_clock` 的取舍在别处：`pvclock_update_vm_gtod_copy()`
+（`x86.c:3034-3037`），masterclock 关掉后 kvmclock 退化为 per-vCPU 现读现算的
+慢路径（`x86.c:3260-3263`）。
 
 ```c
-/* x86.c 中实现 */
-
-/* kvm_synchronize_tsc() — x86.c:2717
- * 检查各pCPU的TSC偏移，如果差异过大则标记为不稳定
- */
-kvm_synchronize_tsc(vcpu, user_value)
-{
-    /* ... 检查 TSC 偏移 ... */
-    if (kvm_check_tsc_unstable()) {
-        /* 不使用纯TSC作为时钟源 */
-        kvm->arch.use_master_clock = false;
-        /* kvmclock 回退到 system_time 计算 */
-    }
-}
+/* 来源: arch/x86/kvm/x86.c:2771-2780 kvm_synchronize_tsc()（节选） */
+	if (synchronizing &&
+	    vcpu->arch.virtual_tsc_khz == kvm->arch.last_tsc_khz) {
+		if (!kvm_check_tsc_unstable()) {
+			offset = kvm->arch.cur_tsc_offset;
+		} else {
+			u64 delta = nsec_to_cycles(vcpu, elapsed);
+			data += delta;
+			offset = kvm_compute_l1_tsc_offset(vcpu, data);
+		}
+		matched = true;
+	}
 ```
 
 **检查**：
@@ -462,23 +488,27 @@ echo "clocksource=kvm-clock" >> /etc/default/grub
 update-grub && reboot
 ```
 
-### 陷阱2：kvmclock未启用
+### 陷阱2：guest 掉到低价时钟源（PIT/HPET/acpi_pm）
 
-**场景**：Guest使用PIT或HPET，性能差
+**场景**：Guest 使用 PIT 或 HPET 做 clocksource，性能差
 
-**症状**：`cyclictest`显示高延迟
+**症状**：`cyclictest` 显示高延迟；`current_clocksource` 显示 `hpet`/`acpi_pm` 等
 
-**原因**：kvmclock未启用
+**⚠️ 注意（与旧版本文档相反）**：现代 host（invariant TSC + vCPU 对齐）上
+guest 默认 clocksource **应该是 `tsc`**，不是 `kvm-clock`——kvmclock 在 TSC 可靠时
+主动把 rating 从 400 降到 299 让位（`arch/x86/kernel/kvmclock.c:342-345`，
+见 §4 对比小节与勘误 22）。所以"不是 kvm-clock 就切到 kvm-clock"是错的，
+先判断 tsc 为什么没被选中。
 
-**解决**：
+**排查/解决**：
 ```bash
 # Guest中检查
 cat /sys/devices/system/clocksource/clocksource0/current_clocksource
-# 应该是: kvm-clock
+cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+dmesg | grep -i "tsc\|clocksource"   # tsc 是否被标 unstable、kvm-clock 是否注册
 
-# 如果不是，手动切换
+# 仅当 tsc 被标 unstable、且需要固定 kvm-clock 时：
 echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource
-
 # 永久生效
 echo "clocksource=kvm-clock" >> /etc/default/grub
 update-grub && reboot
@@ -521,7 +551,9 @@ update-grub && reboot
   - 超过 MAX(5000) → 重置为 INIT(1000)
 - **仅适用于 TSC-deadline 模式**（Periodic/One-shot 不使用 timer advance）
 
-**正确做法**：
+**正确做法**（按 6.12.93 基线；**当前宿主 6.8.0-51-generic 接口不同**——
+它没有 `lapic_timer_advance` bool 参数，只有运行时可写的 int
+`lapic_timer_advance_ns` 模块参数，见上文"宿主版本差异"框）：
 ```bash
 # 开关 timer advance（bool 模块参数，权限 0444 → 运行时只读，
 # 只能在模块加载时指定）

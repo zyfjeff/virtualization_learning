@@ -526,42 +526,71 @@ out:
 
 ### Q: TX 路径的两种模式有什么区别？
 
-| 模式 | 触发条件 | 行为 | 性能 |
+| 模式 | 触发条件（源码） | 行为 | 性能 |
 |------|---------|------|------|
-| `handle_tx_copy` | 默认 | `copy_to_iter()` 拷贝到 skb，`sock_sendmsg()` 发送 | 简单可靠 |
-| `handle_tx_zerocopy` | `VHOST_NET_USE_VHOST_NET_ZCOPY` + 支持 | 页面直接挂到 skb（`skb_zerocopy_realloc`），需要等待 DMA 完成才能释放 | 高吞吐但复杂 |
+| `handle_tx_copy` | `!vhost_sock_zcopy(sock)`（`net.c:965`） | 把 `vq->iov` 建成 `iov_iter`（`init_iov_iter()` `net.c:616-626`），`sock->ops->sendmsg()` 发送（`net.c:816`） | 简单可靠 |
+| `handle_tx_zerocopy` | `vhost_sock_zcopy(sock)`（`net.c:962`）= 模块参数 **`experimental_zcopytx`**（`net.c:38` 默认 0，`:39` 0444）**且** socket 带 `SOCK_ZEROCOPY` | 页挂 ubuf（分配方为 `msg_zerocopy_realloc()`，`include/linux/skbuff.h:1734`），等 DMA 完成回调 `vhost_zerocopy_complete()`（`net.c:388`）后才回收 used | 高吞吐但复杂 |
+
+> ⚠️ 本行初版写的 `VHOST_NET_USE_VHOST_NET_ZCOPY` 与 `skb_zerocopy_realloc` **两个符号都不存在**
+> （全内核 0 命中），`copy_to_iter()` 也不是 TX 的拷贝方式（`net.c` 无该调用，
+> 只有 RX 的 hdr/num_buffers 修补用了它，见 `net.c:1198`/`:1214`）。已按源码改写。
+> 另：6.12 的 copy 模式下还有一条 XDP 批量路径 `vhost_net_build_xdp()`（`net.c:793`），
+> 仅当 `sk_sndbuf == INT_MAX` 时启用（`net.c:762`）。
 
 ### Q: `handle_rx()` 的批处理机制？
 
 **文件**: `drivers/vhost/net.c:1092`
 
+> ⚠️ 本块初版是"凭印象"写的伪代码：`handle_rx()` 里并不直接调 `vhost_net_buf_produce()`
+> （它只在 `vhost_net_buf_peek()` 内被调用，`net.c:216`），循环条件也不是
+> `!vhost_net_buf_is_empty()`。下面换成真实代码。
+
 ```c
-static void handle_rx(struct vhost_net *net)
-{
-    struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_RX];
-    struct vhost_virtqueue *vq = &nvq->vq;
-
-    /* ★ 从 TAP socket 收包到 vhost_net_buf（批量） */
-    vhost_net_buf_produce(nvq);    /* ptr_ring_consume_batched → 批量取 skb */
-
-    /* 逐个分发给 Guest */
-    while (!vhost_net_buf_is_empty(&nvq->rxq)) {
-        /* 从描述符链获取 buffer */
-        head = vhost_get_vq_desc(vq, vq->iov, ...);
-
-        /* 拷贝数据到 Guest buffer */
-        skb = vhost_net_buf_consume(&nvq->rxq);
-        /* copy_to_iter / zerocopy 到描述符指向的 Guest 内存 */
-
-        /* 写入 used ring */
-        vhost_add_used(vq, head, len);
-
-        /* 检查是否达到调度权重限制 */
-        if (vhost_exceeds_weight(vq, ++pkts, total_len))
-            break;
-    }
-}
+/* 来源: drivers/vhost/net.c:1138-1185（节选） */
+	do {
+		sock_len = vhost_net_rx_peek_head_len(net, sock->sk,
+						      &busyloop_intr);   /* :1139 */
+		if (!sock_len)
+			break;
+		sock_len += sock_hlen;
+		vhost_len = sock_len + vhost_hlen;
+		headcount = get_rx_bufs(vq, vq->heads + nvq->done_idx,
+					vhost_len, &in, vq_log, &log,
+					likely(mergeable) ? UIO_MAXIOV : 1); /* :1145 */
+		...
+		iov_iter_init(&msg.msg_iter, ITER_DEST, vq->iov, in, vhost_len); /* :1177 */
+		...
+		err = sock->ops->recvmsg(sock, &msg,
+					 vhost_len, MSG_DONTWAIT | MSG_TRUNC);   /* :1185 */
 ```
+
+```c
+/* 来源: drivers/vhost/net.c:1212-1227（节选） */
+		num_buffers = cpu_to_vhost16(vq, headcount);
+		if (likely(mergeable) &&
+		    copy_to_iter(&num_buffers, sizeof num_buffers,
+				 &fixup) != sizeof num_buffers) {   /* :1214 */
+			vq_err(vq, "Failed num_buffers write");
+			vhost_discard_vq_desc(vq, headcount);
+			goto out;
+		}
+		nvq->done_idx += headcount;
+		if (nvq->done_idx > VHOST_NET_BATCH)
+			vhost_net_signal_used(nvq);                /* :1222 */
+		...
+		total_len += vhost_len;
+	} while (likely(!vhost_exceeds_weight(vq, ++recv_pkts, total_len)));  /* :1227 */
+```
+
+要点（与初版的差异）：
+
+| 初版说法 | 实际源码 |
+|---|---|
+| `handle_rx()` 调 `vhost_net_buf_produce()` | 只在 `vhost_net_buf_peek()`（`net.c:209`，内部 `net.c:216`）里调用；`handle_rx` 通过 `vhost_net_rx_peek_head_len()`（`net.c:992`）间接触发批量预取 |
+| `while (!vhost_net_buf_is_empty(...))` | `do { ... } while (likely(!vhost_exceeds_weight(vq, ++recv_pkts, total_len)));`（`net.c:1227`）——按**包数/字节数权重**收敛 |
+| 取描述符用 `vhost_get_vq_desc()` | 用 `get_rx_bufs()`（`net.c:1145`），一次可吃多个描述符（`VIRTIO_NET_F_MRG_RXBUF`） |
+| 数据靠 vhost `copy_to_iter()` 写进 guest | 数据由 `sock->ops->recvmsg()`（`net.c:1185`）写进 `ITER_DEST` 指向的 `vq->iov`；`copy_to_iter()` 只用于 virtio-net hdr（`net.c:1198`）与 `num_buffers` 修补（`net.c:1214`） |
+| 逐个 `vhost_add_used()` | 攒到 `done_idx > VHOST_NET_BATCH` 才 `vhost_net_signal_used()` → `vhost_add_used_and_signal_n()`（`net.c:465`） |
 
 ---
 
@@ -622,7 +651,8 @@ case VHOST_SET_VRING_KICK:
    （KVM 把 kick 的 MMIO/PIO 写入直接转成 eventfd 信号，vhost 线程等待，省用户态往返）
 3. 引申（反事实）：如果不用 irqfd，vhost 注入中断要绕哪？
    （得回 QEMU 调 ioctl(KVM_INTERRUPT)——又回到用户态往返，卸载白做）
-4. 链尾：vhost 怎么访问 guest 内存？→ GPA→HVA via KVM memslot；
+4. 链尾：vhost 怎么访问 guest 内存？→ GPA→HVA via **vhost 自己的 `vhost_iotlb`**
+   （`VHOST_SET_MEM_TABLE` 建表，不是 KVM memslot；详见 vhost-net-datapath.md §4）；
    真机验证卸载 → practice vhost-perf-test.sh
 
 ### Q: vhost 如何避免 VM-Exit 回 QEMU？

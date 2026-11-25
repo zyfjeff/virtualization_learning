@@ -106,8 +106,12 @@ KVM_SET_CLOCK → kvm_vm_ioctl_set_clock() → kvm_guest_time_update()
 
 **预期输出**：
 ```
-[cap] KVM_CAP_ADJUST_CLOCK = 0x9
+[cap] KVM_CAP_ADJUST_CLOCK = 0xe
       → KVM_CLOCK_HOST_TSC supported (host_tsc field valid)
+      （0xe = KVM_CLOCK_TSC_STABLE|KVM_CLOCK_REALTIME|KVM_CLOCK_HOST_TSC
+       = 2|4|8，内核直接返回 KVM_CLOCK_VALID_FLAGS，x86.c:4714 +
+       kvm_host.h:2377-2378；宿主 6.8.0-51 实测亦为 0xe。
+       旧预期值 0x9 不成立，见勘误 30）
 
 ═══════════════════════════════════════════════════════════════
   Phase 1: Initial Clock Read (KVM_GET_CLOCK)

@@ -110,15 +110,15 @@ timeout）：i8042 命令寄存器 `0x64` 写 `0xFE`（`reboot.c:667`）与 CF9
 端口 `0xcf9` 写 bit1（`reboot.c:698`）。实测 `reboot -f` 后 VMM 打印
 `guest 复位请求 (port 0x64 val 0xfe)` 并退出。
 
-### CPUID 三处必改（相对 `KVM_GET_SUPPORTED_CPUID` 原样透传）
+### CPUID 必改点（相对 `KVM_GET_SUPPORTED_CPUID` 原样透传；注意 bit24/bit31 都得**自己置位**，supported CPUID 里两位都是 0）
 
 | leaf1 字段 | 处理 | 原因 |
 |-----------|------|------|
-| ECX bit24 `TSC_DEADLINE_TIMER` | 保留 | 缺则 `timer_mode_mask=1<<17`，deadline 设不上（`cpuid.c:399-402`） |
+| ECX bit24 `TSC_DEADLINE_TIMER` | **置位** | `KVM_GET_SUPPORTED_CPUID` 本就不含该位（`cpuid.c:647-660` 白名单把 bit24 写死为 0，与 bit31 同理；QEMU 也在 `target/i386/kvm/kvm.c:461-467` 自行补位），缺则 `timer_mode_mask=1<<17`，deadline 设不上（`cpuid.c:399-402`）；前提是 `KVM_CAP_TSC_DEADLINE_TIMER`=1（本机实测=1）+ in-kernel irqchip。**minivmm.c 现状未置**（`-p` 之外走 PIC/virtual-wire、不用 LAPIC timer，实测不受影响；guest 进 APIC 模式后要 deadline 必须手动置位） |
 | ECX bit31 `HYPERVISOR` | **置位** | `KVM_GET_SUPPORTED_CPUID` 不含它（实测 ECX=`0x76fab223`），缺了 PV 全灭（`kvm.c:877`） |
 | ECX bit21 `x2APIC` | 清零 | 第一版保持 xAPIC MMIO |
 | EBX[31:24] 初始 APIC ID | 归零 | 与 in-kernel LAPIC ID 0 对齐，否则 APIC ID mismatch（`topology_common.c:174-176`） |
-| EBX[23:16] 逻辑处理器数 | 改 1 | 宿主 96 对单 vCPU 无意义 |
+| EBX[23:16] 逻辑处理器数 | 改 1 | 字段为宿主透传（本机实测=64；96 是 nproc 概念，两者不同），对单 vCPU 无意义 |
 
 KVM 半虚拟化叶 `0x40000000/1` 宿主已填好（feature 叶 eax=`0x01007efb`），
 照抄即可，不要覆盖成最小集。
@@ -294,7 +294,11 @@ BAR2），已绑 `vfio-pci`、独占 IOMMU group 35。用 `-p` 打开直通模�
 96 线程、内核 6.8.0-51-generic；被测 guest 统一单 vCPU、
 内核 6.12.93-kvm-study（`scripts/vm/kernel-config`，CONFIG_HZ=250），
 M1/M2 内存 512 MB、M3 为 256 MB。QEMU 基线 10.1.0-rc2（`-accel kvm -cpu host`），
-q35 为默认 machine，microvm 为 `-machine microvm`。
+q35 为 bench 选用的 machine 类型（脚本显式 `-machine q35`，见
+`bench-boot.sh:57-58`；**10.1.0-rc2 的 x86 没有任何 `is_default` machine**，
+`hw/i386/` 全无设置、`system/vl.c:852-866` 找不到默认值时报
+"No machine specified, and there is no default"——省略 `-machine` 不是
+落到 q35 而是直接失败），microvm 为 `-machine microvm`。
 脚本：`bench-boot.sh`（M1）、`bench-exits.sh`（M2）、`bench-halt.sh` +
 `bench-halt-sweep.sh`（M3）；原始数据在 `bench/` 各输出目录。
 
@@ -339,9 +343,10 @@ i8042.noaux`，ready 1291.6 vs 1289.0 ms，无效。8250 那 253 ms 是
 
 反直觉点：minivmm 设备模型远小于 QEMU（无 PCI/ACPI/BIOS，首字节最快
 32.9 ms），boot 却比 q35 慢 300 ms——瓶颈不在模拟量，在缺固件信息把
-guest 推上了 msleep 密集的 legacy 探测路径。与
-`../phase11-microvm/README.md` 的结论一致：microvm 快既因砍设备，
-更因把该给的固件信息给全了。
+guest 推上了 msleep 密集的 legacy 探测路径。本对比本身即说明：
+microvm 快既因砍设备，更因把该给的固件信息（ACPI/FADT/PNP）给全了
+（原此处引用的 `../phase11-microvm/README.md` 在仓库中不存在，
+悬空引用已删，见 `../corrections.md` L6）。
 
 ### M2：VM-Exit 分布
 
@@ -385,8 +390,11 @@ boot（perf 包裹整个 VMM 进程）：
    `handle_level_irq`（`kernel/irq/chip.c`），每个 tick 都要
    mask/ack/unmask：IN 0x21、OUT 0x21、OUT 0x20、OUT 0x21
    （`mask_and_ack_8259A`/unmask，`drivers/irqchip/irq-i8259.c:48,134`，
-   用 `/tmp/mvidle.kvmexit15` 的 `kvm_exit` info1>>16 解码核对过序列与
-   rip 模式）。4×250 Hz=1000/s，且 15008/4≈3752=HLT 计数，自洽。
+   曾用 `/tmp/mvidle.kvmexit15` 的 `kvm_exit` info1>>16 解码核对过序列与
+   rip 模式——注：该原始 trace 在 `/tmp` 下已清理，未归档进
+   `bench/exits-20260901-101641/`，目前**不可复核**；4 次 PIO 序列与
+   `mask_and_ack_8259A()`/`enable_8259A_irq()` 的端口操作静态一致，
+   下一轮实验需重跑并归档）。4×250 Hz=1000/s，且 15008/4≈3752=HLT 计数，自洽。
    QEMU guest 有 MADT → LAPIC timer，每 tick **零** PIO，改为 250/s 的
    MSR_WRITE（x2APIC 寄存器经 MSR 访问，per-tick 重编程定时器）。
    同一个 250 Hz 时钟，投递载体决定了退出形态。

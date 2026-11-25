@@ -62,7 +62,7 @@ EPT 页表缺失或权限违规
     ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 8. direct_page_fault()                                      │
-│    arch/x86/kvm/mmu/mmu.c:4575                              │
+│    arch/x86/kvm/mmu/mmu.c:4576                              │
 │    - 快速路径检查 (fast_page_fault)                         │
 │    - 分配物理页 (kvm_faultin_pfn)                           │
 │    - 获取 mmu_lock                                          │
@@ -295,7 +295,7 @@ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 ### 2.7 direct_page_fault()
 
 ```c
-// arch/x86/kvm/mmu/mmu.c:4575
+// arch/x86/kvm/mmu/mmu.c:4576
 static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 {
     kvm_pfn_t orig_pfn;
@@ -434,50 +434,72 @@ retry:
 ### 2.9 tdp_mmu_map_handle_target_level()
 
 ```c
-// arch/x86/kvm/mmu/tdp_mmu.c:1017
+/* 来源: arch/x86/kvm/mmu/tdp_mmu.c:1017-1064 */
 static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
-                                           struct kvm_page_fault *fault,
-                                           struct tdp_iter *iter)
+					   struct kvm_page_fault *fault,
+					   struct tdp_iter *iter)
 {
-    struct kvm_mmu_page *sp = sptep_to_sp(rcu_dereference(iter->sptep));
-    u64 new_spte;
-    int ret = RET_PF_FIXED;
-    bool writable = READ_ONCE(fault->slot->arch.lpage_info[...]);
+	struct kvm_mmu_page *sp = sptep_to_sp(rcu_dereference(iter->sptep));
+	u64 new_spte;
+	int ret = RET_PF_FIXED;
+	bool wrprot = false;
 
-    if (unlikely(!is_shadow_present_pte(iter->old_spte))) {
-        // 新的叶节点，需要分配页面
-        if (sp->role.level > PG_LEVEL_4K)
-            track_possible_nx_huge_page(vcpu->kvm, sp);
-    }
+	if (WARN_ON_ONCE(sp->role.level != fault->goal_level))
+		return RET_PF_RETRY;
 
-    // 构建新的 SPTE
-    new_spte = make_spte(vcpu, sp, fault->slot, fault->gfn, fault->pfn,
-                         fault->level, fault->spte_ptr,
-                         fault->map_writable, true, true, true, NULL);
+	if (unlikely(!fault->slot))
+		new_spte = make_mmio_spte(vcpu, iter->gfn, ACC_ALL);
+	else
+		wrprot = make_spte(vcpu, sp, fault->slot, ACC_ALL, iter->gfn,
+				   fault->pfn, iter->old_spte, fault->prefetch, true,
+				   fault->map_writable, &new_spte);
 
-    if (fault->prefault)
-        new_spte |= PT_ACCESSED_MASK;
+	if (new_spte == iter->old_spte)
+		ret = RET_PF_SPURIOUS;
+	else if (tdp_mmu_set_spte_atomic(vcpu->kvm, iter, new_spte))
+		return RET_PF_RETRY;
+	else if (is_shadow_present_pte(iter->old_spte) &&
+		 !is_last_spte(iter->old_spte, iter->level))
+		kvm_flush_remote_tlbs_gfn(vcpu->kvm, iter->gfn, iter->level);
 
-    if (!fault->map_writable)
-        new_spte &= ~PT_WRITABLE_MASK;
+	/*
+	 * If the page fault was caused by a write but the page is write
+	 * protected, emulation is needed. If the emulation was skipped,
+	 * the vCPU would have the same fault again.
+	 */
+	if (wrprot && fault->write)
+		ret = RET_PF_WRITE_PROTECTED;
 
-    // 原子写入 SPTE
-    tdp_mmu_set_spte_atomic(vcpu, iter, new_spte);
+	/* If a MMIO SPTE is installed, the MMIO will need to be emulated. */
+	if (unlikely(is_mmio_spte(vcpu->kvm, new_spte))) {
+		vcpu->stat.pf_mmio_spte_created++;
+		trace_mark_mmio_spte(rcu_dereference(iter->sptep), iter->gfn,
+				     new_spte);
+		ret = RET_PF_EMULATE;
+	} else {
+		trace_kvm_mmu_set_spte(iter->level, iter->gfn,
+				       rcu_dereference(iter->sptep));
+	}
 
-    // ... 统计和跟踪 ...
-
-    return ret;
+	return ret;
 }
 ```
 
 **关键操作**：
-1. **构建 SPTE**：调用 `make_spte()` 构建完整的 SPTE 值
-   - 设置权限位（Present、Writable、User）
-   - 设置内存类型（WB/UC）
-   - 设置 Accessed/Dirty 位
-   - 设置 PFN
-2. **原子写入**：`tdp_mmu_set_spte_atomic()` 使用 `cmpxchg` 原子写入
-3. **统计**：更新页错误统计
+1. **级别校验**：`sp->role.level != fault->goal_level` 直接 `RET_PF_RETRY` —— 迭代
+   落到的叶页表和本次缺页想要的目标级别必须一致，否则重来。
+2. **构建 SPTE**：两条分支互斥——`!fault->slot` 说明 GFN 落在 memslot 之外，走
+   `make_mmio_spte()`（无效 SPTE，见第 7 节）；否则走 `make_spte()`。
+   **注意 `make_spte()` 的返回值是 `bool wrprot`（是否需要写保护），不是 SPTE**；
+   SPTE 由最后一个出参 `&new_spte` 带回（`spte.c:157-161`、`spte.h:499`）。
+   权限位（Present/Writable/User）、内存类型（WB/UC，`get_mt_mask()`）、A/D 位、PFN
+   都在这一步编码进去。
+3. **原子写入**：`tdp_mmu_set_spte_atomic(vcpu->kvm, iter, new_spte)` —— 首参是
+   `kvm` 不是 `vcpu`；内部用 `try_cmpxchg64` 乐观更新，失败返回 true → 本函数
+   `RET_PF_RETRY`（并发场景由 `tdp-mmu-concurrency.md` 展开）。
+4. **三种返回值由新值与旧值比较决定**：相同 → `RET_PF_SPURIOUS`；旧值是本叶表项
+   之外的 present 项（被大页拆分等）→ 需要 `kvm_flush_remote_tlbs_gfn()`；
+   装上了 MMIO SPTE → `RET_PF_EMULATE`（指令必须软件模拟）。
 
 ---
 
@@ -486,31 +508,79 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 ### 3.1 kvm_page_fault
 
 ```c
-// arch/x86/kvm/mmu/mmu_internal.h:191
+/* 来源: arch/x86/kvm/mmu/mmu_internal.h:190-250 */
 struct kvm_page_fault {
-    /* 输入参数 */
-    const gpa_t addr;           // 触发异常的 GPA
-    const u32 error_code;       // 错误码
-    const u8 access;            // 访问类型（读/写/执行）
-    
-    /* 计算得出 */
-    const gfn_t gfn;            // Guest Frame Number
-    struct kvm_memory_slot *slot; // 对应的 memslot
-    
-    /* 输出 */
-    kvm_pfn_t pfn;              // 分配的物理页帧号
-    hpa_t hva;                  // 宿主虚拟地址
-    
-    /* 级别调整 */
-    int max_level;              // 最大支持的级别
-    int req_level;              // 请求的级别
-    int goal_level;             // 目标级别（4K/2M/1G）
-    
-    /* 大页相关 */
-    bool huge_page_disallowed;  // 是否禁止大页
-    bool prefault;              // 是否是预取
+	/* arguments to kvm_mmu_do_page_fault.  */
+	const gpa_t addr;
+	const u64 error_code;
+	const bool prefetch;
+
+	/* Derived from error_code.  */
+	const bool exec;
+	const bool write;
+	const bool present;
+	const bool rsvd;
+	const bool user;
+
+	/* Derived from mmu and global state.  */
+	const bool is_tdp;
+	const bool is_private;
+	const bool nx_huge_page_workaround_enabled;
+
+	/*
+	 * Whether a >4KB mapping can be created or is forbidden due to NX
+	 * hugepages.
+	 */
+	bool huge_page_disallowed;
+
+	/*
+	 * Maximum page size that can be created for this fault; input to
+	 * FNAME(fetch), direct_map() and kvm_tdp_mmu_map().
+	 */
+	u8 max_level;
+
+	/*
+	 * Page size that can be created based on the max_level and the
+	 * page size used by the host mapping.
+	 */
+	u8 req_level;
+
+	/*
+	 * Page size that will be created based on the req_level and
+	 * huge_page_disallowed.
+	 */
+	u8 goal_level;
+
+	/* Shifted addr, or result of guest page table walk if addr is a gva.  */
+	gfn_t gfn;
+
+	/* The memslot containing gfn. May be NULL. */
+	struct kvm_memory_slot *slot;
+
+	/* Outputs of kvm_faultin_pfn.  */
+	unsigned long mmu_seq;
+	kvm_pfn_t pfn;
+	hva_t hva;
+	bool map_writable;
+
+	/*
+	 * Indicates the guest is trying to write a gfn that contains one or
+	 * more of the PTEs used to translate the write itself, i.e. the access
+	 * is changing its own translation in the guest page tables.
+	 */
+	bool write_fault_to_shadow_pgtable;
 };
 ```
+
+三个容易记错的点（本仓旧稿都曾写错）：
+
+| 字段 | 正确 | 说明 |
+|---|---|---|
+| `error_code` | **`u64`**，不是 u32 | VMCS 的 exit qualification / EPT violation 数据宽度是 64 位（`vmx_get_exit_qual()` 返回 unsigned long） |
+| 预取标志 | **`prefetch`**（`const bool`） | 全内核**没有** `prefault` 这个字段；`KVM_PRE_FAULT_MEMORY` 这条 ioctl 路径最终也是置 `prefetch` |
+| 三个级别 | **`u8`**，不是 int | 取值来自 `enum pg_level`（`arch/x86/include/asm/pgtable_types.h:548-553`）：`PG_LEVEL_4K = 1`、`PG_LEVEL_2M = 2`、`PG_LEVEL_1G = 3`；`KVM_MAX_HUGEPAGE_LEVEL = PG_LEVEL_1G`（`arch/x86/include/asm/kvm_host.h:152`），所以**叶 SPTE 最高只到 1G**，level 4/5 只会出现在非叶（root）上 |
+
+另外**没有 `access` 字段**：访问类型是从 `error_code` 里派生成 `exec/write/present/rsvd/user` 五个 bool 的（见上面第二组注释 "Derived from error_code"），见 `mmu_internal.h:293` 的 `kvm_mmu_do_page_fault()` 构造处。
 
 ### 3.2 tdp_iter
 
@@ -537,11 +607,30 @@ struct tdp_iter {
 ### 4.1 mmu_lock
 
 ```c
-// arch/x86/kvm/mmu/mmu.c:4575
-write_lock(&vcpu->kvm->mmu_lock);  // 获取写锁
-// ... 修改 EPT 页表 ...
-write_unlock(&vcpu->kvm->mmu_lock); // 释放写锁
+/* 来源: arch/x86/kvm/mmu/mmu.c:4602-4617（direct_page_fault() 节选） */
+	r = RET_PF_RETRY;
+	write_lock(&vcpu->kvm->mmu_lock);          /* :4603 独占模式 */
+
+	if (is_page_fault_stale(vcpu, fault))
+		goto out_unlock;
+
+	r = make_mmu_pages_available(vcpu);
+	if (r)
+		goto out_unlock;
+
+	r = direct_map(vcpu, fault);               /* 真正改页表的地方 */
+
+out_unlock:
+	write_unlock(&vcpu->kvm->mmu_lock);        /* :4615 */
+	kvm_release_pfn_clean(orig_pfn);
+	return r;
 ```
+
+**两个要点**：① 旧路径拿锁**之后**还要再查一次 `is_page_fault_stale()`——因为取 pfn
+是在锁外做的，锁期间 memslot 可能已经变了（`mmu_seq` 比对）；② `mmu_lock` 是
+`rwlock_t`（`include/linux/kvm_host.h:764`，TDP MMU 关闭时退化为 `spinlock_t`，`:766`），
+旧路径全程写模式，而 TDP MMU 的缺页走读模式 + `cmpxchg`（见
+[`tdp-mmu-concurrency.md`](tdp-mmu-concurrency.md)）。
 
 **为什么需要 mmu_lock？**
 - EPT 页表是共享资源，多个 vCPU 可能同时访问
@@ -574,10 +663,10 @@ rcu_read_unlock();
 ### 5.1 快速路径
 
 ```c
-// arch/x86/kvm/mmu/mmu.c:4575
-r = fast_page_fault(vcpu, fault);
-if (r != RET_PF_INVALID)
-    return r;
+/* 来源: arch/x86/kvm/mmu/mmu.c:4588-4590（direct_page_fault() 内） */
+	r = fast_page_fault(vcpu, fault);
+	if (r != RET_PF_INVALID)
+		return r;
 ```
 
 **快速路径的条件**：
@@ -610,10 +699,36 @@ kvm_mmu_hugepage_adjust(vcpu, fault);
 ### 5.3 预取（Prefetch）
 
 ```c
-// arch/x86/kvm/mmu/tdp_mmu.c:1017
-if (fault->prefault)
-    new_spte |= PT_ACCESSED_MASK;
+/* 来源: arch/x86/kvm/mmu/spte.c:180-183（make_spte() 内） */
+	spte |= shadow_present_mask;
+	if (!prefetch)
+		spte |= spte_shadow_accessed_mask(spte);
 ```
+
+```c
+/* 来源: arch/x86/kvm/mmu/mmu.c:4736-4753（kvm_tdp_map_page()，KVM_PRE_FAULT_MEMORY 的落点） */
+static int kvm_tdp_map_page(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code,
+			    u8 *level)
+{
+	...
+	do {
+		if (signal_pending(current))
+			return -EINTR;
+		cond_resched();
+		r = kvm_mmu_do_page_fault(vcpu, gpa, error_code, true, NULL, level);
+	} while (r == RET_PF_RETRY);
+```
+
+**语义要点（旧稿写反过）**：预取路径**不给 SPTE 预置 Accessed 位** ——
+`if (!prefetch) spte |= spte_shadow_accessed_mask(spte);`。也就是 prefetch 建出来的
+映射 A=0，硬件在第一次真正访问它时才把 A 置 1。KVM 正是靠这一点识别"预取了但没被
+用到"的映射（回收/脏页扫描时 A=0 即未被碰过）。若反过来预置 A=1，这批信息就丢了。
+
+调用链上 `prefetch=true` 是从 `kvm_mmu_do_page_fault(vcpu, gpa, error_code, true, ...)`
+的第四个实参传下去的（`mmu.c:4752`），最终落到 `struct kvm_page_fault.prefetch`
+（`mmu_internal.h:194`、构造点 `:306`）。**`fault->prefault` 这个字段不存在**，
+`tdp_mmu_map_handle_target_level()` 里也没有 "prefault 就或上 PT_ACCESSED_MASK" 这段代码
+（旧稿把这两处写错了，A 位的决定权在 `make_spte()`，不在 target-level 处理里）。
 
 **预取的优势**：
 - 提前建立 EPT 映射
@@ -796,15 +911,23 @@ CPU 自动设置 SPTE 的 Dirty 位（bit 9）
 #### SPTE 中的 A/D 位
 
 ```
-SPTE bit 9-8（软件位，用于标记 A/D 模式）：
+软件位 bits 53:52（标记"这条 SPTE 该按哪种 A/D 模式解释"，硬件看不见）：
 00 = SPTE_TDP_AD_ENABLED      → 使用硬件 A/D 位
 01 = SPTE_TDP_AD_DISABLED     → 禁用 A/D 位
 10 = SPTE_TDP_AD_WRPROT_ONLY  → 仅使用写保护
+（来源：arch/x86/kvm/mmu/spte.h:32-36，SPTE_TDP_AD_SHIFT = 52、
+ SPTE_TDP_AD_MASK = (3ULL << 52)；"11" 未定义）
 
-实际硬件 A/D 位（当 AD_ENABLED 时）：
-bit 8: Accessed（访问位）
-bit 9: Dirty（脏位）
+硬件 A/D 位（当 AD_ENABLED 时，EPT 叶条目自己的位）：
+bit 8: Accessed（VMX_EPT_ACCESS_BIT = 1ull << 8）
+bit 9: Dirty   （VMX_EPT_DIRTY_BIT  = 1ull << 9）
+（来源：arch/x86/include/asm/vmx.h:538-539）
 ```
+
+**别把两组位混了**：软件模式位在 **53:52**，硬件 A/D 位在 **8/9**。之所以要塞进高位，
+是因为 EPT 低位没有空闲 ignore 位可借；而 52 及以上对 PAE 分页是保留位段，所以
+`SPTE_TDP_AD_ENABLED` 必须取 0（`spte.h:26-37` 的注释与
+`static_assert(SPTE_TDP_AD_ENABLED == 0)` 就是在约束这件事）。
 
 #### 脏页记录
 
@@ -1134,32 +1257,51 @@ T2: QEMU 获取脏页
 EPT PTE 格式：
 [PFN:51-12] [MT:5-3] [IPAT:6] [其他标志]
 
-IPAT = 0: 考虑 Guest 的 PAT/MTRR 设置
-IPAT = 1: 忽略 Guest 的 PAT/MTRR 设置，使用 EPT 中设置的内存类型
+IPAT = 0: 有效类型 = EPT MT 与 Guest **PAT** 的组合（EPT MT 顶替 MTRR MT 的位置）
+IPAT = 1: 有效类型 = EPT MT，**PAT** 被忽略
+※ MTRR 在 EPT 下恒不参与，与 IPAT 取值无关（SDM Vol 3C §29.3.7.2）
 ```
 
 ### 9.2 KVM 如何决定是否设置 IPAT
 
-通过查看 KVM 源码 `arch/x86/kvm/vmx/vmx.c:7676`：
+**源码引用**: `arch/x86/kvm/vmx/vmx.c:7679-7693` → `vmx_get_mt_mask()`
 
 ```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:7668-7693 */
+static inline bool vmx_ignore_guest_pat(struct kvm *kvm)
+{
+	/*
+	 * Non-coherent DMA devices need the guest to flush CPU properly.
+	 * In that case it is not possible to map all guest RAM as WB, so
+	 * always trust guest PAT.
+	 */
+	return !kvm_arch_has_noncoherent_dma(kvm) &&
+	       kvm_check_has_quirk(kvm, KVM_X86_QUIRK_IGNORE_GUEST_PAT);
+}
+
 u8 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
 {
-    // 情况 1: MMIO 区域
-    if (is_mmio)
-        return MTRR_TYPE_UNCACHABLE << VMX_EPT_MT_EPTE_SHIFT;
-        // 返回: UC (无 IPAT 位)
-    
-    // 情况 2: 无 VFIO 设备（默认情况）
-    if (!kvm_arch_has_noncoherent_dma(vcpu->kvm))
-        return (MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT) | VMX_EPT_IPAT_BIT;
-        // 返回: WB + IPAT（IPAT = 1，忽略 Guest PAT）
-    
-    // 情况 3: 有 VFIO 非一致性 DMA 设备
-    return (MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT);
-    // 返回: WB（无 IPAT 位，IPAT = 0，考虑 Guest PAT）
+	/*
+	 * Force UC for host MMIO regions, as allowing the guest to access MMIO
+	 * with cacheable accesses will result in Machine Checks.
+	 */
+	if (is_mmio)
+		return MTRR_TYPE_UNCACHABLE << VMX_EPT_MT_EPTE_SHIFT;
+
+	/* Force WB if ignoring guest PAT */
+	if (vmx_ignore_guest_pat(vcpu->kvm))
+		return (MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT) | VMX_EPT_IPAT_BIT;
+
+	return (MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT);
 }
 ```
+
+旧稿这里有两个问题，都已按源码改掉：
+1. 行号写成 `vmx.c:7676`（那是 `vmx_cleanup_l1d_flush()` 之前的空行区），真实入口 **7679**。
+2. 条件写成 `if (!kvm_arch_has_noncoherent_dma(vcpu->kvm))` —— **漏了 quirk 这一半**。
+   实际判据是 `vmx_ignore_guest_pat()` 的 **与** 关系：既没有非一致性 DMA 设备，
+   `KVM_X86_QUIRK_IGNORE_GUEST_PAT` 也没被 VMM 关掉，才会置 IPAT。
+   也就是说 VMM 可以主动关掉这个 quirk 来要回 PAT 控制权，与 VFIO 无关。
 
 ### 9.3 三种场景总结
 
@@ -1176,36 +1318,46 @@ u8 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
 #### 普通 VM（无 VFIO 设备）
 
 ```bash
-# 检查是否有 VFIO 设备
-cat /sys/kernel/debug/kvm/*/noncoherent_dma_count
-# 输出: 0
+# 判据：kvm->arch.noncoherent_dma_count == 0
+# ⚠️ 这个计数器**不是 debugfs 文件**，旧稿的
+#    `cat /sys/kernel/debug/kvm/*/noncoherent_dma_count` 读不到东西
+#    （实测 /sys/kernel/debug/kvm/<pid>-<n>/ 下只有 exits/pf_*/pages_*k/mmu_* 等统计项）。
+#    它是 struct kvm_arch 里的 atomic_t（arch/x86/include/asm/kvm_host.h:1341）。
+#    可落地的观测法：
+#      - KVM_CHECK_EXTENSION(KVM_CAP_DISABLE_QUIRKS2) 看支持集（x86.c:4800-4802），
+#        KVM_X86_QUIRK_IGNORE_GUEST_PAT = (1 << 9)（arch/x86/include/uapi/asm/kvm.h:444）
+#      - 宿主 /proc/cpuinfo 有没有 `ss`（X86_FEATURE_SELFSNOOP，cpufeatures.h:54）；
+#        没有则该 quirk 直接从支持集里摘掉（vmx.c:8606-8607），IPAT 恒为 0
+#      - 第一个/最后一个非一致设备注册时会 zap 全部 SPTE
+#        （kvm_noncoherent_dma_assignment_start_or_stop()，x86.c:13627-13639），
+#        表现为 mmu_shadow_zapped 突增 + 一轮 EPT violation
 
 # 结果
 # IPAT = 1（开启）
-# Guest 的 PAT/MTRR 设置被忽略
+# Guest 的 PAT 被忽略（MTRR 本来就不参与，见下）
 # 所有 RAM 区域使用 WB
 ```
 
 **实际影响**：
-- Guest OS 设置 `mtrr_add(..., "uncachable")` **不会生效**
-- Guest OS 设置 `ioremap_wc(...)` **不会生效**
+- Guest OS 设置 `ioremap_wc(...)`（走 **PAT**）**不会生效**
+- Guest 写 MTRR **同样不生效，但与 IPAT 无关**：SDM Vol 3C §29.3.7.2 明确
+  "The MTRRs have no effect on the memory type used for an access to a
+  guest-physical address." —— EPT 下 MTRR 永远出局，IPAT 只管 PAT
 - 所有内存访问都使用 WB（可缓存）
 
 #### VFIO VM（有 VFIO 非一致性 DMA 设备）
 
 ```bash
-# 检查是否有 VFIO 设备
-cat /sys/kernel/debug/kvm/*/noncoherent_dma_count
-# 输出: 1（或更大）
+# 判据：kvm->arch.noncoherent_dma_count > 0（观测方法见上一块）
 
 # 结果
 # IPAT = 0（关闭）
-# Guest 的 PAT/MTRR 设置被考虑
+# Guest 的 PAT 参与决策（EPT MT 顶替 MTRR MT 的位置，与 PAT MT 组合）
 # 可以设置 WC、UC 等内存类型
 ```
 
 **实际影响**：
-- GPU 直通时，`ioremap_wc(...)` **会生效**
+- GPU 直通时，`ioremap_wc(...)` **会生效**（生效通道是 PAT，不是 MTRR）
 - 可以正确设置 GPU 显存为 WC
 - 内存类型由 Guest OS 控制
 
@@ -1225,7 +1377,7 @@ if (kv->noncoherent)
 
 **结果**：
 ```c
-// arch/x86/kvm/x86.c:13543
+// arch/x86/kvm/x86.c:13654
 bool kvm_arch_has_noncoherent_dma(struct kvm *kvm)
 {
     return atomic_read(&kvm->arch.noncoherent_dma_count);
@@ -1257,16 +1409,28 @@ bool kvm_arch_has_noncoherent_dma(struct kvm *kvm)
 #### 场景 1：普通 VM 尝试设置 UC
 
 ```bash
-# Guest OS 尝试将 RAM 设置为 UC
-mtrr_add(0x100000, 4096, "uncachable", 1);
+# Guest OS 想把自己 RAM 设成 UC，它能用的手段有两条，结论不同：
 
-# 实际效果：
-# Guest PAT/MTRR: UC
-# EPT: WB + IPAT（IPAT 位 = 忽略 Guest 设置）
-# 最终: WB（Guest 设置被忽略）
+# (a) 改 PAT（页表 PCD/PAT 位 + MSR_IA32_PAT），例如 ioremap_nocache()/set_memory_uc()
+#     Guest PAT MT: UC
+#     EPT: WB + IPAT=1
+#     最终: WB     ← IPAT=1 把 PAT MT 忽略掉了
+
+# (b) 改 MTRR（guest 内核对 /proc/mtrr、mtrr_add() 的写会 trap 到 VMM 模拟）
+#     最终: 还是 WB —— 但原因**不是 IPAT**
 ```
 
-**结果**：Guest 的设置**不起作用**。
+**结果**：两种设置在 IPAT=1 时都不起作用，但**理由不同**，这一点很容易写错：
+
+- PAT 是被 IPAT **主动忽略**的（SDM Vol 3C §29.3.7.2："If the value is 1, the memory
+  type used for the access is the EPT memory type. The PAT memory type is ignored."）；
+- MTRR 则是**无论 IPAT 取 0 还是 1 都不参与**：同一节原文
+  "The MTRRs have no effect on the memory type used for an access to a guest-physical
+  address."。IPAT=0 时硬件是把 **EPT MT 放到原本 MTRR MT 在 Table 12-7 里的位置**，
+  再与 PAT MT 组合 —— 也就是 EPT MT 顶替 MTRR，而不是"MTRR 重新生效"。
+
+**所以"IPAT=0 就会考虑 Guest 的 PAT/MTRR"这种写法是错的**（本章旧稿、以及
+[`mmio-identification.md`](mmio-identification.md) 的旧稿都这么写过，已改）。
 
 #### 场景 2：GPU 直通设置 WC
 
@@ -1304,14 +1468,24 @@ void *mmio = ioremap(0xfexxxxxx, size);
 #### 在 Host 上检查
 
 ```bash
-# 检查是否有 VFIO 设备
-cat /sys/kernel/debug/kvm/*/noncoherent_dma_count
+# ❌ 旧稿这里的 `cat /sys/kernel/debug/kvm/*/noncoherent_dma_count` 是错的：
+#    debugfs 的 per-VM 目录（/sys/kernel/debug/kvm/<pid>-<n>/）里【没有】这个文件。
+#    实测该目录下的文件是 exits / pf_taken / pf_fixed / pf_fast / pf_emulate /
+#    pf_spurious / pf_mmio_spte_created / pages_4k / pages_2m / pages_1g /
+#    mmu_* / remote_tlb_flush … 这类统计项（每个来自
+#    arch/x86/kvm/x86.c:232-247 的 kvm_vm_stats_desc[] 等表）。
+#    noncoherent_dma_count 只是 struct kvm_arch 里的一个 atomic_t
+#    （arch/x86/include/asm/kvm_host.h:1341），没有任何 debugfs/sysfs 导出。
 
-# 0 = 普通 VM（IPAT = 1）
-# >0 = VFIO VM（IPAT = 0）
-
-# 检查 VFIO 设备列表
-ls /sys/bus/pci/drivers/vfio-pci/
+# ✅ 能落地的检查：
+ls /sys/bus/pci/drivers/vfio-pci/            # 有哪些设备被 VFIO 接管（真实路径）
+grep -m1 flags /proc/cpuinfo | grep -o '\bss\b'   # 宿主是否 self-snoop（无 ⇒ IPAT 恒 0）
+# quirk 支持集：KVM_CHECK_EXTENSION(KVM_CAP_DISABLE_QUIRKS2)（x86.c:4800-4802），
+#   bit = KVM_X86_QUIRK_IGNORE_GUEST_PAT (1 << 9)（arch/x86/include/uapi/asm/kvm.h:444）
+# 副作用观测：挂上第一个非一致设备会 zap 全部 SPTE（x86.c:13627-13639），
+#   表现为 debugfs 里 mmu_shadow_zapped / pages_4k 突变 + 一轮 EPT violation
+# MMIO SPTE 是否真被建出来：pf_mmio_spte_created（vcpu 级统计，
+#   x86.c:265；自增点 tdp_mmu.c:1054、mmu.c:2935）
 ```
 
 #### 在 Guest 中测试

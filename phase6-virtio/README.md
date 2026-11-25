@@ -24,7 +24,8 @@
 ## 📚 前置与衔接
 
 - **前序 phase**：phase0 的 KVM 框架（ioeventfd/irqfd 是 vhost 与 KVM 协作的桥梁）；
-  phase5 的中断注入（vhost 直接调 kvm_set_irq）。
+  phase5 的中断注入（vhost **不**直接调 KVM：它 signal call eventfd，由 KVM 的 irqfd
+  调 `kvm_set_irq()`，见 `virt/kvm/eventfd.c:41-56`）。
 - **VMM 经验衔接**：你在 QEMU 里用 `-netdev tap,vhost=on` 开启过 vhost。
   本章讲内核 vhost 线程如何接管数据面、为什么不再回 QEMU。
 
@@ -121,8 +122,8 @@ vhost-user:   Guest → 共享内存 → DPDK 进程（polled）→ NIC  （无 
 |------|---------------------|-------------|-----------|
 | 数据面位置 | QEMU 用户态线程 | vhost 内核线程 | DPDK/SPDK 进程 |
 | 系统调用 | 每包 VM-Exit + ioctl | 0（全程内核态） | 0（polled 共享内存） |
-| 内存访问 | mmap guest 内存 | KVM memslot 直接访问 | 共享内存（大页） |
-| 中断注入 | ioctl(KVM_INTERRUPT) | 直接 kvm_set_irq() | irqfd / 无中断 |
+| 内存访问 | mmap guest 内存 | vhost 自己的 `vhost_iotlb`（`VHOST_SET_MEM_TABLE` 注册） | 共享内存（大页） |
+| 中断注入 | 回 QEMU，走 irqfd/`KVM_SIGNAL_MSI` | `eventfd_signal(call_ctx)` → **KVM** irqfd → `kvm_set_irq()` | irqfd / 无中断 |
 
 **为什么这样分工**：数据面路径越短越快，但通用性/可调试性越差。
 **量化吞吐/延迟差异见 phase10**（本章不复制数字；旧讲义的 "3 倍/100万 pps" 等无出处推算已登记待审计）。
@@ -138,8 +139,13 @@ vhost-user:   Guest → 共享内存 → DPDK 进程（polled）→ NIC  （无 
 | virtio-queue | 驱动和设备怎么无锁协作？ | 通知抑制为什么能省 VM-Exit？ | 三环结构（virtio spec） |
 | vhost-user-basics | 数据面怎么搬进用户态进程？ | 共享内存怎么设置？消息怎么协商？ | vhost-user 协议 |
 
-源码路线：vhost.c（核心）→ net.c（vhost-net）→ vhost 与 KVM 交互
-（GPA→HVA via memslot、kvm_set_irq、kvm_vcpu_kick）。
+源码路线：vhost.c（核心）→ net.c（vhost-net）→ vhost 与 KVM 的**唯一接口就是 eventfd**：
+kick 方向 KVM 的 ioeventfd signal `vq->kick`（`virt/kvm/eventfd.c:981-988`），
+中断方向 vhost `eventfd_signal(vq->call_ctx.ctx)`（`drivers/vhost/vhost.c:3035-3041`），
+再由 KVM 的 irqfd 调 `kvm_set_irq()`（`virt/kvm/eventfd.c:41-56`）。
+注意 `grep -rn "kvm" drivers/vhost/*.c` → **0 命中**：vhost 不引用任何 KVM 符号，
+GPA→HVA 也走 vhost 自己的 `vhost_iotlb`（`vhost.c:1965`/`:2000`，查表在
+`translate_desc()` `vhost.c:1316`），**不是** KVM memslot。
 
 ---
 
@@ -184,13 +190,20 @@ vhost-user:   Guest → 共享内存 → DPDK 进程（polled）→ NIC  （无 
 
 - [ ] 解释 vhost 怎么把数据面从 QEMU 卸载到内核
 - [ ] 画出 vhost-net TX/RX 数据路径
-- [ ] 说明 vhost 怎么访问 guest 内存（memslot）、怎么注入中断（kvm_set_irq）
+- [ ] 说明 vhost 怎么访问 guest 内存（`VHOST_SET_MEM_TABLE` → `vhost_iotlb`）、
+      怎么注入中断（`eventfd_signal(call_ctx)` → KVM irqfd → `kvm_set_irq`）
 - [ ] 说明何时用 vhost、何时用 QEMU 用户态
 
 深度自测（答不出 = 没学会）：
 
 - [ ] **反事实**：如果 guest kick 不需要 VM-Exit（通知抑制生效），vhost 相对 QEMU 的优势还剩什么？
-- [ ] **不可简化**：vhost-user 为什么不能省掉共享内存设置，直接像 vhost 那样用 memslot？
+- [ ] **不可简化**：vhost-user 为什么不能省掉共享内存设置，直接像 vhost 那样
+      用 `VHOST_SET_MEM_TABLE` 让内核替它映射？（答：vhost 的 `vhost_iotlb` 存的是
+      **注册者进程的 HVA**，worker 必须活在那份地址空间里才读得到——
+      `vhost_attach_mm()` 取 `dev->mm = get_task_mm(current)`（`drivers/vhost/vhost.c:678-693`），
+      kthread 模式靠 `kthread_use_mm(dev->mm)`（`vhost.c:406`），
+      vhost_task 模式靠 `CLONE_VM` 直接共享（`kernel/vhost_task.c:123-131`）。
+      独立的后端进程没有这套绑定，只能用 `mmap` 过来的共享 fd 自己建映射）
 - [ ] **推导**：从"每包模式切换是固定开销"推出"高吞吐下数据面必须缩短路径"。
 
 ---

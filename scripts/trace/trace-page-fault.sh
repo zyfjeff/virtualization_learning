@@ -120,7 +120,7 @@ echo 0 > "$TRACEFS/tracing_on"
 # ★ 用 `>` 打开 set_event 带 O_TRUNC，内核会先 ftrace_clear_events() 把宿主上**全部**已启用
 #   事件清掉（kernel/trace/trace_events.c:2411 → :2422-2423，函数定义 :883）。tracefs 是
 #   全局状态，别把别人挂的探针顺手清了：清场显式写 `: >`，之后一律 `>>` 追加。
-#   规则唯一来源：../../phase9-performance/measurement.md §5 第 3 条。
+#   规则唯一来源：../../phase10-performance/measurement.md §5 第 3 条。
 : > "$TRACEFS/set_event"
 echo kvm:kvm_page_fault >> "$TRACEFS/set_event"
 # 页级别要靠 kvmmmu:kvm_mmu_set_spte —— 它**存在**，只是不在 `kvm` 这个 system 下：

@@ -50,7 +50,8 @@ sudo ./run.sh
 **关键 tracepoints**：
 ```
 kvm:kvm_entry          — VM-Entry 尝试
-kvm:kvm_exit           — VM-Exit 原因（exit_reason, error_code）
+kvm:kvm_exit           — VM-Exit 原因（exit_reason / guest_rip / isa /
+                           info1 / info2 / intr_info / error_code / vcpu_id）
 kvm:kvm_inj_exception  — 异常注入
 ```
 
@@ -126,9 +127,9 @@ interval:s:10 { print(@gpa, 20); clear(@gpa); }
 **关键 tracepoints**：
 ```
 kvm:kvm_exit              — 退出原因（exit_reason）
-kvm:kvm_inj_exception     — 异常注入（exception, error_code）
-kvm:kvm_userspace_exit    — 退到用户态（exit_reason）
-kvm:kvm_inj_virq          — 中断注入
+kvm:kvm_inj_exception     — 异常注入（exception / has_error / error_code / reinjected）
+kvm:kvm_userspace_exit    — 退到用户态（字段只有 reason + errno，无 vcpu_id）
+kvm:kvm_inj_virq          — 中断注入（vector / soft / reinjected，无 vcpu_id）
 ```
 
 **预期诊断路径**：
@@ -164,7 +165,7 @@ cd ../../scripts/vm/
 
 ## 📚 参考资料
 
-- Phase 10 主文档: `../README.md`
+- Phase 11 主文档: `../README.md`
 - 源码注释: `../annotations.md`
 - 勘误: `../corrections.md`
 - 启动失败诊断: `../launch-failures.md`

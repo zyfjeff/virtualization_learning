@@ -1,6 +1,8 @@
 # VMClock：虚拟机高效时间同步
 
-> 基于 VMClock 规范 v1.0（UAPI.13），David Woodhouse (Amazon) 2025-12-15 发布
+> 基于 VMClock 规范（UAPI.13，正文其余处均按 v1.1 引用；本行原写 "v1.0 /
+> 2025-12-15 发布"，版本与日期本机无规范原文可核，**待核实**，见勘误 30）。
+> David Woodhouse (Amazon)
 >
 > VMClock 是一项新的半虚拟化时钟同步技术，旨在解决现有机制（kvmclock、ptp_kvm）在
 > 大规模云环境下遇到的 **CPU 超分**、**重复校准**和**迁移时间跳变**问题。
@@ -353,10 +355,10 @@ VMClock 提供的核心参数构成一个简单的线性变换：
 │  精确周期 = 1 ns = 10⁻⁹ 秒                                     │
 │                                                                   │
 │  朴素表示（无 shift）:                                           │
-│    counter_period_frac_sec = 0x44B82FA0A                        │
+│    counter_period_frac_sec = 0x44B82FA0A = 18446744074          │
 │    P = 0x44B82FA0A / 2⁶⁴                                        │
-│    = 18014398506.97 / 1.8×10¹⁹                                 │
-│    ≈ 1.000000000 × 10⁻⁹ 秒                                     │
+│    = 18446744074 / 1.8447×10¹⁹                                 │
+│    ≈ 1.000000000016 × 10⁻⁹ 秒（已带量化误差）                  │
 │                                                                   │
 │  问题: 64 位定点数的精度有限，长时间内误差会累积               │
 │    运行 1 天后: 误差 ≈ 几微秒                                  │
@@ -364,10 +366,12 @@ VMClock 提供的核心参数构成一个简单的线性变换：
 │                                                                   │
 │  精确表示（使用 shift = 29）:                                    │
 │    counter_period_frac_sec = 0x89705F4136B4A597                │
+│                            = 9903520314283042199               │
 │    counter_period_shift = 29                                     │
 │    P = 0x89705F4136B4A597 / 2^(64+29)                           │
-│    = 9765625000734658967 / 5.76×10²⁷                           │
+│    = 9903520314283042199 / 9.9035×10²⁷                        │
 │    ≈ 1.000000000000000 × 10⁻⁹ 秒（更高精度!）                 │
+│    （十进制换算与除法为精确计算复核，旧版数值有误，见勘误 30）   │
 │                                                                   │
 │  shift 的作用: 用更多的有效位表示周期，减少长期累积误差          │
 └──────────────────────────────────────────────────────────────────┘
@@ -644,36 +648,52 @@ Hypervisor 需要：
 
 2. **创建 ACPI 设备**：
 
+ACPI ID **必须匹配 guest 驱动的匹配表**，内核只认这两个（旧版示例写的
+`VCLK0001`/`VMCLK0001` 不存在于任何实现，驱动永远不会绑定，见勘误 30）：
+
+```c
+/* 来源: drivers/ptp/ptp_vmclock.c:771-774 (Linux 7.4.0-rc3, /root/code/linux) */
+static const struct acpi_device_id vmclock_acpi_ids[] = {
+	{ "AMZNC10C", 0 },
+	{ "VMCLOCK", 0 },
+	{}
+};
+```
+
+QEMU 实际生成的 SSDT（`/root/code/qemu-10.1.0-rc2/hw/acpi/vmclock.c:38-55`，
+`hw/acpi/vmclock.c` 自 2025-01 commit `3634039b93` 起存在）：
+
 ```asl
-Device (VMCK)
+Device (VCLK)
 {
-    Name (_HID, "VCLK0001")    // 硬件 ID
-    Name (_DDN, "VMClock")     // DOS 设备名
-    Name (_CID, "VMCLK0001")   // 兼容 ID
+    Name (_HID, "AMZNC10C")     // 硬件 ID
+    Name (_CID, "VMCLOCK")      // 兼容 ID
+    Name (_DDN, "VMCLOCK")
+    Name (_STA, 0x0F)           // 设备存在且启用
 
     Method (_CRS, 0, Serialized)
     {
-        // 资源描述符：共享内存区域
-        Name (RBUF, ResourceTemplate ()
-        {
-            Memory32Fixed (ReadWrite, 0xFE800000, 0x1000)  // 4KiB 页
-        })
-        Return (RBUF)
+        // QWORD Memory 资源: POS_DECODE, MIN/MAX_FIXED,
+        // CACHEABLE, READ_ONLY, 0xfeffb000..0xfeffbfff (4KiB 页,
+        // VMCLOCK_ADDR 见 include/hw/acpi/vmclock.h:11)
     }
-
-    // 可选: 支持通知
-    Method (_STA) { Return (0x0F) }  // 设备存在且启用
 }
 ```
 
-3. **通知机制**（可选）：当 `seq_count` 更新为新的偶数值时，触发 ACPI Notify
-   （通知码 0x80）。需要设置 `VMCLOCK_FLAG_NOTIFICATION_PRESENT` 标志。
+3. **通知机制**（可选）：当 `seq_count` 更新为新的偶数值时，触发 ACPI Notify。
+   需要设置 `VMCLOCK_FLAG_NOTIFICATION_PRESENT` 标志。旧版写的"通知码 0x80"
+   本机无规范原文可证（**待核实**）；内核 handler 不检查 event 值
+   （`ptp_vmclock.c:522-530`，收到任何通知即 `wake_up_interruptible`）。
 
 ### 7.2 Device Tree 发现方式
 
+`compatible` 必须是 binding 定义的 const `amazon,vmclock`
+（`Documentation/devicetree/bindings/ptp/amazon,vmclock.yaml:20`；驱动 of 表
+`ptp_vmclock.c:778-780`。旧版写的 `"vmclock"` 不会绑定，见勘误 30）：
+
 ```dts
 vmclock@fe800000 {
-    compatible = "vmclock";
+    compatible = "amazon,vmclock";
     reg = <0xfe800000 0x1000>;  // 基地址 + 大小
 };
 ```
@@ -713,9 +733,10 @@ vmclock@fe800000 {
 | 组件 | 状态 | 版本/位置 |
 |------|------|----------|
 | **规范** | ✅ 已发布 | UAPI.13 v1.1 (uapi-group.org) |
-| **Linux Guest 驱动** | ✅ 已合入主线 | Linux 7.0+ (2024-10 首次合入，7.3.0 持续改进) |
+| **Linux Guest 驱动** | ✅ 已合入主线 | **v6.13 起**（commit `205032724226`，author 2024-10-06，`git tag --contains` 核实；7.x 持续改进，v7.3 为 797 行。旧版误写 "7.0+"，见勘误 30） |
 | **Firecracker Host 侧 (Phase 1)** | ✅ 已实现 | 仅通知机制，不含时间同步 |
-| **KVM/QEMU Host 侧** | ❌ 未实现 | 主线内核无相关代码 |
+| **QEMU Host 侧** | ✅ 已实现 | `hw/acpi/vmclock.c`（2025-01 commit `3634039b93` 起，本仓基线 qemu-10.1.0-rc2 即有；仅 ACPI/共享页/迁移 marker，无时间参数填充） |
+| **KVM 内核 Host 侧** | ❌ 未实现 | 主线内核（含 7.4.0-rc3）无 `vmclock_abi` 填充代码 |
 
 ### 8.2 Linux Guest 驱动（已合入主线）
 
@@ -750,8 +771,9 @@ tspec->tv_sec += le64_to_cpu(st->clk->time_sec);
 
 ### 8.3 Firecracker Host 侧实现（Phase 1：仅通知机制）
 
-> **源码引用**: `src/vmm/src/devices/acpi/vmclock.rs` (Firecracker, 289 行)
-> 首次合入: 2025-10-21 by Babis Chalios (Amazon)
+> **源码引用**: `src/vmm/src/devices/acpi/vmclock.rs` (Firecracker, 288 行, `wc -l` 实测)
+> 首次合入: commit `ef215b91b`（author 2025-10-21，committer/进 main 2025-11-20），
+> by Babis Chalios (Amazon)
 
 Firecracker 的 VMClock 实现是**分阶段的**。当前 Phase 1 只实现了**通知机制**，
 **没有**填充时间参数字段。
@@ -802,7 +824,12 @@ Firecracker 的 VMClock 实现是**分阶段的**。当前 Phase 1 只实现了*
 │     → Guest 驱动看到 INVALID 不会注册 PTP 设备                 │
 │                                                                   │
 │  ❌ clock_status = VMCLOCK_STATUS_UNKNOWN                       │
-│     → Guest 驱动会返回 -EINVAL                                  │
+│     → 注意: 驱动并不因 UNKNOWN 返回 -EINVAL——唯一检查的是       │
+│       UNRELIABLE（ptp_vmclock.c:124-125:                        │
+│       `if (... clock_status == VMCLOCK_STATUS_UNRELIABLE)       │
+│        return -EINVAL;`）；UNKNOWN 只是表示时钟质量未声明。     │
+│       真正让 Phase 1 无法同步的是上面的 counter_id=INVALID      │
+│       → PTP 时钟根本不注册（见勘误 30）                         │
 │                                                                   │
 │  ❌ counter_value = 0         (参考时刻的 TSC 值)              │
 │  ❌ counter_period_frac_sec = 0 (TSC tick 周期)                │
@@ -833,11 +860,18 @@ Firecracker 的 VMClock 实现是**分阶段的**。当前 Phase 1 只实现了*
 1. **随机数生成器重播种**：检测到 `vm_generation_counter` 变化 → 重新播种 PRNG
 2. **UUID 重新生成**：避免克隆 VM 的 UUID 冲突
 3. **网络连接重置**：检测到快照恢复后断开旧连接
-4. **应用层迁移感知**：通过 `disruption_marker` 知道发生了迁移
+4. **应用层扰动感知**：通过 `disruption_marker` 知道发生了时钟域扰动。
+   ⚠️ **Firecracker Phase 1 并无热迁移**：其唯一递增 `disruption_marker` 的路径是
+   快照恢复 `do_post_restore()`（`src/vmm/src/devices/acpi/vmclock.rs:122-153`），
+   引入 commit `ef215b91b` 的说明原话即 "we don't support live migration,
+   the device won't do anything at the moment"；上面引用的 FC 文档把
+   "Live migration through the disruption_marker" 列为设计意图而非当前能力。
+   **迁移时真正递增 marker 的是 QEMU**（post_load：
+   `hw/acpi/vmclock.c:64-97`，marker++ @ :78-80）（见勘误 30）。
 
 #### Firecracker VMClock 测试工具
 
-**源码引用**: `tests/host_tools/vmclock.c` (Firecracker, 188 行)
+**源码引用**: `tests/host_tools/vmclock.c` (Firecracker, 187 行, `wc -l` 实测)
 
 这个 C 工具验证了 Phase 1 的功能边界——只读取通知相关字段：
 
@@ -858,41 +892,53 @@ void print_vmclock(struct vmclock_abi *vmclock)
 }
 ```
 
-### 8.4 KVM/QEMU Host 侧（未实现）
+### 8.4 Host 侧现状：QEMU 已实现（设备层），KVM 内核侧未实现
 
-搜索 Linux 7.3.0 内核源码树：
+> ⚠️ 本节旧版标题写"KVM/QEMU Host 侧（未实现）"，**对 QEMU 而言已过时**：
+> QEMU 自 2025-01-07 commit `3634039b93`（"hw/acpi: Add vmclock device"）起就
+> 实现了 host 侧设备，本仓项目基线 `qemu-10.1.0-rc2` 里就有
+> `hw/acpi/vmclock.c`（另见 qemu-11.1.0 与 /root/code/QEMU；
+> `hw/acpi/Kconfig` 的 `ACPI_VMCLOCK` default y，x86 PC 机型 select）。
+> 见勘误 30。
+
+"内核树无填充代码"这半句仍成立——搜索 Linux 源码树（实测 7.4.0-rc3 同样）：
 
 ```bash
 # KVM 中没有 vmclock_abi 填充代码
 $ grep -rn "vmclock_abi" arch/x86/kvm/
 # 无结果
 
-# 整个内核树中无 hypervisor 侧填充代码
+# 整个内核树中无 hypervisor 侧填充代码（仅 guest 驱动命中）
 $ grep -rn "VMCLOCK_MAGIC" --include="*.c" | grep -v ptp_vmclock
 # 无结果
 ```
 
-KVM/QEMU 的 VMClock 实现需要：
-1. **QEMU (用户态)**：分配共享页、生成 ACPI 表、迁移协调
-2. **KVM (内核态)**：精确 cross-timestamp、周期性更新参数
+QEMU 当前实现的是**设备层**：分配共享页（`VMCLOCK_ADDR 0xfeffb000`，
+`include/hw/acpi/vmclock.h:11`，e820 RESERVED）、生成 ACPI（_HID AMZNC10C）、
+realize 时写常量字段、迁移/快照恢复 post_load 时递增 `disruption_marker`。
+QEMU **不填充时间参数**（counter_id 置 INVALID、clock_status UNKNOWN），
+"精确 cross-timestamp、周期性更新时间字段"仍待后续（可能依赖 KVM 内核态支持）。
 
 ### 8.5 实现时间线
 
 ```
 2024-06     David Woodhouse 提交 RFC PATCH v2 (ptp_vmclock guest 驱动)
 2024-07     PATCH v3
-2024-10-06  ★ Guest 驱动首次合入 Linux 主线 (commit 205032724226)
+2024-10-06  ★ Guest 驱动 commit 205032724226 (author date)
+            ——随 **v6.13** 进入主线（2025-01，git tag --contains 核实）
             最初仅支持 ACPI，设备 ID "AMZNC10C"
+2025-01-07  ★ QEMU 合入 vmclock 设备 (3634039b93 "hw/acpi: Add vmclock device")
 2025-02     修复 driver data 设置时序 (进入 net-next)
-2025-10-21  ★ Firecracker Phase 1 合入 (x86_64)
-            commit ef215b91b by Babis Chalios
+2025-10-21  ★ Firecracker Phase 1 合入 (x86_64, author date;
+            committer 2025-11-20)，commit ef215b91b by Babis Chalios
 2025-12-05  Firecracker 添加 ARM64 支持
 2026-01-30  Guest 驱动添加 vm_generation_counter + ACPI 通知
             (合入 Linux 7.0)
 2026-05     Guest 驱动切换至 ktime_get_snapshot_id()
 2026-06     Guest 驱动使用 hw_cycles 精确配对 TSC
 2026-08-13  Guest 驱动最新改进（防止 mmap 变可写）
-2026-10     当前状态：Guest 驱动完整，Firecracker Phase 1，KVM 未实现
+2026-10     当前状态：Guest 驱动完整（v6.13+），Firecracker Phase 1，
+            QEMU 设备层已实现（不含时间参数填充），KVM 内核侧未实现
 ```
 
 ### 8.6 预测：后续阶段

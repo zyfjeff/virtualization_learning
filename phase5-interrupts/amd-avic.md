@@ -40,13 +40,14 @@
 │  │ 设备 MSI → IOMMU → IRTE (IM=1) → PI Descriptor → vCPU PIR     │    │
 │  │              ↑                ↑                     ↑            │    │
 │  │         IRTE.PDA 指向 PI Descriptor (64B)                      │    │
-│  │         IRTE.VV (Virtual Vector) → PI.NV (Notification Vector)│    │
-│  │         IRTE.DestID → PI.NDST (目标 pCPU APIC ID)             │    │
+│  │         IRTE.VV = guest 向量（记入 PIR 的位；与 PI.NV 值不同） │    │
+│  │         PI.NV (Notification Vector)=通知向量(0xf2),            │    │
+│  │         PI.NDST = 目标 pCPU APIC ID（Posted IRTE 无目标字段）  │    │
 │  │                                                                  │    │
 │  │  硬件行为:                                                       │    │
 │  │    · IOMMU 原子设置 PIR[vector]=1, ON=1                          │    │
 │  │    · 发送通知中断 (Notification Vector) 给 pCPU                  │    │
-│  │    · VM-Entry 时硬件自动 PIR → IRR                               │    │
+│  │    · guest 态收到通知中断时硬件自动 PIR→VIRR（SDM 30.6）          │    │
 │  │    · 零 VM-Exit!                                                 │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                          │
@@ -74,10 +75,10 @@
 |------|------------|-----------|
 | **中断重映射表** | IRTE (128-bit) | IRTE (32-bit 或 128-bit) |
 | **模式选择位** | `IM` (bit 15): 0=Remapped, 1=Posted | `GuestMode` (bit 7): 0=Remapped, 1=Virtualized |
-| **Posted/虚拟化目标** | PI Descriptor (64B, 物理地址) | Guest Virtual APIC Table (4KB, 物理地址) |
-| **向量字段** | `VV` (Virtual Vector, bits 23:16) | `Vector` (bits 71:64, 8-bit) |
+| **Posted/虚拟化目标** | PI Descriptor (64B, 物理地址) | vAPIC Backing Page (4KB, 物理地址，IRTE 115:76 指向它；"Guest Virtual APIC Table"是 DTE 字段的别名，注意区分) |
+| **向量字段** | `VV` (Virtual Vector, bits 23:16) = **guest 向量**（记入 PIR 的位） | `Vector` (bits 71:64, 8-bit) = guest 向量（算 vIRR 偏移） |
 | **目标地址字段** | `PDAL/PDAH` (PI Descriptor 地址) | `GuestVirtualAPICTableRootPointer` (vAPIC 地址) |
-| **目标 CPU** | `Dest_ID` (bits 319:288) | `Destination` (bits 15:8) |
+| **通知/doorbell 目标** | `NDST`（**PI Descriptor** bits 319:288；Posted IRTE 无 destination 字段） | `Destination`（**IRTE** bits 15:8，x2APIC 扩展 31:8/127:120） |
 | **运行状态提示** | 无 (通过 SN 位抑制通知) | `IsRun` (bit 6): 0=Guest 未运行, 1=运行中 |
 | **日志机制** | 无 | `GALogIntr` (bit 2): 记录未投递的中断 |
 | **零 VM-Exit 机制** | PI Descriptor + 通知中断 | vAPIC Backing Page + doorbell 中断 |
@@ -91,22 +92,37 @@
 **规范引用**: amd-virtualization.pdf, Section 2.2.5.1, Figure 15, Table 20
 
 ```
-127                                                              0
-┌──────────────────────────────────────────────────────────────────────┐
-│ Reserved          │ Vector │  Destination │DM│RqEoi│IntType│SupIOPF│RemapEn│
-│    96:72          │ 71:64  │    15:8      │ 7 │  6  │  4:2  │   1   │   0   │
-│                   │  8-bit │    8-bit     │1b │ 1b  │  3b   │  1b   │  1b   │
-└──────────────────────────────────────────────────────────────────────┘
+32-bit 表项（Table 20 "Basic Format"）:
 
-字段说明 (amd-virtualization.pdf, Table 20):
-  Vector (71:64)    : 中断向量号 (8-bit)
-  Destination (15:8): 目标 APIC 物理/逻辑地址
-  DM (7)            : Destination Mode, 1=逻辑模式, 0=物理模式
-  RqEoi (6)         : Request EOI, 1=需要 EOI 周期
+  bits   字段
+  ─────────────────────────────────────────────
+  31:24  Reserved
+  23:16  Vector        (8-bit)
+  15:8   Destination   (8-bit)
+     7   GuestMode     ← 本格式恒为 0
+     6   DM            1=逻辑, 0=物理
+     5   RqEoi
+   4:2   IntType       000b=Fixed, 001b=Arbitrated
+     1   SupIOPF
+     0   RemapEn
+
+字段说明 (amd-virtualization.pdf, Table 20；内核对照 union irte,
+drivers/iommu/amd/amd_iommu_types.h:982-994):
+  Vector (23:16)    : 中断向量号 (8-bit)              [fields.vector]
+  Destination (15:8): 目标 APIC 物理/逻辑地址          [fields.destination]
+  GuestMode (7)     : 本格式下恒为 0（区分 GA 格式的标志位）
+                      [fields.rsvd_1 / fields_remap.guest_mode]
+  DM (6)            : Destination Mode, 1=逻辑模式, 0=物理模式   [fields.dm]
+  RqEoi (5)         : Request EOI, 1=需要 EOI 周期               [fields.rq_eoi]
   IntType (4:2)     : 中断类型, 000b=Fixed, 001b=Arbitrated
-  SupIOPF (1)       : 抑制 IO_PAGE_FAULT 事件
-  RemapEn (0)       : 重映射使能, 1=有效, 0=中断被目标终止
+  SupIOPF (1)       : 抑制 IO_PAGE_FAULT 事件                    [fields.no_fault]
+  RemapEn (0)       : 重映射使能, 1=有效, 0=中断被目标终止        [fields.valid]
 ```
+
+**勘误（2026-11-25）**：旧版图把 Vector 标在 71:64、DM=bit7、RqEoi=bit6——
+71:64 是 **128-bit GA 表内 remap 条目（Table 22）** 的位置；Table 20 Basic 格式中
+bit 7 是恒零的 GuestMode，DM=bit 6、RqEoi=bit 5、Vector=bits 23:16（Table 20 与内核
+`union irte` 一致）。见 corrections.md。
 
 ### 3.2 Guest Virtual APIC 启用时的 IRTE 格式
 
@@ -235,24 +251,21 @@ Guest Virtual APIC Backing Page (4KB):
            │         Reserved (0x000-0x1FF)           │
            │              512 bytes                    │
 偏移 0x200 ├────────────────────────────────────────┤
-           │         Virtual IRR (vIRR)               │
-           │         256 bits = 32 bytes              │
-           │         每个 bit 对应一个中断向量          │
-           │                                          │
-           │    bit 0  = vector 0                     │
-           │    bit 1  = vector 1                     │
-           │    ...                                   │
-           │    bit 255 = vector 255                  │
-           │                                          │
-           │    布局: 32 个 8-bit 字节                 │
-           │    Byte 0: bits 7-0   (vectors 0-7)      │
-           │    Byte 1: bits 15-8  (vectors 8-15)     │
-           │    ...                                   │
-           │    Byte 31: bits 255-248 (vectors 248-255)│
-偏移 0x220 ├────────────────────────────────────────┤
-           │         Reserved (0x220-0xFFF)           │
-           │              3552 bytes                  │
+           │  Virtual IRR (vIRR): 8 个 32-bit 寄存器， │
+           │  16 字节步距（与 Local APIC MMIO 同风格）  │
+           │    0x200: vectors   0- 31  (低32位有效)    │
+           │    0x210: vectors  32- 63                 │
+           │    0x220: vectors  64- 95                 │
+           │    ...                                    │
+           │    0x270: vectors 224-255                 │
+           │  → 实际占用 0x200-0x273，跨到 0x270+4      │
+偏移 0x274 ├────────────────────────────────────────┤
+           │  （规范本节未把其余区域定义为 vIRR）       │
 偏移 0xFFF └────────────────────────────────────────┘
+
+勘误（2026-11-25）：旧图把 vIRR 画成"32 个 8-bit 字节连续位图（0x200-0x21F）、
+0x220 起全为 Reserved"——与下方自己引用的公式矛盾：byte offset=(V/32)<<4 是
+**16 字节步距的 32-bit 寄存器组**，vector 64 落在 0x220（旧图中却是 Reserved）。
 
 IOMMU 写入 vIRR 的计算 (amd-virtualization.pdf, Section 2.2.5.2):
 
@@ -434,10 +447,11 @@ GA Log Entry 格式 (64-bit, amd-virtualization.pdf, Table 75):
 │  │ 2. 读取 PDA → PI Descriptor 物理地址                            │    │
 │  │ 3. 原子设置: PIR[VV]=1, ON=1                                    │    │
 │  │ 4. 发送通知中断 (NV) 给 NDST 指定的 pCPU                        │    │
-│  │ 5. pCPU 收到通知中断:                                            │    │
-│  │    · 如果 vCPU 正在运行: 硬件在 VM-Exit 时自动 PIR→IRR           │    │
+│  │ 5. 通知中断到达 NDST 指向的 pCPU:                                 │    │
+│  │    · 如果 vCPU 正在 Guest 运行: 硬件以不可中断方式直接完成         │    │
+│  │      posted-interrupt processing（清ON→PIR→VIRR→RVI），★不VM-Exit │    │
 │  │    · 如果 vCPU 未运行: pi_wakeup_handler() 唤醒                  │    │
-│  │ 6. VM-Entry 时硬件自动 PIR→IRR, Guest 处理                      │    │
+│  │ 6. 下次进入 Guest 前 vmx_sync_pir_to_irr() 兜底同步, Guest 处理   │    │
 │  │                                                                   │    │
 │  │  关键点:                                                          │    │
 │  │    · 总是发送通知中断 (即使 vCPU 未运行)                          │    │
@@ -477,7 +491,7 @@ GA Log Entry 格式 (64-bit, amd-virtualization.pdf, Table 75):
 | **vCPU 未运行** | PIR[vec]=1, ON=1, SN=1 → 不发送通知 | vIRR[vec]=1, IsRun=0, 写入 GA Log |
 | **vCPU 调出** | 设置 SN=1 抑制通知 | 设置 IsRun=0 |
 | **vCPU 载入** | 清除 SN=0, 更新 NDST | 设置 IsRun=1, 更新 Destination |
-| **vCPU 迁移** | 更新 PI.NDST + IRTE.DestID | 更新 IRTE.Destination |
+| **vCPU 迁移** | 只更新 PI.NDST（Posted IRTE 无 destination，不改 IRTE） | 更新 IRTE.Destination + IsRun |
 
 ### 6.4 零 VM-Exit 实现对比
 
@@ -495,7 +509,9 @@ GA Log Entry 格式 (64-bit, amd-virtualization.pdf, Table 75):
 │  │   4. 评估中断 (RVI vs PPR)                                      │    │
 │  │   5. 如果 RVI > PPR: 注入中断                                   │    │
 │  │                                                                   │    │
-│  │ 触发时机: VM-Exit 时 (外部中断向量 = 通知向量)                   │    │
+│  │ 触发时机: guest 态收到外部中断、向量 = posted-interrupt          │    │
+│  │          notification vector 时——★ 不产生 VM-Exit（SDM 30.6     │    │
+│  │          "without transferring control to the VMM"）             │    │
 │  │ 规范引用: Intel SDM Section 30.6                                  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                          │
@@ -511,8 +527,10 @@ GA Log Entry 格式 (64-bit, amd-virtualization.pdf, Table 75):
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                          │
 │  关键差异:                                                                │
-│    · Intel 需要通知中断触发 VM-Exit, 然后在 VM-Exit 时自动处理          │
-│    · AMD 的 vIRR 直接在 vAPIC page, VM-Entry 时自动评估                 │
+│    · Intel 正常路径零 VM-Exit: guest 态收到通知向量中断时硬件直接做      │
+│      posted-interrupt processing，KVM 代码不执行（勿误解为 VM-Exit 处理）│
+│    · AMD 的 vIRR 直接在 vAPIC page, 收到 doorbell/下次调度进 Guest 时    │
+│      由硬件评估 vIRR vs vPPR 自动注入                                    │
 │    · 两者最终都实现零 VM-Exit 的中断注入                                 │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘

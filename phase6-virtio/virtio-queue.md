@@ -1,6 +1,6 @@
 # Virtio Queue 深度解析
 
-> Phase 5 深度主题 | 从 README.md 拆出，正文内容未作改动
+> Phase 6 深度主题 | 2026-11-25 事实核查修订（修正项见 [corrections.md](corrections.md) 勘误 5）
 
 ---
 
@@ -171,8 +171,9 @@ Kick 和 Notify 是 virtio 的中断机制，用于通知对方"有新的数据"
 │                                                               │
 │  设备 → 驱动 (Notify/Interrupt):                             │
 │    · 设备写 used ring 后, 发送中断                           │
-│    · vhost: 直接调用 kvm_set_irq() 注入中断                  │
-│    · QEMU: 通过 eventfd 通知 KVM 注入中断                   │
+│    · vhost: eventfd_signal(vq->call_ctx.ctx)                 │
+│      → KVM irqfd → kvm_set_irq()  （vhost 不直接调 KVM）    │
+│    · QEMU: 通过 eventfd / KVM_SIGNAL_MSI 通知 KVM 注入中断  │
 │                                                               │
 │  关键优化:                                                     │
 │    · Event Index: 避免不必要的 kick/interrupt                │
@@ -300,25 +301,59 @@ Queue Size (队列大小):
 │     · flags (2 bytes)                                        │
 │     · idx (2 bytes)                                          │
 │     · ring[queue_size] (2 × queue_size bytes)               │
-│     · avail_event (2 bytes, 可选)                           │
+│     · used_event (2 bytes, 仅 VIRTIO_F_EVENT_IDX)           │
+│       ★ 驱动要读的"下次该通知驱动"的值，放在 AVAIL 环尾部   │
 │                                                               │
 │  3. 已用描述符区域 (Used Ring):                              │
 │     大小 = 6 + 8 × queue_size bytes                          │
 │     · flags (2 bytes)                                        │
 │     · idx (2 bytes)                                          │
 │     · ring[queue_size] (8 × queue_size bytes)               │
-│     · used_event (2 bytes, 可选)                            │
+│     · avail_event (2 bytes, 仅 VIRTIO_F_EVENT_IDX)          │
+│       ★ 设备要读的"下次该通知设备"的值，放在 USED 环尾部    │
 │                                                               │
-│  总大小 = (16 + 2 + 8) × queue_size + 12 bytes              │
-│         = 26 × queue_size + 12 bytes                        │
+│  布局总字节（未含对齐）                                      │
+│         = (16 + 2 + 8) × queue_size + 12 = 26n + 12         │
 │                                                               │
-│  示例 (queue_size=256):                                      │
+│  示例 (queue_size=256, 未含对齐):                            │
 │  · 描述符表: 16 × 256 = 4096 bytes                          │
 │  · Available: 6 + 2×256 = 518 bytes                         │
 │  · Used: 6 + 8×256 = 2054 bytes                             │
-│  · 总计: 6668 bytes                                          │
+│  · 三者相加: 6668 bytes                                      │
+│  ★ 实际申请量更大：used ring 必须按 align 对齐，             │
+│    vring_size(256, 4096) = 8192 + 2054 = **10246 bytes**     │
 │                                                               │
 └───────────────────────────────────────────────────────────────┘
+
+**尾部这两个字段的名字是交叉的**（本节初版写反，已修）：
+
+```c
+/* 来源: include/uapi/linux/virtio_ring.h:194-197 */
+/* We publish the used event index at the end of the available ring, and vice
+ * versa. They are at the end for backwards compatibility. */
+#define vring_used_event(vr) ((vr)->avail->ring[(vr)->num])
+#define vring_avail_event(vr) (*(__virtio16 *)&(vr)->used->ring[(vr)->num])
+```
+
+规范同样如此：`struct virtq_avail` 以 `le16 used_event` 结尾（virtio-v1.3-csd01.pdf §2.7.6），
+`struct virtq_used` 以 `le16 avail_event` 结尾（§2.7.8）。
+记忆法：**字段名表示"谁的值"，位置表示"谁去看"** —— used_event 是驱动关心的、驱动自己
+写在 avail 环尾；avail_event 是设备关心的、设备写在 used 环尾。
+
+对齐带来的差异来自 `vring_size()`：
+
+```c
+/* 来源: include/uapi/linux/virtio_ring.h:209-214 */
+static inline unsigned vring_size(unsigned int num, unsigned long align)
+{
+	return ((sizeof(struct vring_desc) * num + sizeof(__virtio16) * (3 + num)
+		 + align - 1) & ~(align - 1))
+		+ sizeof(__virtio16) * 3 + sizeof(struct vring_used_elem) * num;
+}
+```
+
+`align` 即 `VIRTIO_PCI_VRING_ALIGN = 4096`（`include/uapi/linux/virtio_pci.h:93`），
+所以 desc+avail 区间被向上取整到 8192。
 
 ┌─ Packed Queue (Virtio 1.1+) ───────────────────────────────┐
 │                                                               │
@@ -376,9 +411,15 @@ Queue Size (队列大小):
 │  · 通过 wrap counter 区分新旧描述符                         │
 │  · 描述符中的 AVAIL/USED 标志位表示状态                     │
 │                                                               │
-│  状态判断:                                                   │
-│  · 驱动判断描述符可用: avail == wrap_counter                │
-│  · 设备判断描述符可用: avail != used && avail == wrap       │
+│  状态判断（谁写、谁读，方向不要搞反）:                       │
+│  · 驱动【写】标记可用: AVAIL = 自己的 wrap, USED = 取反     │
+│  · 设备【写】标记已用: USED  = 自己的 wrap, AVAIL = 同值     │
+│  · 判据（spec §2.8.1）: AVAIL != USED → 可用；二者相等 → 已用│
+│  · 驱动侧实际检查的是"已用": is_used_desc_packed()           │
+│      return avail == used && used == used_wrap_counter;      │
+│      （drivers/virtio/virtio_ring.c:1648-1658）              │
+│  · 设备侧检查的是"可用": avail != used                       │
+│    （并把自己的 Device Ring Wrap Counter 与之比对）          │
 │                                                               │
 │  Wrap Counter:                                               │
 │  · 初始值为 1                                                │
@@ -386,10 +427,11 @@ Queue Size (队列大小):
 │  · 用于区分新旧描述符                                       │
 │                                                               │
 │  优点:                                                       │
-│  · 内存占用减少 40%                                         │
-│  · 更好的缓存局部性                                         │
-│  · 减少内存访问次数                                         │
-│  · 性能提升 10-20%                                          │
+│  · 内存占用更少（每描述符一份 16B，无双环 + idx 开销）       │
+│  · 更好的缓存局部性（单环、顺序访问）                       │
+│  · 减少内存访问次数（无 avail/used 两次间接寻址）           │
+│  ★ 具体收益百分比本仓未实测，见 phase10-performance 分级；  │
+│    旧讲义的 "40%/10-20%" 无出处，已登记待审计               │
 │                                                               │
 │  缺点:                                                       │
 │  · 实现复杂                                                 │
@@ -551,55 +593,111 @@ static bool vm_notify_with_data(struct virtqueue *vq)
 
 解决方案: KVM IOEventFD + Fast MMIO Bus
 
-机制:
-  · 设备注册 IOEventFD 时指定地址和数据匹配
-  · KVM 将匹配的 MMIO 访问放入快速总线 (KVM_FAST_MMIO_BUS)
+机制（★ fast-mmio 的前提是「不带 datamatch」，本节初版写成"指定地址和数据匹配"，已修）:
+  · 设备注册 IOEventFD 时指定地址 + fd；len 可以是 0（忽略长度）或 1/2/4/8
+  · 只有 **len == 0** 且地址在 KVM_MMIO_BUS 上的 ioeventfd，才会被**额外**挂到
+    KVM_FAST_MMIO_BUS；而 len==0 与 DATAMATCH 是互斥的（KVM 直接 -EINVAL）
   · 当 Guest 触发 EPT_MISCONFIG 时:
     1. 先检查 KVM_FAST_MMIO_BUS 是否有匹配
     2. 如果有，直接完成写入，跳过指令模拟
     3. 如果没有，才走正常的指令模拟流程
 
-实现:
+实现（以下三段均为实际源码，非伪代码）:
 
-// 注册 IOEventFD
+```c
+/* 来源: include/uapi/linux/kvm.h:612-619 —— 注意字段顺序与 fd */
 struct kvm_ioeventfd {
-    __u64 addr;           // MMIO 地址
-    __u32 len;            // 数据长度
-    __u64 datamatch;      // 数据匹配值
-    __u32 flags;          // 标志位
-    // ...
+	__u64 datamatch;
+	__u64 addr;        /* legal pio/mmio address */
+	__u32 len;         /* 1, 2, 4, or 8 bytes; or 0 to ignore length */
+	__s32 fd;
+	__u32 flags;
+	__u8  pad[36];
 };
+```
 
-// KVM 内部处理
-static int kvm_assign_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
-{
-    // 如果 len=0，放入快速总线
-    if (!args->len && bus_idx == KVM_MMIO_BUS) {
-        ret = kvm_assign_ioeventfd_idx(kvm, KVM_FAST_MMIO_BUS, args);
-    }
-    // ...
-}
+```c
+/* 来源: virt/kvm/eventfd.c:973-988 —— kvm_assign_ioeventfd() */
+	/* ioeventfd with no length can't be combined with DATAMATCH */
+	if (!args->len && (args->flags & KVM_IOEVENTFD_FLAG_DATAMATCH))
+		return -EINVAL;
 
-// 处理 EPT_MISCONFIG
+	ret = kvm_assign_ioeventfd_idx(kvm, bus_idx, args);
+	if (ret)
+		goto fail;
+
+	/* When length is ignored, MMIO is also put on a separate bus, for
+	 * faster lookups.
+	 */
+	if (!args->len && bus_idx == KVM_MMIO_BUS) {
+		ret = kvm_assign_ioeventfd_idx(kvm, KVM_FAST_MMIO_BUS, args);
+		if (ret < 0)
+			goto fast_fail;
+	}
+```
+
+即：**fast-mmio 走的是"忽略长度、忽略数据"的 wildcard 路径**，命中即 signal，
+不需要比对 datamatch，这才是它能省掉指令模拟的原因。
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:5815-5834 —— handle_ept_misconfig() */
 static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
 {
-    gpa_t gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
-    
-    // 先检查快速总线
-    if (!is_guest_mode(vcpu) &&
-        !kvm_io_bus_write(vcpu, KVM_FAST_MMIO_BUS, gpa, 0, NULL)) {
-        trace_kvm_fast_mmio(gpa);
-        return kvm_skip_emulated_instruction(vcpu);
-    }
-    
-    // 走正常模拟流程
-    return kvm_mmu_page_fault(vcpu, gpa, PFERR_RSVD_MASK, NULL, 0);
+	gpa_t gpa;
+
+	if (vmx_check_emulate_instruction(vcpu, EMULTYPE_PF, NULL, 0))
+		return 1;
+
+	/*
+	 * A nested guest cannot optimize MMIO vmexits, because we have an
+	 * nGPA here instead of the required GPA.
+	 */
+	gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+	if (!is_guest_mode(vcpu) &&
+	    !kvm_io_bus_write(vcpu, KVM_FAST_MMIO_BUS, gpa, 0, NULL)) {
+		trace_kvm_fast_mmio(gpa);
+		return kvm_skip_emulated_instruction(vcpu);
+	}
+
+	return kvm_mmu_page_fault(vcpu, gpa, PFERR_RSVD_MASK, NULL, 0);
 }
+```
+
+VMM 侧谁用得上 fast-mmio（QEMU 10.1.0-rc2）:
+
+```c
+/* 来源: hw/virtio/virtio-pci.c:343-349 —— virtio_pci_ioeventfd_assign()（函数头 :326） */
+        if (modern) {
+            memory_region_add_eventfd(modern_mr, modern_addr, 0,
+                                      false, n, notifier);
+            if (modern_pio) {
+                memory_region_add_eventfd(modern_notify_mr, 0, 2,
+                                              true, n, notifier);
+            }
+        }
+```
+
+```c
+/* 来源: hw/virtio/virtio-mmio.c:52-53 */
+        memory_region_add_eventfd(&proxy->iomem, VIRTIO_MMIO_QUEUE_NOTIFY, 4,
+                                  true, n, notifier);
+```
+
+| 注册方 | size | match_data | 能否进 KVM_FAST_MMIO_BUS |
+|---|---|---|---|
+| virtio-pci **modern** MMIO notify（`virtio-pci.c:344`） | 0 | false | ✅ 能（每队列一个独立地址） |
+| virtio-pci modern **PIO** notify（`:347`） | 2 | true | ❌ 否 |
+| virtio-pci **legacy** notify（`:352`） | 2 | true | ❌ 否 |
+| **virtio-mmio**（`virtio-mmio.c:52`） | 4 | true | ❌ 否 |
+
+所以"virtio-mmio 拿不到 fast-mmio"的真正原因不是协议本身，而是 QEMU 给它注册的是
+**固定单地址 + datamatch**（所有队列共用 `VIRTIO_MMIO_QUEUE_NOTIFY`，靠数据的队列号区分），
+`len != 0` 就不满足 `eventfd.c:984` 的条件。
 
 限制:
-  · Virtio-mmio 协议本身的限制
-  · 同一地址绑定多个 eventfd 时无法使用 fast-mmio
-  · 需要特定条件下的优化
+  · 只有 len=0（无 datamatch）的 MMIO ioeventfd 才享受 fast-mmio
+  · 嵌套 guest（is_guest_mode）走不了（`vmx.c:5822-5827` 注释：拿到的是 nGPA）
+  · fast-mmio 只覆盖"写"，读 notify 寄存器仍需正常模拟
 ```
 
 #### 同步机制与原子性保证
@@ -650,61 +748,87 @@ static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
 │                                                               │
 └───────────────────────────────────────────────────────────────┘
 
-┌─ 设备侧同步示例 ──────────────────────────────────────────┐
+┌─ 设备侧（vhost）写 used ring：真实代码 ───────────────────┐
 │                                                               │
-│  // 设备写入 used ring                                      │
-│  void add_used(struct vring_virtqueue *vq,                  │
-│                struct vring_used_elem *elem)                 │
-│  {                                                           │
-│      // 1. 写入数据到 used ring                             │
-│      vq->vring.used->ring[idx] = *elem;                    │
-│                                                               │
-│      // 2. 写屏障，确保数据写入完成                         │
-│      smp_wmb();                                              │
-│                                                               │
-│      // 3. 更新 idx                                         │
-│      vq->vring.used->idx++;                                │
-│                                                               │
-│      // 4. 发送中断通知驱动                                 │
-│      notify_guest();                                         │
-│  }                                                           │
+/* 来源: drivers/vhost/vhost.c:2960-2995 —— vhost_add_used_n()（节选） */
+int vhost_add_used_n(struct vhost_virtqueue *vq, struct vring_used_elem *heads,
+		     unsigned count)
+{
+	...
+	r = __vhost_add_used_n(vq, heads, count);      /* :2974 写 ring[] 条目 */
+	if (r < 0)
+		return r;
+
+	/* Make sure buffer is written before we update index. */
+	smp_wmb();                                     /* :2980 */
+	if (vhost_put_used_idx(vq)) {                  /* :2981 再更新 used->idx */
+		vq_err(vq, "Failed to increment used idx");
+		return -EFAULT;
+	}
+	...
+}
+
+│  · 条目内容由 __vhost_add_used_n() 写入（vhost.c:2926-2956，   │
+│    内部用 vhost_put_used() 做用户态写，脏页日志路径另有       │
+│    smp_wmb() @ :2942）                                        │
+│  · used->idx 是 __virtio16（virtio_ring.h:133），不是 u32      │
+│  · 设备侧持有的是 guest 内存的 __user 指针：                  │
+│    vring_used_elem_t __user *used = vq->used->ring + start;   │
+│    （vhost.c:2930-2935；vq->used 类型见 vhost.h:102）         │
 │                                                               │
 │  为什么需要 smp_wmb()?                                       │
 │  · 如果 CPU 重排序，可能先更新 idx，再写入数据             │
 │  · 驱动看到新的 idx，但数据还没写入                        │
 │  · 导致驱动读取到旧数据，状态不一致                        │
 │  · smp_wmb() 确保数据先写入，idx 后更新                    │
-│                                                               │
 └───────────────────────────────────────────────────────────────┘
 
-┌─ 驱动侧同步示例 ──────────────────────────────────────────┐
+┌─ 驱动侧（guest 内核）读 used ring：真实代码 ──────────────┐
 │                                                               │
-│  // 驱动读取 used ring                                      │
-│  void process_used(struct vring_virtqueue *vq)             │
-│  {                                                           │
-│      // 1. 读取 idx                                         │
-│      u32 idx = vq->vring.used->idx;                       │
+/* 来源: drivers/virtio/virtio_ring.c:817-852 —— 节选 */
+static bool more_used_split(const struct vring_virtqueue *vq)
+{
+	return vq->last_used_idx != virtio16_to_cpu(vq->vq.vdev,
+			vq->split.vring.used->idx);        /* :819-820 先读 idx */
+}
+
+static void *virtqueue_get_buf_ctx_split(struct virtqueue *_vq,
+					 unsigned int *len, void **ctx)
+{
+	...
+	if (!more_used_split(vq))                         /* :839 */
+		return NULL;
+
+	/* Only get used array entries after they have been exposed by host. */
+	virtio_rmb(vq->weak_barriers);                    /* :846 再读条目 */
+
+	last_used = (vq->last_used_idx & (vq->split.vring.num - 1));
+	i = virtio32_to_cpu(_vq->vdev,
+			vq->split.vring.used->ring[last_used].id);   /* :849-850 */
+	*len = virtio32_to_cpu(_vq->vdev,
+			vq->split.vring.used->ring[last_used].len);  /* :851-852 */
+	...
+}
+
+│  · 成员路径是 vq->split.vring.used（struct vring_virtqueue 用   │
+│    union 区分 split/packed，定义见 virtio_ring.c:154 起）；    │
+│    不存在 vq->vring.used 这种写法                              │
+│  · 索引比较用 u16 回绕语义，条目读取一律过 virtio16/32_to_cpu │
+│  · 屏障是 virtio_rmb(vq->weak_barriers) 而非裸 smp_rmb()：    │
+│    同机/无 DMA API 时可用弱屏障（定义在                        │
+│    include/linux/virtio_ring.h:33），跨设备才需要真正的 rmb   │
 │                                                               │
-│      // 2. 读屏障，确保 idx 读取完成                        │
-│      smp_rmb();                                              │
-│                                                               │
-│      // 3. 读取数据                                         │
-│      struct vring_used_elem elem = vq->vring.used->ring[idx];│
-│                                                               │
-│      // 4. 处理数据                                         │
-│      process(&elem);                                         │
-│  }                                                           │
-│                                                               │
-│  为什么需要 smp_rmb()?                                       │
+│  为什么需要 rmb()?                                           │
 │  · 如果 CPU 重排序，可能先读取数据，再读取 idx             │
 │  · 导致读取到旧数据                                        │
-│  · smp_rmb() 确保 idx 先读取，数据后读取                   │
-│                                                               │
+│  · rmb() 确保 idx 先读取，数据后读取                       │
 └───────────────────────────────────────────────────────────────┘
 
 关键原则:
-  · 写方: 先写数据，再写索引 (使用 wmb)
-  · 读方: 先读索引，再读数据 (使用 rmb)
+  · 写方: 先写数据，再写索引 (vhost.c:2979-2981 的 smp_wmb)
+  · 读方: 先读索引，再读数据 (virtio_ring.c:839-846 的 virtio_rmb)
+  · 两端都成对：驱动回写 used_event/消费进度时同样有对应屏障
+    （virtio_ring.c:866-870，注释 "flush out the write before the read"）
   · 确保 Host 和 Guest 看到一致的视图
 ```
 

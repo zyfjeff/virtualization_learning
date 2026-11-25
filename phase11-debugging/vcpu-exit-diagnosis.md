@@ -47,7 +47,7 @@ kvm_arch_vcpu_ioctl_run() → copy exit_reason to userspace
 
 **源码引用**：
 - VM-Exit 入口：`arch/x86/kvm/vmx/vmx.c:7344`（`vmx_vcpu_run`）
-- kvm_exit tracepoint：`vmx.c:7489`（唯一调用点）
+- kvm_exit tracepoint：`vmx.c:7489`（VMX 侧唯一调用点；SVM 在 `svm.c:4464` 另有一处）
 - 退出分发：`vmx.c:6436`（`__vmx_handle_exit`）
 - 退出处理表：`vmx.c:6095-6148`（`kvm_vmx_exit_handlers[]`）
 
@@ -71,10 +71,16 @@ kvm_arch_vcpu_ioctl_run() → copy exit_reason to userspace
 **Step 1：检查 QEMU 日志**
 
 ```bash
-grep -i 'internal error' /tmp/qemu.log
-# 预期输出类似：
-# error: KVM internal error: suberror 3
-# 或: KVM_INTERNAL_ERROR_DELIVERY_EV
+# 注意：这条信息打在 **stderr**，不在 `-D` 指定的日志文件里
+#（QEMU 的 fprintf(stderr, ...)，accel/kvm/kvm-all.c:2858）
+grep -i 'internal error' /tmp/qemu.err
+# 实际文本是（大小写/标点照源码）：
+#   KVM internal error. Suberror: 3
+#   extra data[0]: 0x0000000080000021
+#   extra data[1]: 0x0000000000000030
+#   ...
+# suberror 的取值含义见 §2.1 表（3 = KVM_INTERNAL_ERROR_DELIVERY_EV）；
+# QEMU 不会打印 KVM_INTERNAL_ERROR_* 这种符号名。
 ```
 
 **Step 2：启用 ftrace 跟踪退出链路**
@@ -93,15 +99,20 @@ cat $TRACEFS/trace | grep -E 'kvm_exit|inj_exception' | tail -30
 **Step 3：分析 exit_reason 和 error_code**
 
 ```bash
-# kvm_exit 的字段（见 arch/x86/kvm/trace.h:297-336）：
-# - exit_reason: VM-Exit 原因（数字）
+# kvm_exit 的字段（宏 TRACE_EVENT_KVM_EXIT，arch/x86/kvm/trace.h:297-331）：
+# - exit_reason: VM-Exit 原因。★ 在 ftrace 文本里打印的是**符号名**
+#   （TP_printk 是 "vcpu %u reason %s%s%s ..."，由 kvm_print_exit_reason()
+#    翻译，trace.h:289-296/:325-330）；只有在 bpftrace 里
+#    `args->exit_reason` 才是数字。见 corrections.md C6。
 # - guest_rip: guest RIP
+# - isa: KVM_ISA_VMX / KVM_ISA_SVM
 # - intr_info: VM-Exit interruption info
 # - error_code: 异常错误码
 # - info1: exit qualification
 # - info2: idt_vectoring_info
+# - vcpu_id: vCPU 编号
 
-# 查看最近的 kvm_exit
+# 查看最近的 kvm_exit（文本里 reason 是符号名，grep 'reason \w+' 才对）
 cat $TRACEFS/trace | grep 'kvm_exit' | tail -5
 ```
 
@@ -199,9 +210,16 @@ KVM 自身检测到三重故障条件，设置 `KVM_REQ_TRIPLE_FAULT` 请求：
 | 触发位置 | 条件 | 源码 |
 |---------|------|------|
 | `x86.c:885` | `#DF` 已挂起时又发生新异常 | `kvm_multiple_exception()` |
+| `x86.c:5306` | UC 型 #MC 无法交付（`CR4.MCE` 未开 / `MCG_STATUS.MCIP`） | `kvm_inject_mce()` |
+| `x86.c:5545` | 用户态用 `KVM_SET_VCPU_EVENTS` 塞入 pending triple fault | `kvm_vcpu_ioctl_x86_set_vcpu_events()` |
 | `x86.c:8619` | 指令模拟导致无法交付的故障 | `emulator_triple_fault()` |
 | `x86.c:8787` | 实模式 INT 模拟失败 | `kvm_inject_realmode_interrupt()` |
-| `vmx.c:6495` | L2 guest 状态无效 | `__vmx_handle_exit()` 嵌套路径 |
+
+> ★ `vmx.c:6495-6496`（L2 状态无效）**不走 `KVM_REQ_TRIPLE_FAULT`**：
+> 那里直接 `nested_vmx_vmexit(vcpu, EXIT_REASON_TRIPLE_FAULT, 0, 0)`
+> 把三重故障投递给 L1，本表旧版把它列成"设置请求"是错的。
+> 全树 `grep -n KVM_REQ_TRIPLE_FAULT arch/x86/kvm/x86.c` 的写点只有上表 5 处
+> （外加 `x86.c:10850/10854` 两个读点）。
 
 **消耗点**：`vcpu_enter_guest()` 检查 `KVM_REQ_TRIPLE_FAULT`（`x86.c:10850-10860`）：
 ```c
@@ -241,9 +259,12 @@ Triple fault 通常是异常链：
 ```
 
 ```bash
-# 查看异常序列
+# 查看异常序列：TP_printk 是 "%s%s%s%s%s"，输出形如
+#   kvm_inj_exception: #PF (0)   /   kvm_inj_exception: #DF   /   #GP (14)
+# 所以取异常名要 grep 符号本身，不能用 awk '{print $NF}'
+# （带错误码时 $NF 是 "(0)"，不是异常名），也不能用 'exception=\w+'（没有这个键）
 cat $TRACEFS/trace | grep 'inj_exception' | \
-    awk '{print $NF}' | tail -10
+    grep -oP '#[A-Z]{2}' | tail -10
 # 预期看到连续的 #PF → #DF → shutdown
 ```
 
@@ -380,8 +401,16 @@ vcpu_enter_guest() → kvm_check_and_inject_events() → kvm_inject_exception()
 ### 5.3 trace_kvm_inj_exception
 
 **定义**：`arch/x86/kvm/trace.h:372`
-**字段**：`vcpu_id, exception, has_error_code, error_code, payload`
+**字段**：`exception, has_error, error_code, reinjected`
+（`trace.h:377-382` 的 `TP_STRUCT__entry`；宿主
+`events/kvm/kvm_inj_exception/format` 实测同此 —— **没有 `vcpu_id`，
+没有 `has_error_code`，也没有 `payload`**；调用点传的是
+`vcpu->arch.exception.{vector,has_error_code,error_code,injected}`，
+落到 trace 里的字段名是 `exception/has_error/...`，见 `x86.c:10295-10298`）
 **调用点**：`kvm_inject_exception()`（`x86.c:10295`）
+
+`TP_printk` 是 `"%s%s%s%s%s"`，即直接打印异常符号（`#PF`、`#DF (0)`…），
+所以想按异常统计要用 `grep -oP '#[A-Z]{2}'`，**不能用 `exception=\w+`**（文本里没有这个键）。
 
 ```bash
 # 跟踪异常注入
@@ -395,11 +424,23 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep inj_exception
 
 | 工具 | 用途 | 命令 |
 |------|------|------|
-| QEMU 日志 | 查看 KVM_EXIT_* 原因 | `-D /tmp/qemu.log -d kvm` |
+| QEMU stderr | 查看 KVM_EXIT_* 原因 | 直接看标准错误（不要 `-d kvm`，见下方说明）|
+| QEMU trace event | 把 exit 原因写进 `-D` 日志文件 | `-D /tmp/qemu.log -d trace:kvm_run_exit` |
 | ftrace kvm_exit | 退出原因分布 | `echo kvm:kvm_exit >> set_event` |
 | ftrace kvm_inj_exception | 异常注入记录 | `echo kvm:kvm_inj_exception >> set_event` |
 | bpftrace | 按 exit_reason 统计 | `tracepoint:kvm:kvm_exit { @r[args->exit_reason] = count(); }` |
 | dump_invalid_vmcs | VMCS 状态导出 | `echo 1 > /sys/module/kvm_intel/parameters/dump_invalid_vmcs` |
+
+> ★ **`-d kvm` 不是合法的 QEMU 日志项**。QEMU 10.1.0-rc2 的
+> `qemu_log_items[]`（`util/log.c:476-527`）里没有 `kvm`，未知项会让
+> `qemu_str_to_log_mask()` 返回 0，`system/vl.c:2609-2613` 随即打印 usage 并
+> `exit(1)` —— VM 根本起不来（本机 QEMU 8.2.2 实测同样 exit 1）。
+> KVM 退出信息本来就是直接打 **stderr** 的：
+> `accel/kvm/kvm-all.c:2858` `"KVM internal error. Suberror: %d"`、
+> `target/i386/kvm/kvm.c:6098` `"KVM: entry failed, hardware error 0x%"PRIx64`。
+> 想落进文件有两条路：shell 层 `2> /tmp/qemu.err`，或用 trace event
+> `-d trace:kvm_run_exit`（`accel/kvm/kvm-all.c:3242`，`trace:` 前缀由
+> `util/log.c:543-545` 特殊处理）。
 
 ---
 
@@ -410,7 +451,7 @@ cat /sys/kernel/debug/tracing/trace_pipe | grep inj_exception
 - Triple fault 处理：`vmx.c:5394`（`handle_triple_fault`）
 - 异常队列：`x86.c:826`（`kvm_multiple_exception`）
 - 异常注入：`x86.c:10284`（`kvm_inject_exception`）
-- kvm_exit tracepoint：`trace.h:297-336`
+- kvm_exit tracepoint：`trace.h:297-331`（宏 `TRACE_EVENT_KVM_EXIT`），实例化 `trace.h:336`
 - KVM_EXIT_* 常量：`include/uapi/linux/kvm.h:189-195`
 - 性能分析：`performance-analysis.md`
 - 实战案例：`case-studies.md`

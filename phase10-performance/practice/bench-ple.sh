@@ -4,7 +4,7 @@
 # 一次测量 = 一次完整 boot，不是"同一台 VM 里换参数"。两条理由：
 #   1) ple_* 全是 0444 只读（arch/x86/kvm/vmx/vmx.c:204 等），改档必须重载 kvm_intel；
 #   2) PLE 窗口 per-vCPU 只增不减（vmx.c:1417-1431），回落只在 vmx_vcpu_load
-#      （vmx.c:1519-1523）—— 同进程内跨档比较一定被上一档污染。
+#      （vmx.c:1520-1522）—— 同进程内跨档比较一定被上一档污染。
 #   （guest 的 minimal initramfs 里也没有 rmmod，负载无法热替换。）
 #
 # 用法：

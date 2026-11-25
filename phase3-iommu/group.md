@@ -10,7 +10,7 @@
 > 就无法解释"为什么这台网卡不能单独直通"，也无法解释 [Q3](domains.md#d7-推论acs-决定了域的形状)
 > 里那条"ACS 改组成员 → 域的形状跟着变"的推论。
 >
-> **分工**：**判定规则在 [phase6 §1.4/§1.5](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)，
+> **分工**：**判定规则在 [phase7 §1.4/§1.5](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)，
 > 构造机制在本篇。**
 
 ---
@@ -20,7 +20,7 @@
 - [G.1 为什么是"整组一起"](#g1-为什么是整组一起)
 - [G.2 probe 路径：设备如何进入 group](#g2-probe-路径设备如何进入-group)
 - [G.3 attach 路径：域如何装到设备上](#g3-attach-路径域如何装到设备上)
-- [G.4 与 phase6 的接缝](#g4-与-phase6-的接缝)
+- [G.4 与 phase7 的接缝](#g4-与-phase7-的接缝)
 - [G.5 自检问题](#g5-自检问题)
 
 ---
@@ -36,10 +36,10 @@
 不经过 IOMMU 就能互相发起请求的物理路径（典型是没有 ACS 的桥下游设备互发
 peer-to-peer），那么把它们放进不同域就是自欺——域 A 的页表管不住从域 B 的设备
 绕过来的请求。判定细节（四步判定、ACS 有效能力、三种真正会并组的情形）全部在
-[phase6 §1.4](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)实测核过，本篇不重复。
+[phase7 §1.4](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)实测核过，本篇不重复。
 
 对直通的直接后果：VFIO 把设备交给用户态之前要独占整个组
-（[phase6 §1.4.5](../phase7-vfio/README.md#145-这对-vfio-意味着什么)）——组里只要还有一台
+（[phase7 §1.4.5](../phase7-vfio/README.md#145-这对-vfio-意味着什么)）——组里只要还有一台
 设备被别的驱动占着，直通就会失败。这就是"整组一起"的用户可见形态。
 
 本篇接下来讲的是边界定了之后的两件事：**设备怎么进组**（G.2）与**域怎么装到组上**（G.3）。
@@ -57,15 +57,29 @@ peer-to-peer），那么把它们放进不同域就是自欺——域 A 的页�
      └─ iommu_probe_device()                 drivers/iommu/iommu.c:600   ← 公开入口，带全局锁
           └─ __iommu_probe_device()          drivers/iommu/iommu.c:513
                ├─ iommu_fwspec_ops()  取 ops  drivers/iommu/iommu.c:528   （没有 fwspec 就 -ENODEV）
-               ├─ iommu_init_device()         drivers/iommu/iommu.c:544   分配 dev_iommu、关联 iommu 设备
-               ├─ iommu_group_alloc_device()  drivers/iommu/iommu.c:549   取/建 group + 建 group_device
-               │    ├─ bus->iommu_ops->device_group()   ← 分组判定在这里（phase6 §1.4）
-               │    └─ iommu_group_alloc()    drivers/iommu/iommu.c:963   （新 group 时）
-               ├─ list_add_tail(&gdev->list)  drivers/iommu/iommu.c:560   ★ 必须先入链表
-               ├─ iommu_create_device_direct_mappings() drivers/iommu/iommu.c:563  FW 要求的恒等映射
-               ├─ iommu_setup_default_domain(group, 0)  drivers/iommu/iommu.c:569  ★ 选域 + attach（Q3）
-               └─ iommu_setup_dma_ops(dev)              drivers/iommu/iommu.c:583  ★ 决定 dev->dma_iommu
+               ├─ iommu_init_device()         drivers/iommu/iommu.c:544 → 定义 :402
+               │    ├─ ops->probe_device(dev)          :416   后端自己那一步（Intel/AMD/ARM）
+               │    ├─ iommu_device_link()             :423   把 iommu_device 与 dev 关联
+               │    ├─ group = ops->device_group(dev)  :427   ★ 分组判定在这一帧（phase7 §1.4）
+               │    │    └─ pci_device_group()         drivers/iommu/iommu.c:1515
+               │    │         └─ iommu_group_alloc()   drivers/iommu/iommu.c:963（新 group 时，:1575 处返回）
+               │    └─ dev->iommu_group = group        :434
+               ├─ group = dev->iommu_group             :548
+               ├─ iommu_group_alloc_device(group, dev) :549 → 定义 :1158（只做记账，不判分组）
+               ├─ list_add_tail(&gdev->list)           :560   ★ 必须先入链表
+               ├─ iommu_create_device_direct_mappings() :563  FW 要求的恒等映射
+               ├─ iommu_setup_default_domain(group, 0)  :569  ★ 选域 + attach（Q3）
+               └─ iommu_setup_dma_ops(dev)              :583  ★ 决定 dev->dma_iommu
 ```
+
+> **勘误**：旧稿把 `bus->iommu_ops->device_group()` 画在 `iommu_group_alloc_device()`
+> 之下，这是错的。`iommu_group_alloc_device()`（定义 `iommu.c:1158`）的形参就已经带着
+> `struct iommu_group *group` —— **group 在它被调用之前就存在了**，它只负责建
+> `group_device`、加 sysfs 链接。真正执行分组判定的是它的**兄弟帧** `iommu_init_device()`
+> 里的 `group = ops->device_group(dev)`（`iommu.c:427`），判定结果在 `:434` 存进
+> `dev->iommu_group`，`:548` 再取出来传给 `iommu_group_alloc_device()`。
+> 这个区分不是学术问题：**"设备进哪个 group"发生在与后端 `probe_device` 同一帧、
+> 早于任何链表记账**，所以 [Q3](domains.md) 的选域投票才可能读到最终确定的组成员。
 
 三处值得停下来的地方：
 
@@ -119,17 +133,17 @@ SVA 走的就是后者。`struct dev_pasid_info` 因此和 `group_device` 是两
 
 ---
 
-## G.4 与 phase6 的接缝
+## G.4 与 phase7 的接缝
 
-一句话分工：**group 的判定在 phase6，group 的构造在这里。**
+一句话分工：**group 的判定在 phase7，group 的构造在这里。**
 
 `bus->iommu_ops->device_group()` 对 PCI 设备就是 `pci_device_group()`，它回答"这台机器上
 这个设备的隔离边界在哪里"，判据是 ACS 能力位与拓扑——那整段推理在
-[phase6 §1.4](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)
+[phase7 §1.4](../phase7-vfio/README.md#14-iommu-组是怎么划出来的)
 和 [§1.5.1–1.5.3](../phase7-vfio/README.md#15-acs-与-ats直通依赖的两个-pcie-能力)。
 本阶段接手的是**边界定了之后**：这个 group 会拿到哪种域、域对象从哪来、失效由谁发起。
 
-反过来说，phase6 里"把 GPU 和 DDI 并进同一个 group"这类 ACS 配置，其内核侧的全部效果
+反过来说，phase7 里"把 GPU 和 DDI 并进同一个 group"这类 ACS 配置，其内核侧的全部效果
 只有一个：让 [Q3](domains.md) 的选择矩阵在**这个 group 上**返回 `IOMMU_DOMAIN_IDENTITY`
 （或让一个 DMA 域覆盖两个设备）。这就是 [Q3 D.7](domains.md#d7-推论acs-决定了域的形状)
 的推论。

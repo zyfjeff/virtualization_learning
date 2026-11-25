@@ -193,6 +193,9 @@ MSI-X 直通 QEMU 始终中间协调（AGENTS.md #5）。
 
 ### 2.2 DMA 映射路径
 
+> 2026-11-25 核查：本图早期版本写的 `vfio_find_dma_valid()` / `get_user_pages_fast()`
+> 在 6.12.93 里都不存在，已按真实调用链改写（见 [corrections.md](corrections.md) 勘误 12）。
+
 ```
 用户态 (QEMU) DMA 映射流程:
 
@@ -204,14 +207,19 @@ MSI-X 直通 QEMU 始终中间协调（AGENTS.md #5）。
       ├── 验证参数（IOVA, 大小, 用户空间 VADDR）
       │
       ▼
-  vfio_find_dma_valid() — 检查 IOVA 范围是否已映射
-      │
-      ├── 如果已映射 → 返回错误
+  vfio_find_dma(iommu, iova, size) — 查 IOVA 区间是否冲突
+      │                                （vfio_iommu_type1.c:1589）
+      ├── 重复映射 / vaddr_invalid 处理 → 返回错误（:1590-1608）
+      ▼
+  vfio_iommu_iova_dma_valid() — 落在允许的 IOVA 区间内？（:1615）
       │
       ▼
   vfio_pin_pages_remote() — 固定用户空间页面
-      │
-      ├── get_user_pages_fast() 固定物理页
+      │                    （vfio_iommu_type1.c:597）
+      ├── vaddr_get_pfns() → pin_user_pages_remote(mm, vaddr, npages,
+      │       flags | FOLL_LONGTERM, ...)   ← :551 / :563
+      │   ★ 不是 get_user_pages_fast()：本文件里 get_user_pages 0 命中。
+      │     FOLL_PIN（而非 FOLL_GET）+ FOLL_LONGTERM 才是"防迁移/防回收"的依据
       ├── 防止页面被换出
       │
       ▼
@@ -810,7 +818,7 @@ qemu-system-x86_64 ... \
 于是把桥拉进同一组：
 
 ```c
-/* 来源: drivers/iommu/iommu.c:1543 —— pci_device_group() */
+/* 来源: drivers/iommu/iommu.c:1547-1550 —— pci_device_group() 的 ACS 上溯循环（循环头在 :1543） */
 	if (pci_acs_path_enabled(bus->self, NULL, REQ_ACS_FLAGS))
 		break;
 

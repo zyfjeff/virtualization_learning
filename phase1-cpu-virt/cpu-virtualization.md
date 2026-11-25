@@ -66,8 +66,15 @@ CPUID 指令在 VMX 中的行为非常明确：
 ```
 ┌─ 核心事实: CPUID 总是触发 VM-Exit ─────────────────────────────────┐
 │                                                                      │
-│  Intel SDM Vol.3, Section 25.1.2 明确规定:                          │
-│    "CPUID instruction (always; see Section 25.2)"                   │
+│  Intel SDM Vol.3C, Section 26.1.2 明确规定:                         │
+│    "Instructions That Cause VM Exits Unconditionally":              │
+│    "The following instructions cause VM exits when they are         │
+│     executed in VMX non-root operation: CPUID, GETSEC, INVD,        │
+│     and XSETBV."                                                    │
+│    (旧版此处误写为 Section 25.1.2 + 一句不存在的引文，              │
+│     本仓 spec/intel-vmx.pdf = Vol.3C 326019-083US，25.1 是          │
+│     VMCS Overview，没有 25.1.2；那句 "CPUID instruction             │
+│     (always; see Section 25.2)" 在全文检索中不存在)                 │
 │                                                                      │
 │  在 VMX non-root 模式下:                                            │
 │    Guest 执行 CPUID → 无条件触发 VM-Exit                            │
@@ -100,11 +107,21 @@ CPUID Faulting 是一个独立于 VMX 的 CPU 特性，用于控制 CPUID 指令
 │                                                                      │
 │  第一步: 确认 CPU 支持                                              │
 │    读 MSR_PLATFORM_INFO (0xCE) bit 31                              │
-│    或 CPUID leaf 7, sub-leaf 0, ECX bit 3                         │
-│    = 1 表示支持                                                     │
+│      = MSR_PLATFORM_INFO_CPUID_FAULT                              │
+│      (arch/x86/include/asm/msr-index.h:96-98)                     │
+│    Linux 只用这条路径判定：arch/x86/kernel/cpu/intel.c:524-532     │
+│      init_cpuid_fault() → set_cpu_cap(X86_FEATURE_CPUID_FAULT)    │
+│    (旧版此处还写了"或 CPUID leaf 7 sub-leaf 0 ECX bit 3"——         │
+│     **待核实**：该位定义在 SDM Vol.2A 的 CPUID 指令页，本仓        │
+│     spec/ 只有 Vol.3C，无法核对；Linux 把该特性放在自定义          │
+│     scattered word 7（cpufeatures.h:193）而不是任何 CPUID 叶位，   │
+│     QEMU 10.1.0-rc2 cpu.h 也未定义对应位。不要当作已证事实引用)    │
 │                                                                      │
 │  第二步: 启用                                                       │
-│    写 MSR_MISC_FEATURES_ENABLES (0x161) bit 0 = 1                 │
+│    写 MSR_MISC_FEATURES_ENABLES (0x140) bit 0 = 1                 │
+│      (arch/x86/include/asm/msr-index.h:1040；bit0 =               │
+│       MSR_MISC_FEATURES_ENABLES_CPUID_FAULT @ :1042-1043)         │
+│    旧版误写为 0x161，已修正                                        │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 
@@ -144,18 +161,34 @@ CPUID Faulting 是一个独立于 VMX 的 CPU 特性，用于控制 CPUID 指令
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 
+┌─ 优先级判定的规范依据（不是推断）──────────────────────────────────┐
+│  SDM Vol.3C §26.1.1 明确：                                          │
+│    "When Section 26.1.2 or Section 26.1.3 identify an instruction  │
+│     execution that may lead to a VM exit, it is assumed that the   │
+│     instruction does not incur a fault that takes priority over a  │
+│     VM exit."  —— 即先有 #GP 这类优先异常时，CPUID 的无条件        │
+│     VM-Exit（§26.1.2）不发生。KVM 侧对应防御检查见                 │
+│     arch/x86/kvm/cpuid.c:1685-1686（kvm_emulate_cpuid 开头）：      │
+│       if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))   │
+│               return 1;   /* CPL>0 且已启用 → KVM 不代做 CPUID */   │
+└──────────────────────────────────────────────────────────────────────┘
+
 ┌─ 对比: 启用 vs 未启用 ─────────────────────────────────────────────┐
 │                                                                      │
 │  未启用 CPUID Faulting:                                            │
 │    Ring 3 CPUID → VM-Exit → KVM 返回虚拟化值 → VM-Entry          │
-│    每次开销: ~1-2 μs (VM-Exit/Entry 开销)                         │
+│    每次开销: 待实测（一次完整 VM-Exit/Entry 往返）                │
 │                                                                      │
 │  启用 CPUID Faulting:                                              │
 │    Ring 3 CPUID → #GP (无 VM-Exit!)                               │
 │    Guest #GP 处理程序捕获异常                                      │
-│    每次开销: ~0.1 μs (#GP 异常处理)                               │
+│    每次开销: 待实测（Guest 内部异常递送，不经宿主）               │
 │                                                                      │
-│  ★ 性能提升: 10-20 倍 ★                                         │
+│  ★ 方向性结论: 省掉一次 VM-Exit/Entry 往返 → 更快；              │
+│    具体倍数**待实测**，引用一律指向 ../phase10-performance/       │
+│    （AGENTS.md 性能单一来源）。旧版此处写的                        │
+│    "~1-2 μs / ~0.1 μs / 10-20 倍" 是无出处推算，已删除            │
+│    （与本章 corrections.md 勘误 1 同类，登记为待审计项）           │
 │                                                                      │
 │  注意: Ring 0 的 CPUID 不受影响, 总是 VM-Exit                     │
 │                                                                      │
@@ -471,84 +504,232 @@ KVM 特别处理的 CPUID 叶:
 
 ### 2.1 MSR Bitmap 机制
 
-MSR Bitmap 是 VMCS 中的一个 4KB 位图，控制 Guest 对 MSR 的读写是否触发 VM-Exit。
+VMCS 里存的是 **MSR-Bitmap Address**（64 位物理地址），指向一个 **4 KB 区域**，
+里面是 **4 张连续的、各 1 KByte（= 8192 bit）的位图**，逐位控制 Guest 对某个 MSR 的
+读/写是否触发 VM-Exit。
+
+> **勘误（2026-11-25 实测核查，见本章 corrections.md 勘误 3）**：本节旧版把每张位图
+> 写成 "1024 **bits**"、偏移写成 0x000/0x080/0x100/0x180，**尺寸与偏移都差了 8 倍**。
+> 关键换算：0x00000000–0x00001FFF 是 **8192 个 MSR**，每个 1 bit ⇒ 8192 bit = **1024 Byte**。
+> 旧版正是漏了这一步（把 8192 bit 当成了 1024 bit），才把偏移按 128 Byte 递增排出来。
 
 ```
-MSR Bitmap 布局 (4KB = 4096 bits):
+MSR Bitmap 区域布局 (4 张图 × 1 KB = 4096 Bytes = 32768 bits):
 
-偏移          大小       控制内容
-───────────  ────────   ─────────────────────────────────────────
-0x000        1024 bits  MSR 0x00000000 - 0x00001FFF 的读拦截
-                        bit=0 → 不拦截 (直接读物理MSR)
-                        bit=1 → 拦截 (VM-Exit → KVM处理)
+偏移(Byte)   大小            控制内容
+───────────  ─────────────   ─────────────────────────────────────────
+0x000        1024 B          读拦截 MSR 0x00000000 - 0x00001FFF
+   ~         (8192 bits)     bit=0 → 不拦截 (直接读物理MSR)
+0x3FF                          bit=1 → 拦截 (VM-Exit → KVM处理)
 
-0x080        1024 bits  MSR 0xC0000000 - 0xC0001FFF 的读拦截
-                        (系统MSR: EFER, STAR, LSTAR, ...)
+0x400        1024 B          读拦截 MSR 0xC0000000 - 0xC0001FFF
+   ~         (8192 bits)     (系统MSR: EFER, STAR, LSTAR, ...)
+0x7FF
 
-0x100        1024 bits  MSR 0x00000000 - 0x00001FFF 的写拦截
+0x800        1024 B          写拦截 MSR 0x00000000 - 0x00001FFF
+   ~         (8192 bits)
+0xBFF
 
-0x180        1024 bits  MSR 0xC0000000 - 0xC0001FFF 的写拦截
+0xC00        1024 B          写拦截 MSR 0xC0000000 - 0xC0001FFF
+   ~         (8192 bits)
+0xFFF
 
-超出范围的 MSR (0x2000-0xBFFFFFFF) 读写总是触发 VM-Exit!
+超出这两段范围的 MSR (0x2000-0xBFFFFFFF 与 0xC0002000 以上)
+读写总是触发 VM-Exit —— 位图根本覆盖不到，没有"不拦截"的选项!
 ```
+
+**源码引用**（KVM 自己的注释把上面四个区间写得很直白）:
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.h:464-486 */
+/*
+ * Note, early Intel manuals have the write-low and read-high bitmap offsets
+ * the wrong way round.  The bitmaps control MSRs 0x00000000-0x00001fff and
+ * 0xc0000000-0xc0001fff.  The former (low) uses bytes 0-0x3ff for reads and
+ * 0x800-0xbff for writes.  The latter (high) uses 0x400-0x7ff for reads and
+ * 0xc00-0xfff for writes.  MSRs not covered by either of the ranges always
+ * VM-Exit.
+ */
+#define __BUILD_VMX_MSR_BITMAP_HELPER(rtype, action, bitop, access, base)      \
+static inline rtype vmx_##action##_msr_bitmap_##access(unsigned long *bitmap,  \
+						       u32 msr)		       \
+{									       \
+	int f = sizeof(unsigned long);					       \
+									       \
+	if (msr <= 0x1fff)						       \
+		return bitop##_bit(msr, bitmap + base / f);		       \
+	else if ((msr >= 0xc0000000) && (msr <= 0xc0001fff))		       \
+		return bitop##_bit(msr & 0x1fff, bitmap + (base + 0x400) / f); \
+	return (rtype)true;						       \
+}
+#define BUILD_VMX_MSR_BITMAP_HELPERS(ret_type, action, bitop)		       \
+	__BUILD_VMX_MSR_BITMAP_HELPER(ret_type, action, bitop, read,  0x0)     \
+	__BUILD_VMX_MSR_BITMAP_HELPER(ret_type, action, bitop, write, 0x800)
+```
+
+注意 `bitmap` 是 `unsigned long *`（8 字节/项），所以"读基址 0x0 / 写基址 0x800 /
+高位再加 0x400"都是以**字节**为单位，`/ f` 才换算成 u64 下标；`msr <= 0x1fff` 直接用
+MSR 号当位下标，正说明低位区间是 8192 位。
+
+**规范引用**: intel-vmx.pdf (Vol.3C, 326019-083US), Section 25.6.9 "MSR-Bitmap Address"
+——"the 64-bit physical address of four contiguous MSR bitmaps, which are **each 1-KByte
+in size**"，并逐个写明 "Read bitmap for low MSRs (located at the MSR-bitmap address) …
+one bit for each MSR address in the range 00000000H to 00001FFFH"、"Read bitmap for high
+MSRs (located at the MSR-bitmap address **plus 1024**)"、"Write bitmap for low MSRs (…**plus
+2048**)"、"Write bitmap for high MSRs (…**plus 3072**)"。
+
+**交叉印证**（x2APIC 动态改写用的下标，只有 1 KB/张这套布局能自洽）:
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:4074-4080 */
+	/*
+	 * x2APIC indices for 64-bit accesses into the RDMSR and WRMSR halves
+	 * of the MSR bitmap.  KVM emulates APIC registers up through 0x3f0,
+	 * i.e. MSR 0x83f, and so only needs to dynamically manipulate 64 bits.
+	 */
+	const int read_idx = APIC_BASE_MSR / BITS_PER_LONG_LONG;
+	const int write_idx = read_idx + (0x800 / sizeof(u64));
+```
+
+`APIC_BASE_MSR = 0x800` ⇒ `read_idx = 0x800/64 = 32`（字节偏移 32×8 = **0x100**，落在读低位
+图内），`write_idx = 32 + 0x800/8 = 288`（字节偏移 288×8 = **0x900** = 0x800 + 0x100，落在写低
+位图内）。若按旧版"每张 1024 bit、写图在 0x100"的布局，MSR 0x800 的写位不可能出现在 0x900。
 
 ### 2.2 MSR 分类与处理策略
 
 ```
-┌─ 直接透传 (不拦截, 高性能) ──────────────────────────────────────┐
-│  MSR                     原因                                     │
-│  ──────────────────────  ─────────────────────────────────────── │
-│  IA32_SPEC_CTRL          安全相关 (Spectre缓解), 每个vCPU独立值   │
-│  IA32_TSC                RDTSC 不经过MSR, 但写TSC需要            │
-│  IA32_PRED_CMD           安全相关                                  │
-│  x2APIC MSRs (0x800+)    APICv启用时部分透传                      │
+┌─ 直接透传 (MSR Bitmap 位 = 0，无 VM-Exit) ───────────────────────┐
+│  KVM 6.12.93 里"可透传"的候选集是唯一写死的：                     │
+│    vmx_possible_passthrough_msrs[]  arch/x86/kvm/vmx/vmx.c:167-190
+│      （注释 167-170，数组本体 171-190） │
+│      SPEC_CTRL, PRED_CMD, FLUSH_CMD, IA32_TSC,                     │
+│      FS_BASE, GS_BASE, KERNEL_GS_BASE, XFD, XFD_ERR,              │
+│      SYSENTER_CS/ESP/EIP, CORE_C{1,3,6,7}_RES  (+ x2APIC/PT/LBR   │
+│      另走专用代码，见数组上方注释 vmx.c:167-170)              │
 │                                                                   │
-│  实现: MSR Bitmap 对应位 = 0                                     │
-│  性能: 无 VM-Exit, 接近原生速度                                  │
+│  vCPU 创建时真正"打开"的位 (arch/x86/kvm/vmx/vmx.c:7575-7589)：   │
+│    MSR_IA32_TSC            **只放开读** (写仍拦截，KVM 要管        │
+│                            TSC offset/scaling) —— RDTSC 本身        │
+│                            不读这个 MSR，走 RDTSC exiting 控制位    │
+│    MSR_FS_BASE / GS_BASE / KERNEL_GS_BASE   RW 透传               │
+│    MSR_IA32_SYSENTER_CS/ESP/EIP             RW 透传               │
+│    MSR_CORE_C*_RES         读透传 (仅 cstate_in_guest)            │
+│  注: 整张 4KB 位图分配时就 memset 成 0xff(全拦截)，上面那些是      │
+│      再打洞 —— alloc_loaded_vmcs(), arch/x86/kvm/vmx/vmx.c:2963；  │
+│      vmx.c:7571-7573 填的是 KVM 自己记账用的 shadow_msr_intercept。│
+│  注: SPEC_CTRL/PRED_CMD/FLUSH_CMD 虽在候选集里，但默认仍由         │
+│      KVM 掌控(uret + 手写 MSR)，不是"默认透传"。                  │
 └──────────────────────────────────────────────────────────────────┘
 
-┌─ 完全拦截 (每次读写都 VM-Exit) ─────────────────────────────────┐
-│  MSR                     原因                                     │
-│  ──────────────────────  ─────────────────────────────────────── │
-│  IA32_EFER               控制长模式/NXE, Guest修改需要KVM处理   │
-│  IA32_STAR/LSTAR/CSTAR   SYSCALL目标地址, Guest需要自己的值     │
-│  IA32_KERNEL_GS_BASE     KERNEL GS base, Guest需要自己的值      │
-│  IA32_PAT                Page Attribute Table                    │
-│  IA32_TSC_AUX            TSC辅助, RDTSCP使用                     │
-│  IA32_PERF_*             性能计数器                              │
+┌─ 拦截 (读写都 VM-Exit) ─────────────────────────────────────────┐
+│  IA32_EFER               控制长模式/NXE                            │
+│  IA32_STAR/LSTAR/CSTAR/SFMASK  SYSCALL 目标地址                   │
+│  IA32_TSC_AUX            RDTSCP 辅助                              │
+│  IA32_PAT                Page Attribute Table                     │
+│  IA32_PERF_*             性能计数器                               │
+│  0xC0002xxx 以上等未建模 MSR                                      │
 │                                                                   │
-│  实现: MSR Bitmap 对应位 = 1                                     │
-│  处理: vmx_get_msr() / vmx_set_msr() [vmx.c]                   │
-│        → kvm_get_msr_common() / kvm_set_msr_common() [x86.c]    │
-│  性能: 每次 VM-Exit, 开销大                                      │
+│  ★ 纠正旧表述: 原文把 IA32_KERNEL_GS_BASE 列在这里，实际它是       │
+│    **RW 透传**(见上表, vmx.c:7579)。                              │
+│  处理: kvm_emulate_rdmsr/wrmsr (vmx.c:6104-6105)                  │
+│        → vmx_get_msr()/vmx_set_msr() → kvm_get/set_msr_common()   │
+│  未命中且开启用户态 MSR 过滤时走 KVM_EXIT_X86_RDMSR/WRMSR         │
+│        (kvm_msr_user_space, arch/x86/kvm/x86.c:2032)，否则 #GP。   │
 └──────────────────────────────────────────────────────────────────┘
 
-┌─ 自动切换 (VM-Entry加载Guest值, VM-Exit恢复Host值) ────────────┐
-│  MSR                     原因                                     │
-│  ──────────────────────  ─────────────────────────────────────── │
-│  IA32_SYSENTER_CS/ESP/EIP  SYSENTER/SYSEXIT 相关                │
-│  IA32_STAR/LSTAR/CSTAR     如果用自动加载, 就不需要拦截         │
-│  IA32_KERNEL_GS_BASE       同上                                  │
+┌─ 硬件自动切换：分两条完全不同的机制 ────────────────────────────┐
+│  (A) 专用 VMCS 状态字段 / load 控制位（L1 走这条，不是 MSR 列表）  │
+│      SYSENTER_CS/ESP/EIP: 本就是 guest-state 字段，entry 加载、    │
+│        exit 保存 ⇒ 所以才敢把 MSR Bitmap 位放开 (vmx.c:7581-7583)  │
+│      EFER / PAT / PERF_GLOBAL_CTRL: 有专用控制位                   │
+│        VM_ENTRY_LOAD_IA32_EFER / VM_ENTRY_LOAD_IA32_PAT /          │
+│        VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL                         │
+│        (KVM_OPTIONAL_VMX_VM_ENTRY_CONTROLS, arch/x86/kvm/vmx/vmx.h)│
+│      STAR/LSTAR/CSTAR/SFMASK/EFER/TSC_AUX/TSX_CTRL 注册为          │
+│        **user-return MSR**，值直接写进硬件、退出路径由内核还原：   │
+│        arch/x86/kvm/vmx/vmx.c:8366-8372                            │
+│        const u32 vmx_uret_msrs_list[] = { MSR_SYSCALL_MASK,        │
+│            MSR_LSTAR, MSR_CSTAR, MSR_EFER, MSR_TSC_AUX, MSR_STAR,  │
+│            MSR_IA32_TSX_CTRL };                                     │
 │                                                                   │
-│  实现: VMCS Guest/Host MSR load/store lists                      │
-│  优点: 无VM-Exit开销, 硬件自动切换                              │
-│  限制: 列表最多8个MSR (MAX_NR_LOADSTORE_MSRS=8)                │
+│  (B) VM-entry / VM-exit MSR load/store lists                       │
+│      KVM 的实现里这套只服务**嵌套虚拟化**(给 vmcs02 装 L2 的       │
+│      MSR_AUT_LOAD/SAVE 表)：                                       │
+│        vmcs_write64(VM_EXIT_MSR_LOAD_ADDR,                         │
+│                     __pa(vmx->msr_autoload.host.val));  nested.c:2309 │
+│        vmcs_write64(VM_ENTRY_MSR_LOAD_ADDR,                        │
+│                     __pa(vmx->msr_autoload.guest.val)); nested.c:2310 │
+│        计数写入 nested.c:2621-2622 / 3255-3258                     │
+│      容量: KVM 数组上限 MAX_NR_LOADSTORE_MSRS = 8                  │
+│        (arch/x86/kvm/vmx/vmx.h:28)。硬件实际上限由                 │
+│        IA32_VMX_MISC 的能力位枚举(规范附录 A.6，本仓 spec/ 只有    │
+│        Vol.3C，**待核实**具体值)；两者不要混谈。                   │
+│  ★ 纠正旧表述: 原文说 SYSENTER_*/STAR/LSTAR/CSTAR/KERNEL_GS_BASE   │
+│    的实现是 "VMCS Guest/Host MSR load/store lists" —— 这四类各有各  │
+│    的机制(A)，load/store lists 在 KVM 里基本不用于 L1(B)。        │
 └──────────────────────────────────────────────────────────────────┘
+```
 
-┌─ 特殊: x2APIC MSR 透传 (APICv优化) ───────────────────────────┐
-│  MSR 范围: 0x800 - 0x8FF (x2APIC 寄存器)                      │
+```
+┌─ 特殊: x2APIC MSR 拦截位是动态算出来的 ──────────────────────────┐
+│  KVM 实际改写的范围: 0x800 - 0x83F                                │
+│    (KVM 只模拟到 APIC 寄存器 0x3f0；0x840 以上是 AMD              │
+│     uber-extended，KVM 不支持，一直保持拦截 —— vmx.c:4104-4105)   │
 │                                                                   │
-│  APICv 启用时:                                                   │
-│    部分x2APIC MSR (ICR除外) 透传给Guest                         │
-│    通过 VIRTUAL_APIC_PAGE 硬件直接处理                          │
-│    MSR Bitmap 对应位 = 0 (不拦截)                               │
+│  前提位: "virtualize x2APIC mode" (Secondary Exec bit 4) 决定      │
+│    MSR_BITMAP_MODE_X2APIC；再叠加 enable_apicv &&                  │
+│    kvm_vcpu_apicv_active() 才置 MSR_BITMAP_MODE_X2APIC_APICV       │
+│    (vmx.c:4088-4096)                                              │
 │                                                                   │
-│  ICR (中断命令寄存器) 例外:                                      │
-│    写 ICR 必须拦截 → KVM 模拟 IPI 投递                          │
-│    MSR Bitmap 对应位 = 1                                         │
+│  默认策略 (vmx.c:4110-4114):                                      │
+│    读: x2APIC+APICV 时  ~kvm_lapic_readable_reg_mask() →           │
+│        **除 TMCCT 外全部可读寄存器透传**                           │
+│        非 APICV 时      ~0ull → 全拦截                            │
+│    写: 恒 ~0ull → **先全拦截，再按需打洞**                        │
 │                                                                   │
-│  实现: vmx_update_msr_bitmap_x2apic() [vmx.c]                  │
+│  打洞顺序 (vmx.c:4120-4129):                                      │
+│    TPR  : RW 透传只需 "virtualize x2APIC mode"，不需要 APICv       │
+│    TMCCT: 显式恢复拦截 (KVM 要按需模拟当前计数)                    │
+│    EOI      (仅写) → 透传，硬件做 virtual EOI                      │
+│    SELF_IPI (仅写) → 透传                                          │
+│    ICR      (RW)   → **只在 enable_ipiv 时才透传**                 │
+│                                                                   │
+│  ★ 纠正旧表述: 原文写 "APICv 启用时部分 x2APIC MSR (ICR 除外)      │
+│    透传 / 写 ICR 必须拦截"。方向性两处不准：                       │
+│      (a) **写侧默认全拦截**，透传的只有 EOI/SELF_IPI(+IPiv 的 ICR) │
+│          与 TPR，不是"大部分写都透传、ICR 例外"；                  │
+│      (b) ICR 并非"必须拦截" —— IPIV 打开时 ICR 的读写都透传，       │
+│          本仓宿主 enable_ipiv=N 才停在拦截那一支。                 │
+│    另: "通过 VIRTUAL_APIC_PAGE 硬件直接处理" 说的是 APIC-access     │
+│    page 那条 **MMIO** 路径；x2APIC 走的是 MSR 接口 +                │
+│    "virtualize x2APIC mode"/虚拟寄存器虚拟化，两者不要混为一谈。    │
+│                                                                   │
+│  实现: vmx_update_msr_bitmap_x2apic()  arch/x86/kvm/vmx/vmx.c:4072 │
 └──────────────────────────────────────────────────────────────────┘
+```
+
+```c
+/* 来源: arch/x86/kvm/vmx/vmx.c:4110-4129 */
+	if (mode & MSR_BITMAP_MODE_X2APIC_APICV)
+		msr_bitmap[read_idx] = ~kvm_lapic_readable_reg_mask(vcpu->arch.apic);
+	else
+		msr_bitmap[read_idx] = ~0ull;
+	msr_bitmap[write_idx] = ~0ull;
+
+	/*
+	 * TPR reads and writes can be virtualized even if virtual interrupt
+	 * delivery is not in use.
+	 */
+	vmx_set_intercept_for_msr(vcpu, X2APIC_MSR(APIC_TASKPRI), MSR_TYPE_RW,
+				  !(mode & MSR_BITMAP_MODE_X2APIC));
+
+	if (mode & MSR_BITMAP_MODE_X2APIC_APICV) {
+		vmx_enable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_TMCCT), MSR_TYPE_RW);
+		vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_EOI), MSR_TYPE_W);
+		vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_SELF_IPI), MSR_TYPE_W);
+		if (enable_ipiv)
+			vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_ICR), MSR_TYPE_RW);
+	}
 ```
 
 ### 2.2.1 讨论：哪些 MSR 真的需要拦截？

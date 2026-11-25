@@ -125,7 +125,18 @@
   ├── 用户态 → 内核态 (ioctl再次调用)
   └── 内核态 → Guest (VMENTER)
 
-总开销: 4次模式切换! (仅慢速路径：MMIO/CPUID等)
+慢速路径要过 2 次 user↔kernel 边界（内核↔用户往返各 1 次），
+快速路径这 2 次完全不发生 —— 这是**切换次数的差别**，不是开销比例。
+具体省多少时间**待实测**（VM-Exit 往返微基准见 ../phase10-performance/index.md，B 级），
+本文不复制数字。旧版此处写的 "总开销: 4次模式切换!" 与 "(减少50%)"
+是无出处推算，已删除（登记本章 corrections.md 勘误 5）。
+
+（顺带纠正：旧版把 CPUID 也列为"MMIO/CPUID 等慢速路径"的例子。
+CPUID 恒在内核闭环 —— `[EXIT_REASON_CPUID] = kvm_emulate_cpuid`，
+`arch/x86/kvm/vmx/vmx.c:6103`；`kvm_emulate_cpuid()`
+`arch/x86/kvm/cpuid.c:1681` 直接查 `KVM_SET_CPUID2` 灌进来的表并返回 1 重入。
+真正会回用户空间的是 IO（无内核态设备时）、未映射 GPA 上的 MMIO、
+TRIPLE_FAULT、以及启用用户态 MSR 过滤后的未建模 MSR。）
 ```
 
 ```
@@ -155,9 +166,12 @@
 │                │  - EPT_VIOLATION                    │     │
 │                │                                     │     │
 │                │  慢速路径 (返回用户态):              │     │
-│                │  - IO_INSTRUCTION                   │     │
-│                │  - CPUID                            │     │
-│                │  - MMIO                             │     │
+│                │  - IO_INSTRUCTION(无内核态设备)   │     │
+│                │  - EPT_VIOLATION→未映射GPA=MMIO   │     │
+│                │  - TRIPLE_FAULT / FAIL_ENTRY      │     │
+│                │  - 未建模MSR(需用户态MSR过滤)    │     │
+│                │  ★ CPUID 不在这里! 恒内核闭环     │     │
+│                │    kvm_emulate_cpuid, 见 §2.1 注  │     │
 │                └──────────────┬──────────────────────┘     │
 │                               │                             │
 │                if (快速路径) {                              │
@@ -172,11 +186,12 @@
 └───────────────────────────────────────────────────────────────┘
 
 快速路径VM-Exit:
-  ├── VM-Exit → 内核态
+  ├── VM-Exit → 内核态(root)
   ├── 内核态处理
   └── 内核态 → Guest (VMENTER)
 
-总开销: 2次模式切换! (减少50%)
+只有 root↔non-root 切换，没有 user↔kernel 往返
+（次数对比见上面那段，倍数待实测）
 ```
 
 ### 2.2 中断注入对比
@@ -542,7 +557,7 @@
 │  Guest执行HLT指令                                          │
 │    │                                                        │
 │    ▼                                                        │
-│  VM-Exit → handle_hlt()                                   │
+│  VM-Exit → kvm_emulate_halt()  (vmx.c:6107)           │
 │    │                                                        │
 │    ▼                                                        │
 │  设置mp_state = KVM_MP_STATE_HALTED                       │
@@ -558,9 +573,9 @@
 │    │   │   └→ 有中断? → 立即返回 (0次系统调用!)           │
 │    │   └→ cpu_relax() 短暂等待                             │
 │    │                                                        │
-│    └── 超过halt_poll_ns (默认400μs)                        │
+│    └── 超过halt_poll_ns (x86 默认200μs)                 │
 │        └→ kvm_vcpu_block() (内核态阻塞)                    │
-│           └→ wait_event_interruptible()                     │
+│           └→ rcuwait + schedule()  (kvm_main.c:3733)      │
 │              └→ 阻塞直到中断到达                            │
 │                                                            │
 │  优势:                                                     │
@@ -570,6 +585,61 @@
 │                                                            │
 └────────────────────────────────────────────────────────────┘
 ```
+
+> **本节三处修正（2026-11-25 核查，登记本章 corrections.md 勘误 5）**
+>
+> 1. **`halt_poll_ns` 默认是 200 μs，不是 400 μs**。
+>    `virt/kvm/kvm_main.c:78-79` `unsigned int halt_poll_ns = KVM_HALT_POLL_NS_DEFAULT;
+>    module_param(halt_poll_ns, uint, 0644);`，
+>    x86 侧 `arch/x86/include/asm/kvm_host.h:71` `#define KVM_HALT_POLL_NS_DEFAULT 200000`。
+>    宿主实测一致：`cat /sys/module/kvm/parameters/halt_poll_ns` → `200000`。
+>    （旧文档在多处写过 400000/400μs；`phase10-performance/parameters.md:82-83` 已声明
+>    "全仓 10 处已修正"，本节是当时漏掉的一处。参数默认值/权限的**唯一来源**是
+>    `../phase10-performance/parameters.md`，本节只讲机制。）
+> 2. **HLT 的 handler 是 `kvm_emulate_halt()`，不叫 `handle_hlt()`**。
+>    `[EXIT_REASON_HLT] = kvm_emulate_halt`（`arch/x86/kvm/vmx/vmx.c:6107`）→
+>    `kvm_emulate_halt()`（`arch/x86/kvm/x86.c:11421`）→
+>    `__kvm_emulate_halt()`（`x86.c:11393-11413`）里
+>    `vcpu->arch.mp_state = KVM_MP_STATE_HALTED` 并 `return 1`（内核 LAPIC 在位时）。
+>    只有 `!lapic_in_kernel()`（如 `-kernel-irqchip=off` 且用户态 LAPIC）才填
+>    `KVM_EXIT_HLT` 回用户态。
+> 3. **阻塞原语是 `rcuwait` + 手写 `schedule()` 循环，不是 `wait_event_interruptible()`**。
+>
+>    ```c
+>    /* 来源: virt/kvm/kvm_main.c:3733-3758 */
+>    bool kvm_vcpu_block(struct kvm_vcpu *vcpu)
+>    {
+>    	struct rcuwait *wait = kvm_arch_vcpu_get_wait(vcpu);
+>    	bool waited = false;
+>
+>    	vcpu->stat.generic.blocking = 1;
+>
+>    	preempt_disable();
+>    	kvm_arch_vcpu_blocking(vcpu);
+>    	prepare_to_rcuwait(wait);
+>    	preempt_enable();
+>
+>    	for (;;) {
+>    		set_current_state(TASK_INTERRUPTIBLE);
+>
+>    		if (kvm_vcpu_check_block(vcpu) < 0)
+>    			break;
+>
+>    		waited = true;
+>    		schedule();
+>    	}
+>
+>    	preempt_disable();
+>    	finish_rcuwait(wait);
+>    	kvm_arch_vcpu_unblocking(vcpu);
+>    	preempt_enable();
+>    	...
+>    ```
+>
+>    "有事件没有"的判据全在 `kvm_vcpu_check_block()`（`kvm_main.c:3708-3726`）：
+>    `kvm_arch_vcpu_runnable()` / `kvm_cpu_has_pending_timer()` / `signal_pending()` /
+>    `KVM_REQ_UNBLOCK`。本图旧版写 `wait_event_interruptible()` 与本章
+>    annotations.md §9 的 rcuwait 说明自相矛盾（后者才是对的），已统一。
 
 ### 5.2 中断注入优化
 
@@ -698,11 +768,11 @@ KVM内核态负责:
 ├── 内存虚拟化 (EPT页表/页错误处理)
 ├── 中断虚拟化 (中断注入/Posted Interrupts)
 ├── 时钟虚拟化 (TSC/kvmclock/APIC Timer)
-└→ 快速路径VM-Exit处理 (HLT/外部中断/EPT Violation)
+└→ 快速路径VM-Exit处理 (HLT/外部中断/EPT Violation/CPUID/MSR)
 
 QEMU用户态负责:
 ├── 复杂设备模拟 (VGA/USB/声卡)
-├── 慢速路径VM-Exit处理 (MMIO/CPUID/IO)
+├── 慢速路径VM-Exit处理 (MMIO/IO；★ CPUID 不在此列)
 ├── 虚拟机管理 (配置/启动/停止)
 └→ 用户接口 (QMP/Monitor)
 ```

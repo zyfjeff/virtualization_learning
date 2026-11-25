@@ -50,7 +50,7 @@ if [ -n "$REMAPPED_SECTION" ]; then
 
     # ★ `|| true` 而不是 `|| echo "0"`：grep -c 计数为 0 时**照样打印 0**、只是退出码为 1，
     #   再 echo 一个 0 会让变量捕到两行 "0\n0"，下面的输出会多出一行裸 `0`。
-    #   出处：../../phase9-performance/corrections.md D13。
+    #   出处：../../phase10-performance/corrections.md D13。
     REMAPPED_COUNT=$(echo "$REMAPPED_SECTION" | grep -c "^ *[0-9]" 2>/dev/null || true)
     echo "  Remapped 模式 IRTE 数量: $REMAPPED_COUNT"
 else
@@ -106,7 +106,8 @@ if [ -n "$DEVICE_IRTES" ]; then
     echo "    Entry   = IRTE 索引 (Handle)"
     echo "    SrcID   = 设备 BDF (Bus:Device.Function)"
     echo "    PDA     = PI Descriptor 物理地址 (Posted 模式)"
-    echo "    Vct     = 通知向量 (通常为 0xf7)"
+    echo "    Vct     = IRTE 的 VV (Virtual Vector) = guest 向量（写进 PIR 的位；"
+    echo "              通知向量 NV=0xf2 在 PI Descriptor 里，不在这一列。AGENTS #2/#18）"
 else
     echo "  未找到设备的 IRTE"
     echo "  （设备可能未启用 MSI/MSI-X，或中断未使用 IR）"
@@ -122,12 +123,12 @@ echo ""
 echo "  请观察上面的 IRTE 表，回答以下问题:"
 echo ""
 echo "  Q1: 有多少个 Remapped 模式的 IRTE？有多少个 Posted 模式的？"
-echo "  Q2: Posted 模式 IRTE 的 Vct 字段是什么值？(提示: 通常是 0xf7)"
+echo "  Q2: Posted 模式 IRTE 的 Vct 字段是什么值？(提示: 它应是 guest 在 MSI-X 表里写的向量)"
 echo "  Q3: PDA_high 和 PDA_low 组合起来是什么地址？"
 echo "  Q4: 同一个设备 (相同 SrcID) 有多少个 IRTE？为什么？"
 echo ""
 echo "  提示: 每个 MSI-X 向量对应一个 IRTE"
-echo "  提示: Posted 模式的 Vct 是通知向量 (POSTED_INTR_VECTOR = 0xf7)"
+echo "  提示: Posted 模式 Vct 列是 VV（guest 向量），不是通知向量（NV=0xf2 在 PI Descriptor）"
 echo "  提示: PDA = (PDA_high << 32) | (PDA_low << 6)，因为 PI Descriptor 64 字节对齐"
 
 echo ""

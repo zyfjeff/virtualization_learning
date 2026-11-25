@@ -18,7 +18,7 @@
 | ex1 | VMX capability MSR 编码 + 依赖链（annotations §5，SDM App A） | 7 MSR 解出 allowed-0/1；VMX_BASIC bit55=1 ⟺ true-CTLS MSR 0x48D 存在 | 程序结尾自动对照 bit55 vs 0x48D 可读性（PASS/FAIL） | 宿主 |
 | ex2 | MSR Bitmap 逐 MSR 拦截（cpu-virt §2） | 透传 MSR 无 kvm_msr trace，拦截的有 | ftrace kvm_msr 对照 bitmap 配置 | 宿主+Guest |
 | ex3 | VM-Exit 快/慢路径分发（annotations §3） | CPU/IO/内存负载的 exit reason 分布不同 | perf kvm stat 分布对照负载类型 | 宿主 |
-| ex4 | CPUID 无条件 exit（cpu-virt §1，SDM 25.1.2） | Guest 每次 CPUID 必产生 kvm_cpuid trace | trace 计数 vs Guest CPUID 次数 | Guest+宿主 |
+| ex4 | CPUID 无条件 exit（cpu-virt §1，SDM 26.1.2） | Guest 每次 CPUID 必产生 kvm_cpuid trace | trace 计数 vs Guest CPUID 次数 | Guest+宿主 |
 | ex5 | halt-polling 自适应（phase0 §7） | 四档 poll 参数改变 halt 延迟/CPU 占用 | perf sched + 四档对照 | 宿主 |
 
 **链式衔接**：ex1 硬件能力 → ex2 MSR 拦截粒度 → ex3 exit 分发 → ex4 CPUID 必 exit → ex5 调度权衡。

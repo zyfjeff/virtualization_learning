@@ -67,18 +67,29 @@ cd /mnt/shared
 
 #### 1.2 对照源码解码 SPTE
 
-读 `arch/x86/kvm/mmu/spte.h:18-91`，理解每个位的含义：
+读 `arch/x86/kvm/mmu/spte.h:18-91`（软件位）+ `arch/x86/kvm/mmu.h:15-17`（`PT_*_MASK`），
+理解每个位的含义：
 
 ```c
-/* 来源: arch/x86/kvm/mmu/spte.h */
-#define PT_PRESENT_MASK         (1ULL << 0)     /* 存在位 */
-#define PT_WRITABLE_MASK        (1ULL << 1)     /* 可写位 */
-#define PT_USER_MASK            (1ULL << 2)     /* 用户态位 */
-#define SPTE_BASE_ADDR_MASK     /* bits 51:12，物理地址 */
+/* 来源: arch/x86/kvm/mmu.h:15-17 —— 注意这三个不在 spte.h 里 */
+#define PT_PRESENT_MASK (1ULL << 0)
+#define PT_WRITABLE_MASK (1ULL << PT_WRITABLE_SHIFT)   /* = 1 */
+#define PT_USER_MASK    (1ULL << PT_USER_SHIFT)        /* = 2 */
+```
 
-// 软件位（KVM 元数据）
-#define EPT_SPTE_HOST_WRITABLE  (1ULL << 57)    /* 宿主认为可写 */
-#define EPT_SPTE_MMU_WRITABLE   (1ULL << 58)    /* KVM MMU 认为可写 */
+```c
+/* 来源: arch/x86/kvm/mmu/spte.h:39-43 */
+#ifdef CONFIG_DYNAMIC_PHYSICAL_MASK
+#define SPTE_BASE_ADDR_MASK (physical_mask & ~(u64)(PAGE_SIZE-1))
+#else
+#define SPTE_BASE_ADDR_MASK (((1ULL << 52) - 1) & ~(u64)(PAGE_SIZE-1))
+#endif
+```
+
+```c
+/* 来源: arch/x86/kvm/mmu/spte.h:90-91 —— EPT 模式的软件可写位在高位 */
+#define EPT_SPTE_HOST_WRITABLE		BIT_ULL(57)
+#define EPT_SPTE_MMU_WRITABLE		BIT_ULL(58)
 ```
 
 #### 1.3 用 GDB 查看实际 SPTE
@@ -92,28 +103,49 @@ sudo gdb -p $(pgrep qemu-system)
 # 查看 EPT 根页面
 (gdb) p/x *(u64*)$rsp  # 根据上下文找到 SPTE 指针
 
-# 解码 SPTE 值
-# bit 0: Present
-# bit 1: Writable
-# bit 2: User
-# bit 3-5: Memory Type (6=WB, 0=UC)
-# bit 6: IPAT
-# bits 12-51: Physical Address
-# bit 57: Host Writable (软件位)
-# bit 58: MMU Writable (软件位)
+# 解码 SPTE 值（EPT 叶条目视角；注意 bit 2 是 Execute，不是 User！）
+# bit 0:     Read
+# bit 1:     Write
+# bit 2:     Execute（supervisor）—— legacy 页表里这一位才是 User
+# bit 5:3    Memory Type（0=UC, 1=WC, 4=WT, 5=WP, 6=WB；其余保留）
+# bit 6:     IPAT（Ignore PAT）
+# bit 7:     Ignored（SDM Table 29-7；4K 叶条目没有 PS 位）
+# bit 8:     Accessed   （仅当 EPTP bit6 = 1）
+# bit 9:     Dirty      （仅当 EPTP bit6 = 1）
+# bit 10:    Execute for user-mode（仅当 mode-based execute control = 1）
+# bit 51:12  物理地址
+# bit 53:52  A/D 类型（软件位，00/01/10）
+# bit 55:54  access-tracking 保存的 R/X（软件位）
+# bit 57:    Host Writable（软件位）
+# bit 58:    MMU Writable （软件位）
+# bit 63:    Suppress #VE（KVM 把它并入 shadow_present_mask，spte.c:439-440）
 ```
 
 ### 思考题
 
 1. **为什么 EPT 模式的软件位在高比特（57/58），而非低比特（9/10）？**
-   - EPT 低位几乎被硬件位占满：bit 0/1/2 (R/W/X)、bit 3:5 (Memory Type)、bit 6 (IPAT)、bit 7 (Ignore PAT)、bit 8/9 (A/D)
-   - 对照 `spte.h:54-56` 的注释
+   - EPT 低位几乎被硬件位占满：bit 0/1/2 (R/W/X)、bit 5:3 (Memory Type)、
+     bit 6 (IPAT)、bit 8/9 (A/D)、bit 10 (user-mode execute，MBEC 开启时)。
+     **bit 7 在 4K 叶条目里是 "Ignored"**（不是"第二个 IPAT"——旧稿这里写重了；
+     只有大页条目里 bit 7 才是 PS=1），可用 ignore 位太少，所以 KVM 把软件位挪到高位。
+   - 对照 `spte.h:85-91` 的注释原文：*"Low ignored bits are at a premium for EPT,
+     use high ignored bits, taking care to not overlap the A/D type mask or the saved
+     access bits of access-tracked SPTEs when A/D bits are disabled."*
+     非 EPT（legacy）路径才用低位：`DEFAULT_SPTE_HOST_WRITABLE = BIT_ULL(9)`、
+     `DEFAULT_SPTE_MMU_WRITABLE = BIT_ULL(10)`（`spte.h:81-83`，注释
+     "Bits 9 and 10 are ignored by all non-EPT PTEs"）。
+   - **规范引用**: `intel-vmx.pdf` Vol 3C, Table 29-7 (Format of an EPT Page-Table
+     Entry that Maps a 4-KByte Page)
 
 2. **`SPTE_TDP_AD_MASK` 的三种取值分别对应什么场景？**
-   - `AD_ENABLED` (0): 默认，硬件 A/D 位启用
-   - `AD_DISABLED` (1): 硬件不支持 A/D，或嵌套虚拟化 L2 使用 PML
-   - `AD_WRPROT_ONLY` (2): 仅写保护跟踪
-   - 对照 `spte.h:33-36`
+   - `AD_ENABLED` (0)：默认，硬件维护 A/D
+   - `AD_DISABLED` (1)：`role.ad_disabled = !kvm_ad_enabled()`，即 CPU 无 EPT A/D 能力
+     或 `kvm_intel.eptad=0`。**与 PML 无关**——PML 反过来要求 A/D 可用
+     （`vmx.c:8525-8529`）
+   - `AD_WRPROT_ONLY` (2)：`cpu_dirty_log_size && role.guest_mode`，即
+     **PML + L2（嵌套）**；不是快照/COW/迁移
+   - 对照 `spte.h:32-37`（定义）与 `mmu_internal.h:148-159`（判据）
+   - ⚠️ 这三个值住在 **bits 53:52**，不在 bit 9/8 —— 见本仓 `corrections.md` 勘误 4
 
 3. **`shadow_present_mask` 是常量还是变量？**
    - 运行时初始化，EPT 和 shadow paging 取不同值
@@ -121,19 +153,40 @@ sudo gdb -p $(pgrep qemu-system)
 
 ### 输出示例
 
-```
-SPTE 解码: 0x8000000123456067
+> **勘误**：旧稿这里给的样例是 `0x8000000123456067`，并声称
+> "MemType=6(WB)、IPAT=0、bit57=1、bit58=1"。**该十六进制按位拆开其实完全不同**
+> （bits 5:3 = 4 = WT、bit 6 IPAT = 1、bit 57/58 都是 0），数字与解读互相矛盾。
+> 下面换成一个自洽的样例，每一位都能反算。
 
-位布局:
-  bit 0 (Present):     1  ← 页存在
-  bit 1 (Writable):    1  ← 可写
-  bit 2 (User):        1  ← 用户态可访问
-  bit 3-5 (MemType):   110 (6) = WB
-  bit 6 (IPAT):        0  ← 使用 PAT
-  bit 7 (Ignore PAT):  0
-  bits 12-51 (PAddr):  0x123456  ← 物理页帧号
-  bit 57 (Host Writable): 1  ← KVM 软件位
-  bit 58 (MMU Writable):  1  ← KVM 软件位
+```
+SPTE 解码: 0x8600000123456373
+
+反算（每一行都可用 (val >> n) & mask 验证）:
+  bit 0   (R):            1  ← 可读
+  bit 1   (W):            1  ← 可写
+  bit 2   (X):            0  ← 不可执行（EPT 的这一位是 Execute，不是 User）
+  bits 5:3(MT):         110 (6) = WB
+  bit 6   (IPAT):         1  ← 忽略 Guest PAT，强制用这里的 MT
+  bit 7               :   0  ← 4K 叶条目里是 Ignored 位
+  bit 8   (A):            1  ← 已被访问（EPTP bit6=1 时硬件维护）
+  bit 9   (D):            1
+  bits 51:12 (PAddr): 0x123456000  ← 物理地址，PFN = 0x123456
+  bits 53:52 (AD type):  00 = SPTE_TDP_AD_ENABLED   ← 软件位，不是 bit 9/8
+  bits 55:54          :  00 （未做 access tracking）
+  bit 57 (HostWritable):  1  ← KVM 软件位（EPT 模式用高位）
+  bit 58 (MMUWritable) :  1  ← KVM 软件位
+  bit 63 (SUPPRESS_VE):   1  ← KVM 恒定并入 shadow_present_mask
+                             （spte.c:439-440：
+                              shadow_present_mask = (has_exec_only ? 0 : VMX_EPT_READABLE_MASK)
+                                                    | VMX_EPT_SUPPRESS_VE_BIT）
+```
+
+校验用一行代码（宿主任意用户可跑，不需要 VM 在跑）：
+
+```bash
+python3 -c 'v=0x8600000123456373; \
+print("R",v&1,"W",(v>>1)&1,"X",(v>>2)&1,"MT",(v>>3)&7,"IPAT",(v>>6)&1,"A",(v>>8)&1, \
+"D",(v>>9)&1,"pfn",hex((v>>12)&((1<<40)-1)),"ADtype",(v>>52)&3,"hostW",(v>>57)&1,"mmuW",(v>>58)&1,"VE",v>>63)'
 ```
 
 ---

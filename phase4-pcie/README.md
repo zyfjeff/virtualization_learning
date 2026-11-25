@@ -294,7 +294,8 @@ ex4 直接回答本章核心问题：本机 157 个设备落在多成员 group�
 4. **#13**：ACS 不是只读的；`pci=config_acs=` 标志串**从右往左**解析
 5. **#14**：ATS 的 STU 是位移量之差、Page Aligned Request 在 bit5、队列深度 0 有两种身份、Linux 关闭时序与规范推荐不同
 
-- 本章勘误（含 basics.md 行号待修项）：[`corrections.md`](corrections.md)
+- 本章勘误（basics.md 行号与 annotations §1/§3、ats.md 代码体已于
+  2026-11-25 二轮修正；待审计项见条目 11/12）：[`corrections.md`](corrections.md)
 - ACS/ATS 直通依赖的完整实测讨论：[`../phase7-vfio/README.md`](../phase7-vfio/README.md) §1.5
 
 ---

@@ -3,8 +3,8 @@
 > 目标：在项目 1 的 VMM 里，用纯用户态代码实现 virtio-mmio 传输层的
 > **virtio-console** 与 **virtio-blk**，替换/补充串口。
 
-**前置**：项目 1（可启动的 VMM）、phase5（virtqueue / feature 协商 /
-vhost 对照）。规范：`../virtio-v1.3-csd01.pdf` §2.7（Split Virtqueues）、
+**前置**：项目 1（可启动的 VMM）、phase6（virtqueue / feature 协商 /
+vhost 对照）。规范：`../spec/virtio-v1.3-csd01.pdf` §2.7（Split Virtqueues）、
 §3.1（Device Initialization）、§4.2（Virtio Over MMIO）、
 §4.2.2（MMIO Device Register Layout）。
 
@@ -12,8 +12,12 @@ vhost 对照）。规范：`../virtio-v1.3-csd01.pdf` §2.7（Split Virtqueues�
 
 ## 设计决策：x86 上如何让 guest 发现 virtio-mmio 设备
 
-virtio-mmio 没有自发现机制；x86 上 QEMU/Firecracker 靠 ACPI 表描述设备。
-为了不在本阶段手写 ACPI，用 guest 内核自带的**命令行手动注册**通道：
+virtio-mmio 没有自发现机制。x86 上 VMM 的标准做法恰恰是让 guest 内核
+**命令行手动注册**——QEMU microvm 就是这么干的：往内核 cmdline 追加
+`virtio_mmio.device=512@<base>:<irq>`（`hw/i386/microvm.c:362-366`）；
+Firecracker 同样走 cmdline（本仓无其源码，细节待核实）。x86 上不需要
+为 virtio-mmio 手写 ACPI 表（ACPI/DT 枚举主要对应 ARM 机器形态），
+本项目直接采用 cmdline 通道：
 
 ```
 virtio_mmio.device=<size>@<base>:<irq>[:<id>]
@@ -96,7 +100,7 @@ blk：后端用普通文件 + `pread/pwrite`，支持 `VIRTIO_BLK_T_IN/OUT/FLUSH
 
 里程碑：先用 `KVM_IRQ_LINE` 跑通（简单、同步），再切到
 ioeventfd + irqfd，用 `perf kvm stat` 对比前后退出计数 —— 这直接复现
-phase5 讲的"数据面下沉"优化。
+phase6 讲的"数据面下沉"优化。
 
 ### M4：中断路由
 
@@ -152,8 +156,8 @@ phase5 讲的"数据面下沉"优化。
 
 ## 参考资料
 
-- Virtio 规范：`../virtio-v1.3-csd01.pdf`（§2.7、§3.1、§4.2）
-- phase5：`../phase6-virtio/README.md`、`virtio-queue.md`、
+- Virtio 规范：`../spec/virtio-v1.3-csd01.pdf`（§2.7、§3.1、§4.2）
+- phase6：`../phase6-virtio/README.md`、`virtio-queue.md`、
   `vhost-architecture.md`
 - QEMU 对照：`/root/code/qemu-10.1.0-rc2/hw/virtio/virtio-mmio.c`
 - guest 驱动：`/root/code/linux-6.12.93/drivers/virtio/virtio_mmio.c`

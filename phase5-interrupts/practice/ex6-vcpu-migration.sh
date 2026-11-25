@@ -33,7 +33,7 @@ TRACE_DIR="/sys/kernel/debug/tracing"
 #   ② `... || echo "?"` **兜不住**：awk 读空输入时不打印任何东西、但退出码是 0，
 #      `||` 因此不触发，调用方拿到的是空串，一旦进 `[ -eq ]` 就报
 #      "integer expression expected"。兜底要用 ${VAR:-?}。
-#   出处：../../phase9-performance/corrections.md D13。
+#   出处：../../phase10-performance/corrections.md D13。
 task_cpu_of() {   # $1 = qemu pid, $2 = tid；取不到时输出 "?"
     local v
     v=$(sed 's/.*) //' "/proc/$1/task/$2/stat" 2>/dev/null | awk '{print $37}' || true)

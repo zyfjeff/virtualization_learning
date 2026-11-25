@@ -20,7 +20,9 @@
 
 ```bash
 # 启动 VM 时启用日志
-qemu-system-x86_64 ... -D /tmp/qemu.log -d kvm
+qemu-system-x86_64 ... 2> /tmp/qemu.err      # KVM 退出信息打在 stderr
+# ★ `-d kvm` 不是合法日志项（QEMU qemu_log_items[] 无 kvm，会 exit 1）；
+#   要写进文件用 -d trace:kvm_run_exit
 
 # 或已有 VM，检查日志位置
 ls -l /tmp/qemu.log
@@ -34,12 +36,12 @@ ls -l /tmp/qemu.log
 
 ```bash
 echo "=== QEMU 日志最后 50 行 ==="
-tail -50 /tmp/qemu.log
+tail -50 /tmp/qemu.err
 
 # 查找 KVM_EXIT_* 原因
 echo ""
 echo "=== KVM_EXIT 原因 ==="
-grep -E 'KVM_EXIT_|kvm_exit' /tmp/qemu.log | tail -20
+grep -E 'KVM internal error|entry failed|kvm run failed' /tmp/qemu.err | tail -20
 
 # 查找内部错误
 echo ""
@@ -115,7 +117,7 @@ interval:s:5 {
 # triple fault = 3 次异常注入失败 → KVM_EXIT_SHUTDOWN
 echo "=== 检查 triple fault ==="
 grep 'kvm_inj_exception' "$TRACEFS/trace" | \
-    awk '{print $NF}' | sort | uniq -c | sort -rn
+    grep -oP '#[A-Z]{2}' | sort | uniq -c | sort -rn   # 文本是 "#PF (0)"，$NF 会取到 (0)
 
 # 如果有异常注入，检查是否成功
 echo ""
@@ -197,9 +199,9 @@ vCPU 停止
 
 ## ⚠️ 注意事项
 
-1. **QEMU 日志必须启用**：`-D /tmp/qemu.log -d kvm`
+1. **QEMU 退出信息在 stderr**：重定向 `2> /tmp/qemu.err`；`-d kvm` 非法（见上）
 2. **tracefs 全局状态**：实验结束清理
-3. **KVM_EXIT 数字 vs 字符串**：QEMU 日志里是字符串，tracepoint 里 `exit_reason` 是数字
+3. **exit_reason 数字 vs 字符串**：ftrace 文本里是**符号名**（`reason MSR_WRITE`），只有 bpftrace 的 `args->exit_reason` 才是数字（见 corrections.md C6）
 4. **triple fault 不总是 guest 问题**：可能是 KVM 异常注入逻辑 bug
 
 ---
@@ -208,5 +210,5 @@ vCPU 停止
 
 - vCPU 退出诊断: `../../vcpu-exit-diagnosis.md` §2
 - KVM trace events: `../../annotations.md` §1
-- 异常注入路径: `../../annotations.md` §1.2
+- 异常注入路径: `../vcpu-exit-diagnosis.md` §5
 - 实战案例: `../../case-studies.md`
