@@ -19,7 +19,7 @@ phase8-timer-virt/      时钟虚拟化
 phase9-capstone/        毕业建造：最小 VMM
 phase10-performance/     性能测量方法论 + 独占机制 + 跨章结论索引
 phase11-debugging/       KVM 运行时调试与诊断
-examples/  notes/  scripts/  shared/
+examples/  scripts/  templates/   (notes/ 与根 shared/ 已清理，见 git 历史)
 ```
 
 各 phase 下的 `practice/` 存放实践练习。实验 VM 环境在 `scripts/`：
