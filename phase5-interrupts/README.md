@@ -43,6 +43,7 @@
 | `annotations.md` | 源码精读：PI 描述符、IRTE、PIR→IRR 同步、桥梁函数、PIC/IOAPIC 模拟 |
 | `posted-interrupts.md` | ★ Intel Posted 模式系统深入：PI Descriptor / IRTE 格式 / 零 VM-Exit 机制 / KVM 实现 |
 | `amd-avic.md` | ★ AMD AVIC 系统深入：Guest Virtual APIC / IRTE GuestMode / GA Log / 与 Intel 对比 |
+| `vcpu-migration-affinity.md` | ★ vCPU 迁移与中断亲和性变更：PI/AVIC 在调度、迁移、亲和性变更场景下的处理逻辑 |
 | `msi-affinity-migration.md` | ★ MSI 地址格式与亲和性迁移（Remapped vs Posted 的迁移路径差异） |
 | `practice/` | ★ 6 个实验脚本：环境检查 / IRTE 观察 / PI 追踪 / 性能对比 / ON-SN / vCPU 迁移 |
 
@@ -71,16 +72,24 @@
   → AMD vs Intel 对比
   → 目标：理解 AMD AVIC 与 Intel PI 的异同
 
-第4步: msi-affinity-migration.md — MSI 与亲和性迁移
-  → Remapped vs Posted 的迁移路径差异
-  → 目标：理解 vCPU 迁移时 IRTE 的更新
+第4步: vcpu-migration-affinity.md — vCPU 迁移与亲和性变更
+  → Intel PI 的 vCPU 调度 (load/put) 机制
+  → AMD AVIC 的 vCPU 调度机制
+  → vCPU 迁移时的 IRTE 更新流程
+  → 中断亲和性变更的处理
+  → Intel vs AMD 的对比分析
+  → 目标：理解调度、迁移、亲和性变更场景下的完整处理逻辑
 
-第5步: annotations.md — 源码精读 (Intel)
+第5步: msi-affinity-migration.md — MSI 与亲和性迁移
+  → Remapped vs Posted 的迁移路径差异
+  → 目标：理解设备 MSI 亲和性迁移与 vCPU 迁移的关系
+
+第6步: annotations.md — 源码精读 (Intel)
   → PI 描述符、IRTE、PIR→IRR 同步
   → vmx_pi_update_irte() 桥梁函数
   → 目标：读懂每行代码的"为什么"
 
-第6步: practice/ — 动手实验（6 个）
+第7步: practice/ — 动手实验（6 个）
   → 环境检查 / IRTE 观察 / PI 追踪 / 性能对比
 ```
 

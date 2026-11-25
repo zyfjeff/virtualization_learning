@@ -3,6 +3,8 @@
 > Phase 4 深度主题 | 从 README.md 拆出，内容未作改动
 >
 > 前置阅读：[README.md](README.md) 的「技术全景」与「完整中断路径」
+>
+> **相关主题**：[vcpu-migration-affinity.md](vcpu-migration-affinity.md) — vCPU 调度、迁移、亲和性变更场景下的 PI/AVIC 处理逻辑
 
 ---
 

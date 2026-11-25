@@ -792,4 +792,5 @@ cat /sys/kernel/debug/iommu/amd/events
 
 **相关文档**:
 - [posted-interrupts.md](posted-interrupts.md) — Intel VT-d Posted Interrupts
+- [vcpu-migration-affinity.md](vcpu-migration-affinity.md) — vCPU 迁移与中断亲和性变更场景下的 AVIC 处理逻辑
 - [msi-affinity-migration.md](msi-affinity-migration.md) — MSI 亲和性迁移

@@ -897,10 +897,11 @@ echo 1 > /sys/module/kvm_intel/parameters/enable_apicv
 ## 🎯 下一步
 
 完成 PI 学习后，可以继续：
-1. 实践：在真实环境中测试 PI
-2. 深入：研究 PI 与 APICv 的协同
-3. 扩展：了解 Posted Interrupts 在嵌套虚拟化中的应用
-4. 优化：探索 PI 的性能调优技巧
+1. **深入调度**：[vcpu-migration-affinity.md](vcpu-migration-affinity.md) — vCPU 迁移与中断亲和性变更场景下的 PI 处理逻辑
+2. 实践：在真实环境中测试 PI
+3. 深入：研究 PI 与 APICv 的协同
+4. 扩展：了解 Posted Interrupts 在嵌套虚拟化中的应用
+5. 优化：探索 PI 的性能调优技巧
 
 ---
 
