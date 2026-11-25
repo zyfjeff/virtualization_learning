@@ -2,6 +2,9 @@
 
 > 基于 Linux 6.12.93 源码。每个代码片段回答一个具体问题，只保留关键行。
 > 行号可能随版本变化，用函数名 grep 定位更可靠。
+>
+> **体例：问题链**（COURSE_FRAMEWORK §3.2）。节序沿数据面路径：
+> 控制块 → 队列 → 初始化 → worker → 读 avail → 写 used → 数据面 → ioctl → KVM 协作。
 
 ---
 
@@ -611,6 +614,16 @@ case VHOST_SET_VRING_KICK:
 ---
 
 ## 9. vhost 与 KVM 的协作
+
+**问题链**（入口来自第一性原理："数据面怎么绕过 QEMU？"）：
+
+1. 入口：vhost 如何避免 VM-Exit 回 QEMU？→ ioeventfd / irqfd
+2. 引申：guest kick 为什么经 ioeventfd 直达 vhost，而不走 QEMU？
+   （KVM 把 kick 的 MMIO/PIO 写入直接转成 eventfd 信号，vhost 线程等待，省用户态往返）
+3. 引申（反事实）：如果不用 irqfd，vhost 注入中断要绕哪？
+   （得回 QEMU 调 ioctl(KVM_INTERRUPT)——又回到用户态往返，卸载白做）
+4. 链尾：vhost 怎么访问 guest 内存？→ GPA→HVA via KVM memslot；
+   真机验证卸载 → practice vhost-perf-test.sh
 
 ### Q: vhost 如何避免 VM-Exit 回 QEMU？
 

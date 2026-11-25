@@ -1,10 +1,16 @@
-# Phase 5: vhost 性能实验
+# Phase 6 实践练习 — 理论取证链
 
-## 实验列表
+> 五段式（COURSE_FRAMEWORK §3.5）：理论 → 预测 → 操作 → 对照 → 反馈。
+> 性能数字按 AGENTS.md 分级汇入 phase10，本章取证机制。
 
-| 实验 | 文件 | 说明 |
-|------|------|------|
-| vhost 性能对比 | vhost-perf-test.sh | vhost=on vs off 吞吐/延迟对比 |
+## 📋 实验总览（取证链）
+
+| 编号 | 验证的理论 | 预测 | 对照判据 | 入口 |
+|------|-----------|------|---------|------|
+| ex1 | vhost 卸载数据面（README VMM 对比） | vhost=on 存在 vhost 内核线程，数据面不回 QEMU；吞吐/延迟优于 off | `ps` 查 vhost 线程 + iperf3 对照（数字 → phase10 分级） | `vhost-perf-test.sh` |
+
+> ⚠️ 吞吐/延迟对比须按 `../../phase10-performance/measurement.md`：多队列 + 直连对端 +
+> ≥3 次重复，否则只是 B/C 级量级参考（phase10 index 已登记旧 vhost 表的三条限制）。
 
 ## 快速开始
 
